@@ -23,4 +23,9 @@ describe('planner approval-plan standard', () => {
   it('gates FLOW on visual clarity rather than structure alone', () => {
     expect(prompt).toContain('only when a multi-component flow, boundary, or state transition is clearer visually');
   });
+
+  it('allows a bounded snippet in HOW only when it removes ambiguity', () => {
+    expect(prompt).toContain('small fenced example');
+    expect(prompt).toContain('Never a full implementation');
+  });
 });

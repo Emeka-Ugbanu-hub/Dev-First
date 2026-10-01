@@ -521,7 +521,7 @@ export const submitPlanTool: ToolDef = {
       how: {
         type: 'string',
         description:
-          'How the verified code flow will work: where it enters, which real files/functions participate, what each owns, and how control or data moves between them.',
+          'How the verified code flow will work: where it enters, which real files/functions participate, what each owns, and how control or data moves between them. May include a small fenced example (≤10 lines) when a signature, shape, config key, or call site clarifies the change; never a full implementation.',
       },
       flow: {
         type: 'string',
