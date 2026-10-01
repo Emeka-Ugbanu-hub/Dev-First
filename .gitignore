@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.vsix
+.devhost/
+.dev-first/
+.DS_Store
+coverage/
+*.log

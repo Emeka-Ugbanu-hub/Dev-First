@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 480" width="1280" height="480">
+  <rect width="1280" height="480" fill="#0B1728"/>
+  <g transform="translate(120, 165) scale(1.17)">
+    <rect width="128" height="128" rx="28" fill="#0B1728"/>
+    <path d="M32 96 L32 64 L96 64 L96 36" fill="none" stroke="#3794FF" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="64" cy="64" r="15" fill="#FFFFFF"/>
+    <path d="M57.5 64.2 L62.2 68.9 L70.5 60.6" fill="none" stroke="#0B1728" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="330" y="258" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="92" font-weight="700" fill="#FFFFFF">Dev-First</text>
+  <text x="334" y="322" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="34" fill="#9DB6D6">Plan first. Build with confidence.</text>
+</svg>

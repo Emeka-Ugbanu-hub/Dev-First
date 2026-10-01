@@ -1,0 +1,33 @@
+.vscode/**
+webview/**
+test/**
+scripts/**
+src/**
+dist/extension.js.map
+**/*.ts
+**/*.tsx
+!dist/**
+!media/**
+!resources/**
+tsconfig*.json
+vite.config.ts
+vitest.config.ts
+esbuild.mjs
+package-lock.json
+.gitignore
+
+# MCP/embedding runtime: only onnxruntime-node for the current platform is needed.
+# The transformers.js code is bundled into dist/extension.js.
+node_modules/@huggingface/**
+node_modules/onnxruntime-web/**
+node_modules/onnxruntime-node/bin/napi-v3/linux/**
+node_modules/onnxruntime-node/bin/napi-v3/win32/**
+
+# tree-sitter: keep the runtime plus every grammar
+
+# Trim package cruft
+node_modules/**/*.md
+node_modules/**/*.map
+node_modules/**/LICENSE*
+node_modules/**/CHANGELOG*
+node_modules/**/*.flow

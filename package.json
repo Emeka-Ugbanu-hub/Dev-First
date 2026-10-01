@@ -1,0 +1,692 @@
+{
+  "name": "dev-first",
+  "displayName": "Dev-First",
+  "description": "Plan-first AI coding agent — every request becomes a plan you approve before a single line changes.",
+  "version": "0.1.0",
+  "publisher": "dev-first",
+  "license": "SEE LICENSE IN LICENSE",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Emeka-Ugbanu-hub/Dev-First"
+  },
+  "bugs": {
+    "url": "https://github.com/Emeka-Ugbanu-hub/Dev-First/issues"
+  },
+  "homepage": "https://github.com/Emeka-Ugbanu-hub/Dev-First",
+  "galleryBanner": {
+    "color": "#0B1728",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.97.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "plan",
+    "code",
+    "assistant"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "devFirst",
+          "title": "Dev-First",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "devFirst": [
+        {
+          "type": "webview",
+          "id": "devFirst.chatView",
+          "name": "Dev-First"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "devFirst.openChat",
+        "title": "Dev-First: Open Chat"
+      },
+      {
+        "command": "devFirst.newSession",
+        "title": "Dev-First: New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "devFirst.setApiKey",
+        "title": "Dev-First: Set API Key"
+      },
+      {
+        "command": "devFirst.pickModel",
+        "title": "Dev-First: Select Model"
+      },
+      {
+        "command": "devFirst.acceptChange",
+        "title": "Dev-First: Accept Change"
+      },
+      {
+        "command": "devFirst.rejectChange",
+        "title": "Dev-First: Reject Change"
+      },
+      {
+        "command": "devFirst.acceptAllChanges",
+        "title": "Dev-First: Accept All Changes"
+      },
+      {
+        "command": "devFirst.rejectAllChanges",
+        "title": "Dev-First: Reject All Changes"
+      },
+      {
+        "command": "devFirst.buildIndex",
+        "title": "Dev-First: Build Semantic Index"
+      },
+      {
+        "command": "devFirst.clearIndex",
+        "title": "Dev-First: Clear Semantic Index"
+      },
+      {
+        "command": "devFirst.newWorktree",
+        "title": "Dev-First: New Session in Worktree"
+      },
+      {
+        "command": "devFirst.mergeWorktree",
+        "title": "Dev-First: Merge Worktree"
+      },
+      {
+        "command": "devFirst.removeWorktree",
+        "title": "Dev-First: Remove Worktree"
+      },
+      {
+        "command": "devFirst.mcpStatus",
+        "title": "Dev-First: MCP Servers Status"
+      },
+      {
+        "command": "devFirst.setupMcp",
+        "title": "Dev-First: Set Up MCP Servers"
+      },
+      {
+        "command": "devFirst.addMcpServer",
+        "title": "Dev-First: Add MCP Server"
+      },
+      {
+        "command": "devFirst.explainSelection",
+        "title": "Dev-First: Explain Selection"
+      },
+      {
+        "command": "devFirst.fixSelection",
+        "title": "Dev-First: Fix Selection"
+      },
+      {
+        "command": "devFirst.fixDiagnostics",
+        "title": "Dev-First: Fix Diagnostics"
+      },
+      {
+        "command": "devFirst.improveSelection",
+        "title": "Dev-First: Improve Selection"
+      },
+      {
+        "command": "devFirst.addSelectionToChat",
+        "title": "Dev-First: Add Selection to Chat"
+      },
+      {
+        "command": "devFirst.addFileToChat",
+        "title": "Dev-First: Add File to Chat"
+      },
+      {
+        "command": "devFirst.addTerminalToChat",
+        "title": "Dev-First: Add Terminal Output to Chat"
+      },
+      {
+        "command": "devFirst.generateTerminalCommand",
+        "title": "Dev-First: Generate Terminal Command"
+      },
+      {
+        "command": "devFirst.explainTerminalCommand",
+        "title": "Dev-First: Explain Terminal Command"
+      },
+      {
+        "command": "devFirst.fixTerminalCommand",
+        "title": "Dev-First: Fix Terminal Command"
+      },
+      {
+        "command": "devFirst.generateCommitMessage",
+        "title": "Dev-First: Generate Commit Message",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "devFirst.exportTranscript",
+        "title": "Dev-First: Export Transcript",
+        "icon": "$(export)"
+      },
+      {
+        "command": "devFirst.explainCodebase",
+        "title": "Dev-First: Explain This Codebase"
+      },
+      {
+        "command": "devFirst.resetScanBaseline",
+        "title": "Dev-First: Reset Scan Baseline"
+      },
+      {
+        "command": "devFirst.scanWholeFile",
+        "title": "Dev-First: Scan Whole File with AI"
+      },
+      {
+        "command": "devFirst.openArchitecture",
+        "title": "Dev-First: Open Architecture",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "devFirst.refreshArchitecture",
+        "title": "Dev-First: Refresh Architecture",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "devFirst.newSession",
+          "when": "view == devFirst.chatView",
+          "group": "navigation"
+        },
+        {
+          "command": "devFirst.openArchitecture",
+          "when": "view == devFirst.chatView && config.devFirst.architecture",
+          "group": "navigation"
+        },
+        {
+          "command": "devFirst.exportTranscript",
+          "when": "view == devFirst.chatView",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "devFirst.explainSelection",
+          "when": "editorHasSelection",
+          "group": "devFirst@1"
+        },
+        {
+          "command": "devFirst.fixSelection",
+          "when": "editorHasSelection",
+          "group": "devFirst@2"
+        },
+        {
+          "command": "devFirst.improveSelection",
+          "when": "editorHasSelection",
+          "group": "devFirst@3"
+        },
+        {
+          "command": "devFirst.addSelectionToChat",
+          "when": "editorHasSelection",
+          "group": "devFirst@4"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "devFirst.addFileToChat",
+          "group": "devFirst@1"
+        }
+      ],
+      "terminal/context": [
+        {
+          "command": "devFirst.addTerminalToChat",
+          "group": "devFirst@1"
+        },
+        {
+          "command": "devFirst.explainTerminalCommand",
+          "group": "devFirst@2"
+        },
+        {
+          "command": "devFirst.fixTerminalCommand",
+          "group": "devFirst@3"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "devFirst.generateCommitMessage",
+          "when": "scmProvider == git",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "devFirst.addSelectionToChat",
+        "key": "ctrl+alt+a",
+        "mac": "cmd+alt+a",
+        "when": "editorTextFocus && editorHasSelection"
+      },
+      {
+        "command": "devFirst.explainSelection",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e",
+        "when": "editorTextFocus && editorHasSelection"
+      },
+      {
+        "command": "devFirst.generateTerminalCommand",
+        "key": "ctrl+shift+g",
+        "mac": "cmd+shift+g",
+        "when": "terminalFocus"
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "devFirst.getStarted",
+        "title": "Get started with Dev-First",
+        "description": "Plan first, then let Dev-First build — and learn while it works.",
+        "steps": [
+          {
+            "id": "connect",
+            "title": "Connect a provider",
+            "description": "Bring your own key — OpenAI, Anthropic, Gemini, OpenRouter, Groq, DeepSeek, or a local model via Ollama / LM Studio.",
+            "media": {
+              "markdown": "media/walkthrough/connect.md"
+            },
+            "completionEvents": [
+              "onCommand:devFirst.setApiKey"
+            ]
+          },
+          {
+            "id": "ask",
+            "title": "Ask for anything",
+            "description": "Questions get answers. Trivial changes just run. Bigger work gets a plan you approve before anything is touched.",
+            "media": {
+              "markdown": "media/walkthrough/ask.md"
+            },
+            "completionEvents": [
+              "onCommand:devFirst.openChat"
+            ]
+          },
+          {
+            "id": "learn",
+            "title": "Learn as you go",
+            "description": "Ask why, open any file mentioned in chat, or hit Learn more for verified resources on the approach and its alternatives.",
+            "media": {
+              "markdown": "media/walkthrough/learn.md"
+            },
+            "completionEvents": [
+              "onCommand:devFirst.explainSelection"
+            ]
+          }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "Dev-First",
+      "properties": {
+        "devFirst.preset": {
+          "type": "string",
+          "default": "openai",
+          "markdownDescription": "Provider preset: `openai`, `anthropic`, `gemini`, `openrouter`, `groq`, `deepseek`, `ollama`, `lmstudio`, `custom`. Normally set from the Dev-First panel."
+        },
+        "devFirst.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "anthropic",
+            "gemini"
+          ],
+          "enumDescriptions": [
+            "OpenAI-compatible API (OpenAI, OpenRouter, Groq, Ollama, LM Studio, DeepSeek, ...)",
+            "Anthropic API (Claude)",
+            "Google Gemini API"
+          ],
+          "default": "openai",
+          "markdownDescription": "LLM provider. The **openai** option works with any OpenAI-compatible endpoint — set `#devFirst.baseUrl#` for OpenRouter, Groq, Ollama, etc."
+        },
+        "devFirst.baseUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Override the API base URL (e.g. `https://openrouter.ai/api/v1`, `http://localhost:11434/v1`). Leave empty for the provider default."
+        },
+        "devFirst.model": {
+          "type": "string",
+          "default": "gpt-4o",
+          "description": "Model ID to use (e.g. gpt-4o, claude-sonnet-4-5, gemini-2.0-flash)."
+        },
+        "devFirst.maxSteps": {
+          "type": "number",
+          "default": 60,
+          "description": "Maximum tool steps per execution run."
+        },
+        "devFirst.plannerMaxSteps": {
+          "type": "number",
+          "default": 12,
+          "description": "Maximum exploration steps while planning."
+        },
+        "devFirst.terminalTimeout": {
+          "type": "number",
+          "default": 120,
+          "description": "Terminal command timeout in seconds."
+        },
+        "devFirst.headerTimeout": {
+          "type": "number",
+          "default": 120,
+          "minimum": 0,
+          "description": "Seconds to wait for model response headers before aborting the request. 0 disables the timeout."
+        },
+        "devFirst.streamIdleTimeout": {
+          "type": "number",
+          "default": 120,
+          "minimum": 0,
+          "description": "Seconds to wait between streaming chunks before aborting the response. 0 disables the timeout."
+        },
+        "devFirst.autoApproveTerminal": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run terminal commands without asking for approval."
+        },
+        "devFirst.autoApproveEdits": {
+          "type": "boolean",
+          "default": true,
+          "description": "Apply write_file, edit_file, and apply_patch without asking for approval."
+        },
+        "devFirst.safeCommandsOnly": {
+          "type": "boolean",
+          "default": true,
+          "description": "When terminal auto-approve is on, only read-only commands (ls, cat, git status, npm test, ...) run automatically; everything else asks first."
+        },
+        "devFirst.yolo": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-approve everything: edits, all commands, and MCP tools. Bypasses every approval check."
+        },
+        "devFirst.checkDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "After each edit, feed language-server errors and warnings for the touched files back to the agent."
+        },
+        "devFirst.autoCompact": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically summarize the conversation when it approaches the context limit, so long tasks can continue."
+        },
+        "devFirst.contextLimitTokens": {
+          "type": "number",
+          "default": 128000,
+          "description": "Fallback context window used only when the model is not in the model catalog."
+        },
+        "devFirst.semanticIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable semantic_search. Uses a bundled local embedding model by default — no API key needed, nothing leaves your machine."
+        },
+        "devFirst.embeddingsProvider": {
+          "type": "string",
+          "enum": [
+            "local",
+            "api"
+          ],
+          "enumDescriptions": [
+            "Bundled all-MiniLM-L6-v2 model, runs on CPU, offline.",
+            "Use the configured LLM provider's embeddings API (OpenAI-compatible or Gemini)."
+          ],
+          "default": "local",
+          "description": "Where embeddings for the semantic index come from."
+        },
+        "devFirst.embeddingsModel": {
+          "type": "string",
+          "default": "text-embedding-3-small",
+          "description": "Embeddings model used when embeddingsProvider is 'api'."
+        },
+        "devFirst.sandbox": {
+          "type": "string",
+          "enum": [
+            "off",
+            "workspace-write"
+          ],
+          "enumDescriptions": [
+            "Run terminal commands without a sandbox.",
+            "Restrict terminal command writes to the workspace and common caches (macOS sandbox-exec / Linux bubblewrap)."
+          ],
+          "default": "workspace-write",
+          "description": "OS-level sandbox for terminal commands. The approval card offers a one-time 'run without sandbox' option."
+        },
+        "devFirst.browserAutoLaunch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically launch a local Chrome/Edge with a dedicated profile when browser tools are used."
+        },
+        "devFirst.reasoningEffort": {
+          "type": "string",
+          "default": "off",
+          "markdownDescription": "Legacy fallback for model reasoning. Use the composer reasoning control to choose a value supported by the selected model."
+        },
+        "devFirst.parallelTools": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run independent read-only tool calls in parallel."
+        },
+        "devFirst.memory": {
+          "type": "boolean",
+          "default": true,
+          "description": "Inject project memory into prompts and expose memory_recall/memory_save tools."
+        },
+        "devFirst.autocomplete": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable inline code completions (ghost text) using the provider's FIM endpoint."
+        },
+        "devFirst.autocompleteModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model used for inline completions (FIM). Leave empty for auto: Dev-First picks a FIM model for the connected provider (Codestral for OpenRouter, qwen2.5-coder for Ollama) and otherwise falls back to the connected chat model."
+        },
+        "devFirst.autocompleteFallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "When no FIM model is available, ask the connected chat model for the completion. Throttled to one call per second with a small context, so token usage stays low."
+        },
+        "devFirst.autoApproveMcp": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run MCP tool calls without asking for approval."
+        },
+        "devFirst.resources": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the Learn more button on plans and walkthroughs (AI-suggested, verified learning resources)."
+        },
+        "devFirst.mcpDisplay": {
+          "type": "string",
+          "enum": [
+            "plain",
+            "markdown"
+          ],
+          "default": "markdown",
+          "description": "How MCP tool output is rendered in chat."
+        },
+        "devFirst.notifyOnFinish": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show a VS Code notification when a task finishes."
+        },
+        "devFirst.soundOnFinish": {
+          "type": "boolean",
+          "default": false,
+          "description": "Play a short sound when a task finishes."
+        },
+        "devFirst.notifyOnComplete": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a VS Code notification when a run finishes successfully."
+        },
+        "devFirst.notifyOnError": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a VS Code error notification when a run fails."
+        },
+        "devFirst.notifySound": {
+          "type": "string",
+          "enum": [
+            "off",
+            "chime",
+            "beep"
+          ],
+          "enumDescriptions": [
+            "No sound.",
+            "Play the macOS Glass sound.",
+            "Play the macOS Ping sound."
+          ],
+          "default": "chime",
+          "description": "Play a short sound when a task completes or fails."
+        },
+        "devFirst.notifyOnInput": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a notification when a plan awaits approval, a command needs Allow/Deny, or the agent asked a question."
+        },
+        "devFirst.keepAwake": {
+          "type": "boolean",
+          "default": false,
+          "description": "Prevent sleep while a plan is running (macOS caffeinate)."
+        },
+        "devFirst.browserPort": {
+          "type": "number",
+          "default": 9222,
+          "description": "Chrome DevTools Protocol port used by the browser tools (start Chrome with --remote-debugging-port=9222)."
+        },
+        "devFirst.scanEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show problems in files you open (squiggles + hover explanations)."
+        },
+        "devFirst.scanAst": {
+          "type": "boolean",
+          "default": true,
+          "description": "Parse JavaScript, TypeScript, Python, Java, Go, and PHP to catch structural bugs such as unreachable code."
+        },
+        "devFirst.scanHotspots": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include non-blocking hotspot hints such as weak randomness or plain http URLs."
+        },
+        "devFirst.scanDuplication": {
+          "type": "boolean",
+          "default": true,
+          "description": "Index workspace functions and flag near-identical bodies in other files."
+        },
+        "devFirst.scanCrossFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Flag circular imports, god modules, dead exports, orphaned files, and other cross-file structure issues."
+        },
+        "devFirst.scanConventions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mine auth, validation, naming, and layering conventions from the cross-file index and use them when planning."
+        },
+        "devFirst.scanDuplicationThreshold": {
+          "type": "number",
+          "default": 0.8,
+          "minimum": 0.5,
+          "maximum": 1,
+          "description": "Minimum token similarity (0.5-1) before a function is reported as a duplicate."
+        },
+        "devFirst.scanMaxFileKb": {
+          "type": "number",
+          "default": 1024,
+          "minimum": 16,
+          "description": "Skip scanning files larger than this (KB)."
+        },
+        "devFirst.scanIgnore": {
+          "type": "string",
+          "default": "**/node_modules/**,**/dist/**,**/out/**,**/.next/**,**/vendor/**,**/target/**,**/build/**,**/coverage/**,**/*.min.*,**/*.pb.go,**/*.generated.*,**/generated/**,**/package-lock.json,**/yarn.lock,**/pnpm-lock.yaml",
+          "markdownDescription": "Comma-separated glob patterns for files to skip when scanning."
+        },
+        "devFirst.scanNewOnly": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show only findings that are not in the scan baseline yet. While this is off, every finding is recorded into the baseline."
+        },
+        "devFirst.scanDisabledCategories": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Comma-separated finding categories to hide: `bug`, `vulnerability`, `smell`, `hotspot`, `secret`, `architecture`."
+        },
+        "devFirst.scanAi": {
+          "type": "boolean",
+          "default": true,
+          "description": "After the deterministic pass, ask the connected model for high-confidence findings linters cannot catch (logic bugs, smells, security, architecture)."
+        },
+        "devFirst.scanAiModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model used for the AI scan. Empty uses `#devFirst.model#`."
+        },
+        "devFirst.scanAiCrossFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Compare same-concept implementations across files with the model and flag same/drifted twins."
+        },
+        "devFirst.scanAiCrossFileMaxPairs": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "description": "Maximum candidate pairs the AI reviews for the opened file per scan."
+        },
+        "devFirst.architecture": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the Architecture button that maps the codebase into domains, subsystems, and components."
+        },
+        "devFirst.pasteFileLines": {
+          "type": "number",
+          "default": 120,
+          "minimum": 20,
+          "description": "Pasted text longer than this many lines is saved under .dev-first/pastes and referenced in the message instead of filling the prompt."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "npm run build:ext && npm run build:webview",
+    "build:ext": "node esbuild.mjs --production",
+    "build:webview": "vite build",
+    "watch:ext": "node esbuild.mjs --watch",
+    "watch:webview": "vite build --watch",
+    "generate:models": "node scripts/generate-models.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.webview.json",
+    "test": "vitest run",
+    "smoke": "node scripts/smoke.cjs",
+    "smoke:embed": "node scripts/smoke-embed.cjs",
+    "package": "npm run build && vsce package",
+    "check": "npm run typecheck && npm run test && npm run build && npm run smoke"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.5.1",
+    "@vscode/tree-sitter-wasm": "^0.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/vscode": "^1.97.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "@vscode/codicons": "^0.0.39",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.2",
+    "jsdom": "^30.1.1",
+    "mermaid": "^11.4.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.0.3",
+    "rehype-highlight": "^7.0.1",
+    "remark-gfm": "^4.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  }
+}
