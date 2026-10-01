@@ -601,6 +601,13 @@
           "minimum": 16,
           "description": "Skip scanning files larger than this (KB)."
         },
+        "devFirst.scanMaxFiles": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 100,
+          "maximum": 20000,
+          "description": "Stop indexing after this many files. Raise it for very large repositories."
+        },
         "devFirst.scanIgnore": {
           "type": "string",
           "default": "**/node_modules/**,**/dist/**,**/out/**,**/.next/**,**/vendor/**,**/target/**,**/build/**,**/coverage/**,**/*.min.*,**/*.pb.go,**/*.generated.*,**/generated/**,**/package-lock.json,**/yarn.lock,**/pnpm-lock.yaml",

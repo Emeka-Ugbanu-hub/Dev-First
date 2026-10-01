@@ -1,4 +1,6 @@
 import { afterAll, describe, expect, it, vi } from 'vitest';
+import { promises as fs } from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 vi.mock('vscode', () => ({
@@ -181,5 +183,23 @@ describe('DuplicationIndex', () => {
     await index.removeFile(FILE_A);
     const matches = await index.findDuplicates(FILE_B, SOURCE_B, 'typescript', options);
     expect(matches).toEqual([]);
+  });
+});
+
+describe('structural language indexing', () => {
+  it('indexes files whose grammar is not bundled with minimal facts', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dev-first-structural-'));
+    await fs.mkdir(path.join(root, 'ios'), { recursive: true });
+    await fs.mkdir(path.join(root, 'android'), { recursive: true });
+    await fs.writeFile(path.join(root, 'ios', 'App.swift'), 'import SwiftUI\nstruct AppView {}\n');
+    await fs.writeFile(path.join(root, 'android', 'Main.kt'), 'package app\nfun main() {}\n');
+    const index = new DuplicationIndex({
+      root,
+      parse: (text, languageId) => service.parse(text, languageId),
+    });
+    await index.ensureBuilt();
+    const files = (await index.getFacts()).map((file) => file.file);
+    expect(files.some((file) => file.endsWith('App.swift'))).toBe(true);
+    expect(files.some((file) => file.endsWith('Main.kt'))).toBe(true);
   });
 });

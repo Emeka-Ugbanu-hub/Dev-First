@@ -27,7 +27,9 @@ export interface ArchitectureNode {
 export type DomainKey =
   | 'backend'
   | 'frontend'
+  | 'services'
   | 'database'
+  | 'mobile'
   | 'infrastructure'
   | 'configuration'
   | 'external-services'
@@ -61,8 +63,10 @@ interface SubsystemRule {
 }
 
 const DOMAIN_ORDER: DomainKey[] = [
-  'backend',
   'frontend',
+  'mobile',
+  'backend',
+  'services',
   'database',
   'infrastructure',
   'configuration',
@@ -81,6 +85,14 @@ const DOMAIN_META: Record<DomainKey, { label: string; description: string }> = {
   frontend: {
     label: 'Frontend',
     description: 'UI components, hooks, pages, and client-side state.',
+  },
+  services: {
+    label: 'Services',
+    description: 'Business logic and use cases that sit between UI and data.',
+  },
+  mobile: {
+    label: 'Mobile',
+    description: 'Native mobile application code for iOS and Android.',
   },
   database: {
     label: 'Database',
@@ -119,6 +131,10 @@ const DOMAIN_META: Record<DomainKey, { label: string; description: string }> = {
 
 const BACKEND_DIR = /^(routes?|routers?|controllers?|middleware|handlers?|endpoints?|resolvers?)$/i;
 const FRONTEND_DIR = /^(components?|hooks?|pages?|views?|screens?|ui|widgets?|frontend|web)$/i;
+const FRONTEND_EXT = new Set(['.vue', '.svelte', '.astro']);
+const SERVICE_DIR = /^(services?|usecases?|use-cases|application)$/i;
+const MOBILE_EXT = new Set(['.swift', '.dart']);
+const MOBILE_DIR = /^(ios|android|mobile|flutter)$/i;
 const DATABASE_DIR = /^(repositories|repos?|models?|migrations?|database|db|entities|dao|persistence|schemas?)$/i;
 const DATABASE_EXT = new Set(['.sql', '.prisma']);
 const TAURI_DIR = /^src-tauri$/i;
@@ -127,8 +143,8 @@ const LANGUAGE_BACKEND_EXT = new Set(['.rs', '.go', '.java', '.kt', '.kts', '.cs
 const LANGUAGE_INFRA_EXT = new Set(['.sh', '.bash', '.ps1']);
 const LANGUAGE_STYLE_EXT = new Set(['.css', '.scss', '.less', '.sass']);
 const LANGUAGE_CONFIG_EXT = new Set(['.ini']);
-const DATABASE_DRIVER_IMPORT = /^(rusqlite|sqlx|diesel|sqlite3?|better-sqlite3|prisma|sequelize|typeorm|knex|mongoose|mongodb|drizzle-orm)(\/|::|$)/i;
-const EXTERNAL_CLIENT_IMPORT = /^(reqwest|octocrab|github-graphql|@octokit|octokit)(\/|$)/i;
+const DATABASE_DRIVER_IMPORT = /^(rusqlite|sqlx|diesel|sqlite3?|better-sqlite3|pg|mysql2?|prisma|sequelize|typeorm|knex|mongoose|mongodb|drizzle-orm|gorm\.io|pgx|jdbc|java\.sql|hibernate|org\.hibernate|mybatis|active_?record|eloquent|sqlalchemy|psycopg2?|asyncpg|peewee|exposed|realm|androidx\.room)(\/|::|\.|$)/i;
+const EXTERNAL_CLIENT_IMPORT = /^(reqwest|octocrab|github-graphql|@octokit|octokit|@aws-sdk|aws-sdk|stripe|twilio|sendgrid|@supabase|supabase|firebase)(\/|$)/i;
 const INFRA_DIR = /^(k8s|kubernetes|terraform|infra|deploy|deployments?|helm|charts?|ci|workflows?)$/i;
 const INFRA_BASE = /^(dockerfile|docker-compose\.ya?ml|compose\.ya?ml|jenkinsfile|\.gitlab-ci\.ya?ml)$/i;
 const INFRA_EXT = new Set(['.tf', '.tfvars']);
@@ -381,10 +397,43 @@ const UNCLASSIFIED_SUBSYSTEMS: SubsystemRule[] = [
   },
 ];
 
+const SERVICES_SUBSYSTEMS: SubsystemRule[] = [
+  { label: 'Tests', match: (entry) => isTestFile(entry.uri) },
+  { label: 'Services', match: () => true },
+];
+
+const MOBILE_SUBSYSTEMS: SubsystemRule[] = [
+  { label: 'Tests', match: (entry) => isTestFile(entry.uri) },
+  {
+    label: 'Screens',
+    match: (entry) =>
+      entry.segments.some((segment) => /^(screens?|views?|pages?)$/i.test(segment)) ||
+      /(Screen|ViewController|View)$/i.test(entry.stem),
+  },
+  {
+    label: 'UI',
+    match: (entry) =>
+      /(View|Widget|Cell|Component)$/i.test(entry.stem) ||
+      entry.ext === '.vue' ||
+      entry.ext === '.svelte',
+  },
+  {
+    label: 'Models',
+    match: (entry) => /(Model|Entity|Dto|DTO)$/i.test(entry.stem),
+  },
+  {
+    label: 'Networking',
+    match: (entry) =>
+      entry.segments.some((segment) => /^(network|networking|api|remote|services?)$/i.test(segment)),
+  },
+];
+
 const SUBSYSTEM_RULES: Record<DomainKey, SubsystemRule[]> = {
   backend: BACKEND_SUBSYSTEMS,
   frontend: FRONTEND_SUBSYSTEMS,
+  services: SERVICES_SUBSYSTEMS,
   database: DATABASE_SUBSYSTEMS,
+  mobile: MOBILE_SUBSYSTEMS,
   infrastructure: INFRA_SUBSYSTEMS,
   configuration: CONFIGURATION_SUBSYSTEMS,
   'external-services': EXTERNAL_SUBSYSTEMS,
@@ -397,7 +446,9 @@ const SUBSYSTEM_RULES: Record<DomainKey, SubsystemRule[]> = {
 const SUBSYSTEM_FALLBACK: Record<DomainKey, string> = {
   backend: 'Other',
   frontend: 'Other',
+  services: 'Services',
   database: 'Other',
+  mobile: 'Other',
   infrastructure: 'Infrastructure',
   configuration: 'Config',
   'external-services': 'Other',
@@ -508,9 +559,18 @@ function classifyEntry(entry: FileEntry): DomainKey {
     return 'configuration';
   }
   const facts = entry.facts;
+  if (
+    facts.sql.length > 0 ||
+    facts.imports.some((record) => DATABASE_DRIVER_IMPORT.test(record.specifier)) ||
+    DATABASE_EXT.has(entry.ext) ||
+    entry.segments.some((segment) => DATABASE_DIR.test(segment))
+  ) {
+    return 'database';
+  }
   const frontendLike =
     entry.ext === '.tsx' ||
     entry.ext === '.jsx' ||
+    FRONTEND_EXT.has(entry.ext) ||
     entry.segments.some((segment) => FRONTEND_DIR.test(segment));
   if (
     !entry.segments.some((segment) => TAURI_DIR.test(segment)) &&
@@ -520,19 +580,14 @@ function classifyEntry(entry: FileEntry): DomainKey {
   ) {
     return 'backend';
   }
+  if (entry.segments.some((segment) => SERVICE_DIR.test(segment))) {
+    return 'services';
+  }
   if (frontendLike) {
     return 'frontend';
   }
   if (/^(cargo\.toml|package\.json|pyproject\.toml|go\.mod|composer\.json)$/i.test(entry.base)) {
     return 'configuration';
-  }
-  if (
-    facts.sql.length > 0 ||
-    facts.imports.some((record) => DATABASE_DRIVER_IMPORT.test(record.specifier)) ||
-    DATABASE_EXT.has(entry.ext) ||
-    entry.segments.some((segment) => DATABASE_DIR.test(segment))
-  ) {
-    return 'database';
   }
   if (
     INFRA_BASE.test(entry.base) ||
@@ -548,6 +603,12 @@ function classifyEntry(entry: FileEntry): DomainKey {
     (entry.ext === '.rs' && /^github$/i.test(entry.stem))
   ) {
     return 'external-services';
+  }
+  if (
+    MOBILE_EXT.has(entry.ext) ||
+    entry.segments.some((segment) => MOBILE_DIR.test(segment))
+  ) {
+    return 'mobile';
   }
   if (LANGUAGE_BACKEND_EXT.has(entry.ext)) {
     return 'backend';
@@ -640,7 +701,7 @@ function packageDomainGroups(entries: FileEntry[], packages: PackageRoot[]): Dom
     }
   }
   const roleFiles: FileEntry[] = [];
-  const splitRoles = new Set<DomainKey>(['database', 'external-services']);
+  const splitRoles = new Set<DomainKey>(['database', 'external-services', 'services', 'mobile']);
   for (const [rootKey, list] of buckets) {
     const kept: FileEntry[] = [];
     for (const entry of list) {

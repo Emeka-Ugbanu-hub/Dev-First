@@ -284,6 +284,36 @@ describe('classifyFileDomain', () => {
 });
 
 describe('buildArchitectureTree domains', () => {
+  it('classifies web frameworks, mobile sources, service folders, and modern ORMs', () => {
+    expect(classifyFileDomain(facts('file:///w/src/App.vue'))).toBe('frontend');
+    expect(classifyFileDomain(facts('file:///w/src/App.svelte'))).toBe('frontend');
+    expect(classifyFileDomain(facts('file:///w/ios/App.swift'))).toBe('mobile');
+    expect(classifyFileDomain(facts('file:///w/android/app/Main.kt'))).toBe('mobile');
+    expect(classifyFileDomain(facts('file:///w/lib/main.dart'))).toBe('mobile');
+    expect(classifyFileDomain(facts('file:///w/src/services/user.ts'))).toBe('services');
+    expect(
+      classifyFileDomain(
+        facts('file:///w/internal/repo/user.go', {
+          imports: [{ specifier: 'gorm.io/gorm', names: [], line: 0 }],
+        }),
+      ),
+    ).toBe('database');
+  });
+
+  it('shows Services and Mobile as their own domains', () => {
+    const tree = buildArchitectureTree([
+      facts('file:///w/src/App.tsx'),
+      facts('file:///w/src/services/user.ts'),
+      facts('file:///w/ios/App.swift'),
+      facts('file:///w/backend/routes/users.ts'),
+    ]);
+    const labels = tree.children.map((child) => child.label);
+    expect(labels).toContain('Frontend');
+    expect(labels).toContain('Services');
+    expect(labels).toContain('Mobile');
+    expect(labels).toContain('Backend');
+  });
+
   it('preserves small domain groups instead of moving files by group size', () => {
     const files = [
       ...routeFiles(5),
@@ -1151,10 +1181,8 @@ describe('mermaidForNode relationships', () => {
       }),
     ];
     const tree = buildArchitectureTree(files);
-    const backend = tree.children.find((child) => child.label === 'Backend');
-    expect(backend).toBeDefined();
-    const relations = levelRelations(backend!, files);
-    const diagram = mermaidForNode(backend!, relations, files);
+    const relations = levelRelations(tree, files);
+    const diagram = mermaidForNode(tree, relations, files);
     expect(diagram).toMatch(/-\. "matches 2 endpoints/);
   });
 });

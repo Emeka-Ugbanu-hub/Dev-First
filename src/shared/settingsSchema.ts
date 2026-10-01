@@ -345,6 +345,16 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     min: 16,
   },
   {
+    key: 'scanMaxFiles',
+    tab: 'behavior',
+    group: 'Scanning',
+    label: 'Maximum indexed files',
+    description: 'Stop indexing after this many files. Raise it for very large repositories.',
+    type: 'number',
+    min: 100,
+    max: 20000,
+  },
+  {
     key: 'scanIgnore',
     tab: 'behavior',
     group: 'Scanning',

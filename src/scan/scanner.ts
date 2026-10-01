@@ -270,6 +270,7 @@ export class ScanRunner implements vscode.Disposable {
         : undefined,
       getScanIgnore: () => getConfig().scanIgnore,
       getMaxFileKb: () => getConfig().scanMaxFileKb,
+      getMaxFiles: () => getConfig().scanMaxFiles,
     });
     this.memory = new MemoryStore(
       vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),

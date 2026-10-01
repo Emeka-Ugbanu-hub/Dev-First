@@ -5,7 +5,7 @@ import { createHash } from 'crypto';
 import { fileURLToPath, pathToFileURL } from 'url';
 import type { Node, Tree } from '@vscode/tree-sitter-wasm/wasm/web-tree-sitter';
 import type { LanguageProfile } from './languages/profiles';
-import { profileFor } from './languages/profiles';
+import { profileFor, scanProfileFor } from './languages/profiles';
 import {
   bodyOf,
   descendantsOf,
@@ -25,9 +25,7 @@ const MIN_TOKENS = 30;
 const DEFAULT_SHINGLE_SIZE = 5;
 const INDEX_MIN_STATEMENTS = 2;
 const MAX_FILES = 2000;
-const UNSUPPORTED_SOURCE_EXTENSIONS = new Set([
-  '.swift', '.kt', '.kts', '.vue', '.svelte', '.astro', '.dart', '.scala', '.clj', '.ex', '.exs', '.lua',
-]);
+const UNSUPPORTED_SOURCE_EXTENSIONS = new Set<string>();
 const YIELD_EVERY = 25;
 const SAVE_DEBOUNCE_MS = 1000;
 
@@ -60,6 +58,39 @@ export const LANGUAGE_BY_EXTENSION: Record<string, string> = {
   '.css': 'css',
   '.ini': 'ini',
 };
+
+export const STRUCTURAL_LANGUAGE_BY_EXTENSION: Record<string, string> = {
+  '.swift': 'swift',
+  '.kt': 'kotlin',
+  '.kts': 'kotlin',
+  '.vue': 'vue',
+  '.svelte': 'svelte',
+  '.astro': 'astro',
+  '.dart': 'dart',
+  '.scala': 'scala',
+  '.clj': 'clojure',
+  '.ex': 'elixir',
+  '.exs': 'elixir',
+  '.lua': 'lua',
+};
+
+const STRUCTURAL_LANGUAGES = new Set(Object.values(STRUCTURAL_LANGUAGE_BY_EXTENSION));
+
+export function isStructuralLanguage(languageId: string): boolean {
+  return STRUCTURAL_LANGUAGES.has(languageId);
+}
+
+function emptyTree(): Tree {
+  const node = {
+    type: 'program',
+    text: '',
+    namedChildren: [],
+    children: [],
+    childForFieldName: () => null,
+    descendantsOfType: () => [],
+  };
+  return { rootNode: node } as unknown as Tree;
+}
 
 export interface DuplicationEntry {
   file: string;
@@ -104,6 +135,7 @@ export interface DuplicationIndexOptions {
   storageFile?: string;
   getScanIgnore?: () => string[];
   getMaxFileKb?: () => number;
+  getMaxFiles?: () => number;
   onProgress?: (message: string) => void;
 }
 
@@ -2364,12 +2396,13 @@ export class DuplicationIndex {
 
   async indexFile(uri: string, text: string, languageId: string, tree?: Tree): Promise<void> {
     await this.ensureLoaded();
-    const profile = profileFor(languageId);
+    const structural = isStructuralLanguage(languageId);
+    const profile = profileFor(languageId) ?? (structural ? scanProfileFor(languageId) : undefined);
     if (!profile) {
       await this.removeFile(uri);
       return;
     }
-    const parsed = tree ?? (await this.options.parse(text, languageId));
+    const parsed = structural ? emptyTree() : tree ?? (await this.options.parse(text, languageId));
     if (!parsed) {
       return;
     }
@@ -2655,13 +2688,14 @@ export class DuplicationIndex {
     }
     const ignore = this.options.getScanIgnore?.() ?? [];
     const maxBytes = (this.options.getMaxFileKb?.() ?? 1024) * 1024;
+    const maxFiles = Math.max(1, this.options.getMaxFiles?.() ?? MAX_FILES);
     const gitignore = await readGitignore(root);
-    const files = await listWorkspaceFiles(root, { extensions: TEXT_EXTENSIONS, maxEntries: MAX_FILES });
+    const files = await listWorkspaceFiles(root, { extensions: TEXT_EXTENSIONS, maxEntries: maxFiles });
     this.architectureCoverage = {
       unsupportedSourceFiles: 0,
       parseFailures: 0,
       oversizedSourceFiles: 0,
-      scanLimitReached: files.length >= MAX_FILES,
+      scanLimitReached: files.length >= maxFiles,
     };
     const seenUris = new Set<string>();
     let changed = false;
@@ -2705,7 +2739,7 @@ export class DuplicationIndex {
       if (existing && existing.mtime === stat.mtimeMs && existing.size === stat.size) {
         continue;
       }
-      const languageId = LANGUAGE_BY_EXTENSION[extension];
+      const languageId = LANGUAGE_BY_EXTENSION[extension] ?? STRUCTURAL_LANGUAGE_BY_EXTENSION[extension];
       if (!languageId) {
         continue;
       }
@@ -2718,29 +2752,31 @@ export class DuplicationIndex {
       if (content.includes('\u0000')) {
         continue;
       }
-      const tree = await this.options.parse(content, languageId);
-      if (!tree) {
+      const structural = isStructuralLanguage(languageId);
+      const tree = structural ? undefined : await this.options.parse(content, languageId);
+      if (!structural && !tree) {
         this.architectureCoverage.parseFailures++;
         continue;
       }
       try {
-        const profile = profileFor(languageId);
+        const profile = profileFor(languageId) ?? (structural ? scanProfileFor(languageId) : undefined);
         if (!profile) {
           continue;
         }
+        const parsedTree = tree ?? emptyTree();
         this.data.files[uri] = {
           file: uri,
           mtime: stat.mtimeMs,
           size: stat.size,
           hash: createHash('sha1').update(content).digest('hex'),
-          ...extractFileFacts(tree, content, profile),
-          entries: this.entriesFor(uri, tree, content, profile, INDEX_MIN_STATEMENTS),
+          ...extractFileFacts(parsedTree, content, profile),
+          entries: this.entriesFor(uri, parsedTree, content, profile, INDEX_MIN_STATEMENTS),
         };
         changed = true;
         indexed++;
         this.options.onProgress?.(`Duplicate index: ${indexed} files scanned…`);
       } finally {
-        tree.delete();
+        tree?.delete();
       }
     }
 

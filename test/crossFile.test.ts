@@ -1735,3 +1735,42 @@ describe('DuplicationIndex facts persistence', () => {
     index.dispose();
   });
 });
+
+describe('resolveSpecifier aliases and workspaces', () => {
+  it('resolves tsconfig path aliases', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dev-first-alias-'));
+    await fs.mkdir(path.join(root, 'src', 'lib'), { recursive: true });
+    await fs.writeFile(
+      path.join(root, 'tsconfig.json'),
+      JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@app/*': ['src/lib/*'] } } }),
+    );
+    await fs.writeFile(path.join(root, 'src', 'lib', 'util.ts'), '');
+    await fs.writeFile(path.join(root, 'src', 'main.ts'), '');
+    const main = `file://${path.join(root, 'src', 'main.ts')}`;
+    const util = `file://${path.join(root, 'src', 'lib', 'util.ts')}`;
+    expect(resolveSpecifier(main, '@app/util', new Set([main, util]))).toBe(util);
+  });
+
+  it('resolves workspace package imports through package.json names', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dev-first-ws-'));
+    await fs.mkdir(path.join(root, 'packages', 'lib', 'src'), { recursive: true });
+    await fs.writeFile(path.join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: {} }));
+    await fs.writeFile(
+      path.join(root, 'package.json'),
+      JSON.stringify({ name: 'root-app', workspaces: ['packages/*'] }),
+    );
+    await fs.writeFile(
+      path.join(root, 'packages', 'lib', 'package.json'),
+      JSON.stringify({ name: '@app/lib', main: 'src/index.ts' }),
+    );
+    await fs.writeFile(path.join(root, 'packages', 'lib', 'src', 'index.ts'), '');
+    await fs.writeFile(path.join(root, 'packages', 'lib', 'src', 'util.ts'), '');
+    await fs.writeFile(path.join(root, 'main.ts'), '');
+    const main = `file://${path.join(root, 'main.ts')}`;
+    const index = `file://${path.join(root, 'packages', 'lib', 'src', 'index.ts')}`;
+    const util = `file://${path.join(root, 'packages', 'lib', 'src', 'util.ts')}`;
+    const known = new Set([main, index, util]);
+    expect(resolveSpecifier(main, '@app/lib', known)).toBe(index);
+    expect(resolveSpecifier(main, '@app/lib/util', known)).toBe(util);
+  });
+});

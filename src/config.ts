@@ -55,6 +55,7 @@ export interface DevFirstConfig {
   scanCrossFile: boolean;
   scanConventions: boolean;
   scanMaxFileKb: number;
+  scanMaxFiles: number;
   scanIgnore: string[];
   scanNewOnly: boolean;
   scanDisabledCategories: string[];
@@ -121,6 +122,7 @@ export function getConfig(): DevFirstConfig {
     scanCrossFile: config.get<boolean>('scanCrossFile', true),
     scanConventions: config.get<boolean>('scanConventions', true),
     scanMaxFileKb: config.get<number>('scanMaxFileKb', 1024),
+    scanMaxFiles: config.get<number>('scanMaxFiles', 2000),
     scanIgnore: config
       .get<string>('scanIgnore', DEFAULT_SCAN_IGNORE)
       .split(',')

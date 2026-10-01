@@ -1,4 +1,5 @@
 import { execFile } from 'child_process';
+import * as fs from 'fs';
 import * as pathModule from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import type {
@@ -71,12 +72,247 @@ export function shortName(file: string): string {
   return parts[parts.length - 1] || clean;
 }
 
+interface AliasEntry {
+  prefix: string;
+  suffix: string;
+  hasStar: boolean;
+  targets: string[];
+}
+
+interface WorkspacePackage {
+  dir: string;
+  entry: string;
+}
+
+interface AliasConfig {
+  baseDir: string;
+  aliases: AliasEntry[];
+  packages: Map<string, WorkspacePackage>;
+}
+
+const aliasConfigCache = new Map<string, AliasConfig | null>();
+
+function readJsonc(file: string): Record<string, any> | undefined {
+  try {
+    const raw = fs.readFileSync(file, 'utf-8');
+    const cleaned = raw
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|[^:"'])\/\/.*$/gm, '$1')
+      .replace(/,(\s*[}\]])/g, '$1');
+    return JSON.parse(cleaned) as Record<string, any>;
+  } catch {
+    return undefined;
+  }
+}
+
+function packageEntry(pkg: Record<string, any>): string {
+  const exportsField = pkg.exports;
+  if (typeof exportsField === 'string') {
+    return exportsField;
+  }
+  if (exportsField && typeof exportsField === 'object') {
+    const dot = exportsField['.'];
+    if (typeof dot === 'string') {
+      return dot;
+    }
+    if (dot && typeof dot === 'object') {
+      const first = dot.import ?? dot.require ?? dot.default;
+      if (typeof first === 'string') {
+        return first;
+      }
+    }
+  }
+  if (typeof pkg.module === 'string') {
+    return pkg.module;
+  }
+  return typeof pkg.main === 'string' ? pkg.main : 'index.js';
+}
+
+function readWorkspacePackages(baseDir: string): Map<string, WorkspacePackage> {
+  const packages = new Map<string, WorkspacePackage>();
+  const root = readJsonc(pathModule.join(baseDir, 'package.json'));
+  if (!root) {
+    return packages;
+  }
+  if (typeof root.name === 'string' && root.name.trim()) {
+    packages.set(root.name.trim(), { dir: baseDir, entry: packageEntry(root) });
+  }
+  const workspaces = Array.isArray(root.workspaces)
+    ? root.workspaces
+    : Array.isArray(root.workspaces?.packages)
+      ? root.workspaces.packages
+      : [];
+  for (const pattern of workspaces) {
+    if (typeof pattern !== 'string' || !pattern.includes('*')) {
+      continue;
+    }
+    const star = pattern.indexOf('*');
+    const head = pattern.slice(0, star).replace(/\/+$/, '');
+    const tail = pattern.slice(star + 1).replace(/^\/+/, '');
+    const dir = pathModule.join(baseDir, head);
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const pkgDir = tail ? pathModule.join(dir, entry, tail) : pathModule.join(dir, entry);
+      const pkg = readJsonc(pathModule.join(pkgDir, 'package.json'));
+      const name = pkg && typeof pkg.name === 'string' ? pkg.name.trim() : '';
+      if (name) {
+        packages.set(name, { dir: pkgDir, entry: packageEntry(pkg ?? {}) });
+      }
+    }
+  }
+  return packages;
+}
+
+function parseAliasConfig(file: string): AliasConfig | null {
+  const data = readJsonc(file);
+  if (!data) {
+    return null;
+  }
+  const dir = pathModule.dirname(file);
+  const compilerOptions = (data.compilerOptions ?? {}) as Record<string, any>;
+  if (typeof data.extends === 'string' && !compilerOptions.baseUrl && !compilerOptions.paths) {
+    const parentPath = data.extends.startsWith('.')
+      ? pathModule.resolve(dir, data.extends.endsWith('.json') ? data.extends : `${data.extends}.json`)
+      : undefined;
+    if (parentPath) {
+      const parent = parseAliasConfig(parentPath);
+      if (parent) {
+        return parent;
+      }
+    }
+  }
+  const baseUrl = typeof compilerOptions.baseUrl === 'string'
+    ? pathModule.resolve(dir, compilerOptions.baseUrl)
+    : dir;
+  const aliases: AliasEntry[] = [];
+  const paths = compilerOptions.paths;
+  if (paths && typeof paths === 'object') {
+    for (const [pattern, targets] of Object.entries(paths)) {
+      if (!Array.isArray(targets)) {
+        continue;
+      }
+      const star = pattern.indexOf('*');
+      aliases.push({
+        prefix: star >= 0 ? pattern.slice(0, star) : pattern,
+        suffix: star >= 0 ? pattern.slice(star + 1) : '',
+        hasStar: star >= 0,
+        targets: targets.filter((target): target is string => typeof target === 'string'),
+      });
+    }
+  }
+  return { baseDir: baseUrl, aliases, packages: readWorkspacePackages(baseUrl) };
+}
+
+function configForDirectory(dir: string): AliasConfig | null {
+  const cached = aliasConfigCache.get(dir);
+  if (cached !== undefined) {
+    return cached;
+  }
+  let result: AliasConfig | null = null;
+  for (const name of ['tsconfig.json', 'jsconfig.json']) {
+    const candidate = pathModule.join(dir, name);
+    if (fs.existsSync(candidate)) {
+      result = parseAliasConfig(candidate);
+      break;
+    }
+  }
+  if (!result) {
+    const parent = pathModule.dirname(dir);
+    if (parent !== dir) {
+      result = configForDirectory(parent);
+    }
+  }
+  aliasConfigCache.set(dir, result);
+  return result;
+}
+
+function aliasCandidates(config: AliasConfig, specifier: string): string[] {
+  const candidates: string[] = [];
+  for (const alias of config.aliases) {
+    let rest: string | undefined;
+    if (alias.hasStar) {
+      if (specifier.startsWith(alias.prefix) && specifier.endsWith(alias.suffix)) {
+        rest = specifier.slice(alias.prefix.length, specifier.length - alias.suffix.length || undefined);
+      }
+    } else if (specifier === alias.prefix) {
+      rest = '';
+    }
+    if (rest === undefined) {
+      continue;
+    }
+    for (const target of alias.targets) {
+      candidates.push(pathModule.resolve(config.baseDir, target.replace('*', rest)));
+    }
+  }
+  for (const [name, pkg] of config.packages) {
+    if (specifier === name) {
+      candidates.push(pathModule.resolve(pkg.dir, pkg.entry));
+    } else if (specifier.startsWith(`${name}/`)) {
+      const rest = specifier.slice(name.length + 1);
+      candidates.push(pathModule.resolve(pkg.dir, rest));
+      const entryDir = pathModule.dirname(pkg.entry);
+      if (entryDir && entryDir !== '.') {
+        candidates.push(pathModule.resolve(pkg.dir, entryDir, rest));
+      }
+    }
+  }
+  return candidates;
+}
+
+function probeAbsolute(candidate: string, known: Set<string>): string | undefined {
+  let fileUrl: string;
+  try {
+    fileUrl = pathToFileURL(candidate).toString();
+  } catch {
+    return undefined;
+  }
+  if (known.has(fileUrl)) {
+    return fileUrl;
+  }
+  for (const extension of RESOLVE_EXTENSIONS) {
+    const probe = `${fileUrl}${extension}`;
+    if (known.has(probe)) {
+      return probe;
+    }
+  }
+  const base = fileUrl.replace(/\/$/, '');
+  for (const suffix of ['/index', '/__init__']) {
+    const directory = `${base}${suffix}`;
+    if (known.has(directory)) {
+      return directory;
+    }
+    for (const extension of RESOLVE_EXTENSIONS) {
+      const probe = `${directory}${extension}`;
+      if (known.has(probe)) {
+        return probe;
+      }
+    }
+  }
+  return undefined;
+}
+
 export function resolveSpecifier(
   from: string,
   specifier: string,
   known: Set<string>,
 ): string | undefined {
   if (!specifier.startsWith('.') && !specifier.startsWith('/')) {
+    const filePath = decodedFilePath(from);
+    const config = filePath ? configForDirectory(pathModule.dirname(filePath)) : null;
+    if (!config) {
+      return undefined;
+    }
+    for (const candidate of aliasCandidates(config, specifier)) {
+      const resolved = probeAbsolute(candidate, known);
+      if (resolved) {
+        return resolved;
+      }
+    }
     return undefined;
   }
   let url: URL;
