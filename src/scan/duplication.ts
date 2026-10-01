@@ -834,6 +834,15 @@ export function extractExports(tree: Tree, profile: LanguageProfile, text: strin
       out.push({ name: value, line, isDefault });
     }
   };
+  if (profile.language === 'rust') {
+    for (const match of text.matchAll(/^\s*pub\s+(?:async\s+)?(?:fn|struct|enum|trait|union|type)\s+([A-Za-z_]\w*)/gm)) {
+      add(match[1], lineAt(text, match.index ?? 0), false);
+    }
+  } else if (profile.language === 'csharp') {
+    for (const match of text.matchAll(/^\s*public\s+(?:sealed\s+|abstract\s+|static\s+|partial\s+)*(?:class|interface|struct|enum|record)\s+([A-Za-z_]\w*)/gm)) {
+      add(match[1], lineAt(text, match.index ?? 0), false);
+    }
+  }
   if (isJsLike(profile)) {
     for (const node of named(tree.rootNode, profile)) {
       if (node.type !== 'export_statement') {
@@ -985,6 +994,51 @@ function csharpRouteAttribute(
   return undefined;
 }
 
+function routeShapeOf(route: string): string {
+  const normalized = route && !route.startsWith('/') ? `/${route}` : route;
+  return normalized
+    .replace(/\{[^}]+\}/g, ':p')
+    .replace(/:[A-Za-z_][\w]*/g, ':p')
+    .replace(/\/\d+/g, '/:n');
+}
+
+function frameworkHandlers(text: string): HandlerRecord[] {
+  const out: HandlerRecord[] = [];
+  const push = (name: string, method: string, route: string, index: number): void => {
+    out.push({
+      name,
+      line: lineAt(text, index),
+      hasAuth: false,
+      hasValidation: false,
+      method,
+      pathShape: routeShapeOf(route),
+    });
+  };
+  let match: RegExpExecArray | null;
+  const nest = /@(Get|Post|Put|Patch|Delete|All)\(\s*(['"`])([^'"`]*)\2?\s*\)/g;
+  while ((match = nest.exec(text)) !== null) {
+    const after = text.slice(match.index + match[0].length, match.index + match[0].length + 240);
+    const name = /(?:async\s+)([A-Za-z_$][\w$]*)\s*\(|([A-Za-z_$][\w$]*)\s*\(/.exec(after);
+    push(name?.[1] ?? name?.[2] ?? 'handler', match[1].toUpperCase(), match[3], match.index);
+  }
+  const express = /(?:app|router|server)\.(get|post|put|patch|delete|all)\(\s*(['"`])([^'"`]*)\2\s*,\s*(?:async\s+)?([A-Za-z_$][\w$]*)?/g;
+  while ((match = express.exec(text)) !== null) {
+    push(match[4] ?? 'handler', match[1].toUpperCase(), match[3], match.index);
+  }
+  const spring = /@(Get|Post|Put|Patch|Delete|Request)Mapping\(\s*(?:value\s*=\s*)?(?:['"]([^'"]*)['"]|\{)/g;
+  while ((match = spring.exec(text)) !== null) {
+    const after = text.slice(match.index + match[0].length, match.index + match[0].length + 400);
+    const signature = /[\w<>\[\], .?]+\s+([A-Za-z_]\w*)\s*\(/.exec(after);
+    push(
+      signature?.[1] ?? 'handler',
+      match[1] === 'Request' ? '' : match[1].toUpperCase(),
+      match[2] ?? '',
+      match.index,
+    );
+  }
+  return out;
+}
+
 export function extractHandlers(tree: Tree, profile: LanguageProfile, text: string): HandlerRecord[] {
   const out: HandlerRecord[] = [];
   for (const fn of functionsOf(tree, profile)) {
@@ -1025,6 +1079,7 @@ export function extractHandlers(tree: Tree, profile: LanguageProfile, text: stri
       }
     }
   }
+  out.push(...frameworkHandlers(text));
   return dedupeRecords(out, (record) => `${record.name}\u0000${record.line}`);
 }
 
@@ -1541,6 +1596,19 @@ export function extractTypes(tree: Tree, profile: LanguageProfile, text: string)
       members: typeMembers(node, profile),
     });
   };
+  if (profile.language === 'go') {
+    for (const match of text.matchAll(/^\s*type\s+([A-Z]\w*)\s+(struct|interface)\b/gm)) {
+      out.push({
+        name: match[1],
+        kind: match[2] === 'interface' ? 'interface' : 'class',
+        line: lineAt(text, match.index ?? 0),
+        exported: true,
+        methods: [],
+        implements: [],
+        members: [],
+      });
+    }
+  }
   if (isJsLike(profile)) {
     for (const node of named(tree.rootNode, profile)) {
       const exported = node.type === 'export_statement';
@@ -2690,6 +2758,7 @@ export class DuplicationIndex {
     const maxBytes = (this.options.getMaxFileKb?.() ?? 1024) * 1024;
     const maxFiles = Math.max(1, this.options.getMaxFiles?.() ?? MAX_FILES);
     const gitignore = await readGitignore(root);
+    const nestedIgnoreCache = new Map<string, string[]>();
     const files = await listWorkspaceFiles(root, { extensions: TEXT_EXTENSIONS, maxEntries: maxFiles });
     this.architectureCoverage = {
       unsupportedSourceFiles: 0,
@@ -2712,6 +2781,9 @@ export class DuplicationIndex {
       const absolute = path.join(root, relative);
       seenUris.add(pathToFileURL(absolute).toString());
       if (isIgnored(absolute, relative, ignore, gitignore)) {
+        continue;
+      }
+      if (await matchesNestedGitignore(root, absolute, nestedIgnoreCache)) {
         continue;
       }
       const extension = path.extname(absolute).toLowerCase();
@@ -2887,6 +2959,48 @@ async function readGitignore(root: string): Promise<string[]> {
   } catch {
     return [];
   }
+}
+
+async function gitignorePatterns(dir: string, cache: Map<string, string[]>): Promise<string[]> {
+  const cached = cache.get(dir);
+  if (cached) {
+    return cached;
+  }
+  let patterns: string[] = [];
+  try {
+    const raw = await fs.readFile(path.join(dir, '.gitignore'), 'utf-8');
+    patterns = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith('#'));
+  } catch {
+    patterns = [];
+  }
+  cache.set(dir, patterns);
+  return patterns;
+}
+
+async function matchesNestedGitignore(
+  root: string,
+  absolute: string,
+  cache: Map<string, string[]>,
+): Promise<boolean> {
+  let dir = path.dirname(absolute);
+  while (dir.length > root.length && dir.startsWith(root)) {
+    const patterns = await gitignorePatterns(dir, cache);
+    if (patterns.length > 0) {
+      const relative = path.relative(dir, absolute).split(path.sep).join('/');
+      if (matchesGitignore(relative, patterns)) {
+        return true;
+      }
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      break;
+    }
+    dir = parent;
+  }
+  return false;
 }
 
 function matchesGitignore(relative: string, patterns: string[]): boolean {

@@ -203,3 +203,21 @@ describe('structural language indexing', () => {
     expect(files.some((file) => file.endsWith('Main.kt'))).toBe(true);
   });
 });
+
+describe('nested gitignore', () => {
+  it('skips files ignored by a nested .gitignore', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dev-first-nested-'));
+    await fs.mkdir(path.join(root, 'generated'), { recursive: true });
+    await fs.writeFile(path.join(root, 'generated', '.gitignore'), '*.swift\n');
+    await fs.writeFile(path.join(root, 'generated', 'Skip.swift'), '');
+    await fs.writeFile(path.join(root, 'Keep.swift'), '');
+    const index = new DuplicationIndex({
+      root,
+      parse: (text, languageId) => service.parse(text, languageId),
+    });
+    await index.ensureBuilt();
+    const files = (await index.getFacts()).map((file) => file.file);
+    expect(files.some((file) => file.endsWith('Keep.swift'))).toBe(true);
+    expect(files.some((file) => file.endsWith('Skip.swift'))).toBe(false);
+  });
+});

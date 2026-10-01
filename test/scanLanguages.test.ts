@@ -363,3 +363,29 @@ describe('Rust modules and Tauri command evidence', () => {
     expect(result.some((relation) => relation.label === 'calls')).toBe(false);
   });
 });
+
+describe('framework handler extraction', () => {
+  it('reads Spring, Express, and Nest route declarations', async () => {
+    const spring = await extract('@GetMapping("/users/{id}")\npublic User getUser() { return null; }', 'java');
+    expect(spring.handlers).toContainEqual(
+      expect.objectContaining({ method: 'GET', pathShape: '/users/:p' }),
+    );
+    const express = await extract("router.post('/items', createItem);", 'typescript');
+    expect(express.handlers).toContainEqual(
+      expect.objectContaining({ method: 'POST', pathShape: '/items' }),
+    );
+    const nest = await extract("@Get(':id')\nasync findOne() {}", 'typescript');
+    expect(nest.handlers).toContainEqual(
+      expect.objectContaining({ method: 'GET', pathShape: '/:p' }),
+    );
+  });
+
+  it('extracts Rust exports and Go types', async () => {
+    const rust = await extract('pub fn greet() {}\npub struct User {}', 'rust');
+    expect(rust.exports.map((entry) => entry.name)).toEqual(
+      expect.arrayContaining(['greet', 'User']),
+    );
+    const go = await extract('type User struct { Name string }\ntype Reader interface {}', 'go');
+    expect(go.types.map((entry) => entry.name)).toEqual(expect.arrayContaining(['User', 'Reader']));
+  });
+});
