@@ -47,10 +47,10 @@ export function PlanCard({
     sections.push({ key: 'what', label: 'WHAT', content: plan.what });
   }
   if (plan.how) {
-    sections.push({ key: 'how', label: 'HOW', content: plan.how });
+    sections.push({ key: 'how', label: 'HOW IT WILL WORK', content: plan.how });
   }
   if (plan.why) {
-    sections.push({ key: 'why', label: 'WHY', content: plan.why });
+    sections.push({ key: 'why', label: 'WHY THIS DESIGN', content: plan.why });
   }
   if (plan.tradeoff) {
     sections.push({ key: 'tradeoff', label: 'TRADEOFF', content: plan.tradeoff });
@@ -67,6 +67,25 @@ export function PlanCard({
       status: (plan.skippedSteps?.includes(index) ? 'done' : 'pending') as TodoItem['status'],
     }));
   const completedTasks = todos.filter((todo) => todo.status === 'done').length;
+
+  const renderSection = (section: Section) => (
+    <div className="plan-section" key={section.key}>
+      <div className="plan-section-label">
+        {section.label}
+        <button
+          className="section-explain"
+          title={`Explain ${section.label} in more depth`}
+          onClick={() => post({ type: 'explainSection', key: section.key })}
+        >
+          <span className="codicon codicon-book" />
+        </button>
+      </div>
+      <div className="plan-section-content">
+        <Markdown text={section.content} />
+      </div>
+      {section.key === 'how' && plan.flow && <MermaidDiagram source={plan.flow} />}
+    </div>
+  );
 
   return (
     <div className={`plan-card anim-fade-slide ${approved ? 'approved' : 'draft'}`}>
@@ -131,76 +150,30 @@ export function PlanCard({
                 </div>
               )}
 
-              {liveTasks.length > 0 && (
-                <section className="plan-todo-section" aria-label="Plan tasks">
-                  <div className="plan-todo-heading">
-                    <span>{todos.length > 0 ? `${completedTasks}/${liveTasks.length}` : liveTasks.length}</span>
-                    <span>Todo</span>
-                    {phase === 'executing' && <span className="plan-todo-running">In progress</span>}
-                  </div>
-                  <ul className="plan-todo-list">
-                    {liveTasks.map((todo, index) => {
-                      const skipped = todos.length === 0 && (plan.skippedSteps?.includes(index) ?? false);
-                      const content = (
-                        <>
-                          <span className={`todo-icon codicon codicon-${todo.status === 'done' ? 'circle-filled' : todo.status === 'in_progress' ? 'sync' : 'circle-outline'}`} aria-hidden="true" />
-                          <span className="todo-text"><InlineMarkdown text={todo.text} /></span>
-                          {todo.checkpointId && <span className="todo-revert-icon codicon codicon-history" aria-hidden="true" />}
-                        </>
-                      );
-                      return (
-                        <li key={`${index}-${todo.text}`} className={`todo-item todo-${todo.status} ${skipped ? 'todo-skipped' : ''}`}>
-                          {todo.checkpointId ? (
-                            <button className="todo-row todo-clickable" title="Revert the workspace to before this step" onClick={() => post({ type: 'revertToCheckpoint', checkpointId: todo.checkpointId! })}>
-                              {content}
-                            </button>
-                          ) : !approved && todos.length === 0 ? (
-                            <label className="todo-row plan-todo-toggle">
-                              <input type="checkbox" className="step-check" checked={!skipped} title={skipped ? 'Include this step' : 'Skip this step'} aria-label={`${skipped ? 'Include' : 'Skip'} step ${index + 1}`} onChange={() => post({ type: 'toggleStep', index })} />
-                              {content}
-                            </label>
-                          ) : (
-                            <div className="todo-row">{content}</div>
-                          )}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </section>
-              )}
-
-              {sections.map((section) => (
-                <div className="plan-section" key={section.key}>
-                  <div className="plan-section-label">
-                    {section.label}
-                    <button
-                      className="section-explain"
-                      title={`Explain ${section.label} in more depth`}
-                      onClick={() => post({ type: 'explainSection', key: section.key })}
-                    >
-                      <span className="codicon codicon-book" />
-                    </button>
-                  </div>
-                  <div className="plan-section-content">
-                    <Markdown text={section.content} />
-                  </div>
-                  {section.key === 'how' && plan.flow && <MermaidDiagram source={plan.flow} />}
-                </div>
-              ))}
+              {sections.filter((section) => section.key !== 'tradeoff').map(renderSection)}
 
               {plan.context && plan.context.length > 0 && (
                 <div className="plan-section">
-                  <div className="plan-section-label">CONTEXT</div>
+                  <div className="plan-section-label">EVIDENCE CHECKED</div>
                   <ul className="plan-context">
                     {plan.context.map((entry, index) => (
                       <li key={index}>
-                        <code>{entry.path}</code>
+                        <button
+                          className="plan-context-link"
+                          title={`Open ${entry.path}${entry.startLine ? ` at line ${entry.startLine}` : ''}`}
+                          onClick={() => post({ type: 'openFile', path: `${entry.path}${entry.startLine ? `:${entry.startLine}` : ''}` })}
+                        >
+                          <span className="codicon codicon-go-to-file" /> {entry.path}
+                          {entry.startLine && `:${entry.startLine}${entry.endLine && entry.endLine !== entry.startLine ? `-${entry.endLine}` : ''}`}
+                        </button>
                         <span className="plan-context-role"> — {entry.role}</span>
                       </li>
                     ))}
                   </ul>
                 </div>
               )}
+
+              {sections.filter((section) => section.key === 'tradeoff').map(renderSection)}
 
               {plan.risks && plan.risks.length > 0 && (
                 <div className="plan-section plan-risks">
@@ -240,6 +213,44 @@ export function PlanCard({
                     <InlineMarkdown text={`Recommendation: leave as-is — ${plan.leaveAsIs}`} />
                   </span>
                 </div>
+              )}
+
+              {liveTasks.length > 0 && (
+                <section className="plan-todo-section" aria-label="Plan tasks">
+                  <div className="plan-todo-heading">
+                    <span>{todos.length > 0 ? `${completedTasks}/${liveTasks.length}` : liveTasks.length}</span>
+                    <span>Todo</span>
+                    {phase === 'executing' && <span className="plan-todo-running">In progress</span>}
+                  </div>
+                  <ul className="plan-todo-list">
+                    {liveTasks.map((todo, index) => {
+                      const skipped = todos.length === 0 && (plan.skippedSteps?.includes(index) ?? false);
+                      const content = (
+                        <>
+                          <span className={`todo-icon codicon codicon-${todo.status === 'done' ? 'circle-filled' : todo.status === 'in_progress' ? 'sync' : 'circle-outline'}`} aria-hidden="true" />
+                          <span className="todo-text"><InlineMarkdown text={todo.text} /></span>
+                          {todo.checkpointId && <span className="todo-revert-icon codicon codicon-history" aria-hidden="true" />}
+                        </>
+                      );
+                      return (
+                        <li key={`${index}-${todo.text}`} className={`todo-item todo-${todo.status} ${skipped ? 'todo-skipped' : ''}`}>
+                          {todo.checkpointId ? (
+                            <button className="todo-row todo-clickable" title="Revert the workspace to before this step" onClick={() => post({ type: 'revertToCheckpoint', checkpointId: todo.checkpointId! })}>
+                              {content}
+                            </button>
+                          ) : !approved && todos.length === 0 ? (
+                            <label className="todo-row plan-todo-toggle">
+                              <input type="checkbox" className="step-check" checked={!skipped} title={skipped ? 'Include this step' : 'Skip this step'} aria-label={`${skipped ? 'Include' : 'Skip'} step ${index + 1}`} onChange={() => post({ type: 'toggleStep', index })} />
+                              {content}
+                            </label>
+                          ) : (
+                            <div className="todo-row">{content}</div>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </section>
               )}
             </>
           )}

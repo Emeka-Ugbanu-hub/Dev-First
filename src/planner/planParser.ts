@@ -88,20 +88,46 @@ function normalizeContext(value: unknown): PlanContextEntry[] | undefined {
   const entries = value
     .map((item) => {
       if (typeof item === 'string' && item.trim()) {
-        const [path, ...rest] = item.split(/\s+—\s+|\s+-\s+/);
-        return { path: path.trim(), role: rest.join(' ').trim() || 'Referenced file' };
+        const [source, ...rest] = item.split(/\s+—\s+|\s+-\s+/);
+        return { ...parseContextSource(source.trim()), role: rest.join(' ').trim() || 'Referenced file' };
       }
       if (item && typeof item === 'object') {
         const record = item as Record<string, unknown>;
         const path = firstString(record.path, record.file, record.name);
         if (path) {
-          return { path, role: firstString(record.role, record.description, record.what) ?? 'Referenced file' };
+          const startLine = positiveLine(record.startLine ?? record.start ?? record.line);
+          const endLine = positiveLine(record.endLine ?? record.end) ?? startLine;
+          return {
+            path,
+            role: firstString(record.role, record.description, record.what) ?? 'Referenced file',
+            ...(startLine ? { startLine } : {}),
+            ...(endLine ? { endLine } : {}),
+          };
         }
       }
       return undefined;
     })
     .filter((entry): entry is PlanContextEntry => Boolean(entry));
   return entries.length > 0 ? entries : undefined;
+}
+
+function parseContextSource(source: string): Pick<PlanContextEntry, 'path' | 'startLine' | 'endLine'> {
+  const match = /^(.*?):(\d+)(?:-(\d+))?$/.exec(source);
+  if (!match) {
+    return { path: source };
+  }
+  const startLine = Number(match[2]);
+  const endLine = match[3] ? Number(match[3]) : startLine;
+  return {
+    path: match[1],
+    ...(Number.isInteger(startLine) && startLine > 0 ? { startLine } : {}),
+    ...(Number.isInteger(endLine) && endLine > 0 ? { endLine } : {}),
+  };
+}
+
+function positiveLine(value: unknown): number | undefined {
+  const line = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  return Number.isInteger(line) && line > 0 ? line : undefined;
 }
 
 export function parsePlanFromText(text: string, version: number): Plan | undefined {
@@ -150,7 +176,7 @@ export function planFromText(markdown: string, version: number): Plan | undefine
     if (section === 'CONTEXT') {
       const match = /^[-*]\s*(.+?)(?:\s+—\s+|\s+-\s+)(.*)$/.exec(line.trim());
       if (match) {
-        context.push({ path: match[1].trim(), role: match[2].trim() });
+        context.push({ ...parseContextSource(match[1].trim()), role: match[2].trim() });
       }
       continue;
     }
@@ -259,7 +285,10 @@ export function planToText(plan: Plan): string {
   }
   if (plan.context?.length) {
     lines.push('CONTEXT:');
-    plan.context.forEach((entry) => lines.push(`- ${entry.path} — ${entry.role}`));
+    plan.context.forEach((entry) => {
+      const range = entry.startLine ? `:${entry.startLine}${entry.endLine && entry.endLine !== entry.startLine ? `-${entry.endLine}` : ''}` : '';
+      lines.push(`- ${entry.path}${range} — ${entry.role}`);
+    });
   }
   if (plan.steps?.length) {
     lines.push('PLAN:');

@@ -505,7 +505,7 @@ export function parseFinishFiles(args: Record<string, any>): Array<{ path: strin
 export const submitPlanTool: ToolDef = {
   name: 'submit_plan',
   description:
-    'Submit a plan or a revised plan for a change request. Use this ONLY when the developer asked for a change. Do NOT use this tool for questions — answer those in plain chat text. Include ONLY the sections that add information.',
+    'Submit a plan or a revised plan for a change request. Use this ONLY when the developer asked for a change. Do NOT use this tool for questions — answer those in plain chat text.',
   parameters: {
     type: 'object',
     properties: {
@@ -516,20 +516,22 @@ export const submitPlanTool: ToolDef = {
       },
       what: {
         type: 'string',
-        description: 'For a plan: what we are actually doing.',
+        description: 'The user-visible or code-level result of the change.',
       },
       how: {
         type: 'string',
-        description: 'How the pieces work together. Reference real files/functions.',
+        description:
+          'How the verified code flow will work: where it enters, which real files/functions participate, what each owns, and how control or data moves between them.',
       },
       flow: {
         type: 'string',
         description:
-          'Optional Mermaid diagram (graph TD or graph LR) when there is a real flow or hierarchy to show, e.g. "graph TD\\n  A[Login Page] --> B[AuthService]". Omit for simple tasks.',
+          'Optional verified Mermaid diagram (graph TD or graph LR) when seeing a multi-component flow, boundary, or state transition is clearer than reading HOW. Omit when prose is clearer.',
       },
       why: {
         type: 'string',
-        description: 'Only include when the approach is non-obvious or a choice was made.',
+        description:
+          'Why this change belongs in these modules or layers. Include when ownership, layering, or the chosen approach is not obvious.',
       },
       tradeoff: {
         type: 'string',
@@ -563,12 +565,14 @@ export const submitPlanTool: ToolDef = {
       context: {
         type: 'array',
         description:
-          'Key files involved, each with a one-line role. Only files you actually read. Helps the developer learn where things live.',
+          'Files actually read to support the plan. Give each a one-line role and source lines when known, so the developer can inspect the evidence.',
         items: {
           type: 'object',
           properties: {
             path: { type: 'string', description: 'Workspace-relative file path.' },
             role: { type: 'string', description: 'One line: what this file does in this context.' },
+            startLine: { type: 'number', description: 'One-based first supporting line, when known.' },
+            endLine: { type: 'number', description: 'One-based last supporting line, when known.' },
           },
           required: ['path', 'role'],
         },
@@ -581,7 +585,7 @@ export const submitPlanTool: ToolDef = {
       steps: {
         type: 'array',
         items: { type: 'string' },
-        description: 'Concrete, ordered actions for a plan. Name files and functions.',
+        description: 'Concrete, ordered changes that implement the explanation. Name files and functions.',
       },
     },
   },

@@ -98,6 +98,22 @@ describe('planFromObject', () => {
     expect(plan?.context?.[0]).toEqual({ path: 'lib/redis.ts', role: 'existing client' });
   });
 
+  it('parses source ranges from structured plan context', () => {
+    const plan = planFromObject(
+      {
+        steps: ['Add the endpoint'],
+        context: [{ path: 'src/routes/health.ts', role: 'registers the route', startLine: 12, endLine: 24 }],
+      },
+      1,
+    );
+    expect(plan?.context?.[0]).toEqual({
+      path: 'src/routes/health.ts',
+      role: 'registers the route',
+      startLine: 12,
+      endLine: 24,
+    });
+  });
+
   it('infers explanation when there are no steps', () => {
     const plan = planFromObject({ what: 'just an answer' }, 1);
     expect(plan?.intent).toBe('explanation');
@@ -217,6 +233,23 @@ describe('planToText', () => {
     expect(text).toContain('CONTEXT:\n- a.ts — does a thing');
   });
 
+  it('round-trips context source ranges', () => {
+    const parsed = planFromText(
+      planToText({
+        version: 1,
+        status: 'draft',
+        context: [{ path: 'src/routes/health.ts', role: 'registers the route', startLine: 12, endLine: 24 }],
+      }),
+      1,
+    );
+    expect(parsed?.context?.[0]).toEqual({
+      path: 'src/routes/health.ts',
+      role: 'registers the route',
+      startLine: 12,
+      endLine: 24,
+    });
+  });
+
   it('renders the learning sections', () => {
     const text = planToText({
       version: 1,
@@ -326,12 +359,12 @@ describe('planner prompt learning fields', () => {
     expect(prompt).toContain('NOT worth doing now');
   });
 
-  it('makes plan context optional for small or routine plans', () => {
+  it('asks for code-backed explanations and context for approval plans', () => {
     const prompt = buildPlannerSystemPrompt();
-    expect(prompt).toContain(
-      'context: include the key files you actually read with a one-line role each only when they materially help explain the plan; omit for small or routine plans.',
-    );
-    expect(prompt).not.toContain('whenever you deliver a plan');
+    expect(prompt).toContain('A draft plan is both an execution specification and an explanation for the developer');
+    expect(prompt).toContain('do not omit HOW when the change crosses files, layers, or responsibilities');
+    expect(prompt).toContain('Context is evidence for the explanation');
+    expect(prompt).toContain('Do not create an approval plan from an unverified assumption');
   });
 
   it('points the planner at stored conventions and project-wide explanations', () => {

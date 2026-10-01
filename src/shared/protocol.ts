@@ -3,6 +3,9 @@ export type Phase = 'idle' | 'planning' | 'executing' | 'review';
 export interface PlanContextEntry {
   path: string;
   role: string;
+  /** One-based source range that supports the plan's explanation, when known. */
+  startLine?: number;
+  endLine?: number;
 }
 
 export interface Plan {

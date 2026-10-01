@@ -129,6 +129,35 @@ describe('PlanCard', () => {
     expect(html).not.toContain('**JWT**');
     expect(html).not.toContain('**handler-layer**');
   });
+
+  it('places the explanation and evidence before the plan steps', () => {
+    const html = render({
+      version: 1,
+      status: 'draft',
+      what: 'Add the endpoint',
+      how: 'The router calls the handler.',
+      why: 'Dispatch belongs in the route layer.',
+      tradeoff: 'Middleware would be more general but adds a hop.',
+      context: [{ path: 'src/routes/health.ts', role: 'registers the route', startLine: 12, endLine: 24 }],
+      steps: ['Register the route'],
+    });
+    expect(html.indexOf('HOW IT WILL WORK')).toBeLessThan(html.indexOf('WHY THIS DESIGN'));
+    expect(html.indexOf('WHY THIS DESIGN')).toBeLessThan(html.indexOf('EVIDENCE CHECKED'));
+    expect(html.indexOf('EVIDENCE CHECKED')).toBeLessThan(html.indexOf('TRADEOFF'));
+    expect(html.indexOf('TRADEOFF')).toBeLessThan(html.indexOf('plan-todo-heading'));
+  });
+
+  it('opens context at its supporting source line', () => {
+    const element = mount({
+      version: 1,
+      status: 'draft',
+      context: [{ path: 'src/routes/health.ts', role: 'registers the route', startLine: 12, endLine: 24 }],
+    });
+    const button = element.querySelector('.plan-context-link');
+    expect(button?.textContent).toContain('src/routes/health.ts:12-24');
+    click(button!);
+    expect(sent).toContainEqual({ type: 'openFile', path: 'src/routes/health.ts:12' });
+  });
 });
 
 describe('PlanCard discard action', () => {
