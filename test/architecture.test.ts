@@ -27,16 +27,6 @@ import { computeRelations } from '../src/architecture/relations';
 import type { ArchitectureRelation } from '../src/architecture/relations';
 import { classifyLevelChildren, orderLevel } from '../src/architecture/flow';
 import {
-  LEVEL_LABELS_SYSTEM,
-  buildLevelSummary,
-  cachedLevelLabels,
-  filterLevelLabels,
-  inferLevelLabels,
-  levelSummaryHash,
-  parseLevelLabels,
-} from '../src/architecture/labels';
-import type { LevelLabels } from '../src/architecture/labels';
-import {
   findPackageRoots,
   parseCargoToml,
   parseGoMod,
@@ -50,7 +40,6 @@ import {
   levelRelations,
   mermaidForNode,
   openArchitectureFile,
-  truncateSubtext,
 } from '../src/architecture/panel';
 
 function facts(file: string, overrides: Partial<FileFacts> = {}): FileFacts {
@@ -435,11 +424,11 @@ describe('manifest package boundaries', () => {
       factsFor(root, 'packages/b/src/components/Card.tsx'),
     ];
     const tree = buildArchitectureTree(files);
-    expect(tree.children.map((child) => child.label).sort()).toEqual(['alpha', 'beta']);
-    expect(tree.children.find((child) => child.label === 'beta')?.files).toHaveLength(2);
+    expect(tree.children.map((child) => child.label).sort()).toEqual(['Backend', 'Frontend']);
+    expect(tree.children.find((child) => child.label === 'Frontend')?.files).toHaveLength(2);
   });
 
-  it('falls back to directory names when manifests omit names', () => {
+  it('names packages by role and falls back to directory names', () => {
     const root = workspace({
       'packages/a/package.json': '{}',
       'packages/a/index.ts': '',
@@ -451,7 +440,7 @@ describe('manifest package boundaries', () => {
       factsFor(root, 'packages/b/main.go'),
     ];
     const tree = buildArchitectureTree(files);
-    expect(tree.children.map((child) => child.label).sort()).toEqual(['a', 'beacon']);
+    expect(tree.children.map((child) => child.label).sort()).toEqual(['Backend', 'a']);
   });
 
   it('keeps single-package projects on the existing signals', () => {
@@ -747,7 +736,7 @@ describe('refineTree', () => {
     expect(entry?.files).toHaveLength(2);
   });
 
-  it('disambiguates duplicate package domain labels with their dominant folder', () => {
+  it('names Tauri packages by role', () => {
     const root = workspace({
       'package.json': '{"name":"companion"}',
       'src-tauri/Cargo.toml': '[package]\nname = "companion"\nversion = "0.1.0"\n',
@@ -757,10 +746,7 @@ describe('refineTree', () => {
       factsFor(root, 'src/main.tsx'),
       factsFor(root, 'src-tauri/src/main.rs'),
     ]);
-    expect(tree.children.map((child) => child.label).sort()).toEqual([
-      'companion · src',
-      'companion · src-tauri',
-    ]);
+    expect(tree.children.map((child) => child.label).sort()).toEqual(['Backend', 'Frontend']);
   });
 });
 
@@ -801,7 +787,7 @@ describe('architecture view', () => {
 });
 
 describe('buildArchitectureTree relationships', () => {
-  it('aggregates import edges into usedBy and dependsOn', () => {
+  it('does not derive dependencies from imports', () => {
     const files = [
       facts('file:///w/src/routes/users.ts', {
         imports: [{ specifier: '../db/user', names: ['user'], line: 0 }],
@@ -814,17 +800,7 @@ describe('buildArchitectureTree relationships', () => {
     ];
     const tree = buildArchitectureTree(files);
     const backend = tree.children.find((child) => child.label === 'Backend');
-    const database = tree.children.find((child) => child.label === 'Database');
-    expect(backend?.dependsOn).toContain('Database');
-    expect(database?.usedBy).toContain('Backend');
-    const importer = allNodes(tree).find(
-      (node) => node.kind === 'file' && node.files[0] === 'file:///w/src/routes/users.ts',
-    );
-    expect(importer?.dependsOn).toContain('user.ts');
-    const target = allNodes(tree).find(
-      (node) => node.kind === 'file' && node.files[0] === 'file:///w/src/db/user.ts',
-    );
-    expect(target?.usedBy).toContain('users.ts');
+    expect(backend?.dependsOn).toEqual([]);
   });
 });
 
@@ -921,7 +897,6 @@ describe('ArchitectureSession', () => {
     await session.load();
     const initial = levelMessages(messages).at(-1);
     expect(initial?.node?.files).toHaveLength(3);
-    expect(initial?.coverage).toMatchObject({ indexedFiles: 3, representedFiles: 3, unsupportedSourceFiles: 0 });
     current = [
       facts('file:///w/src/db/user.ts'),
       facts('file:///w/src/db/order.ts'),
@@ -1023,115 +998,6 @@ describe('ArchitectureSession', () => {
   });
 });
 
-describe('ArchitectureSession lazy level labels', () => {
-  const groupFiles = [
-    facts('file:///w/src/routes/a/one.ts'),
-    facts('file:///w/src/routes/a/two.ts'),
-    facts('file:///w/src/routes/b/one.ts'),
-    facts('file:///w/src/routes/b/two.ts'),
-    facts('file:///w/src/db/user.ts'),
-  ];
-  const rootLabels = JSON.stringify({
-    nodes: [{ id: 'domain:backend', label: 'API', subtext: 'Handles every HTTP route' }],
-  });
-  const backendLabels = JSON.stringify({
-    nodes: [
-      {
-        id: 'domain:backend/subsystem:routes/component:dir-routes-a',
-        label: 'Read routes',
-        subtext: 'Serves read endpoints',
-      },
-    ],
-  });
-
-  function labelSession(
-    getFacts: () => Promise<FileFacts[]>,
-    provider: LLMProvider | undefined,
-    cache: Map<string, LevelLabels | null>,
-  ): { session: ArchitectureSession; messages: TestMessage[] } {
-    const messages: TestMessage[] = [];
-    const session = new ArchitectureSession({
-      getFacts,
-      post: (message) => messages.push(message as TestMessage),
-      isVisible: () => true,
-      ...(provider ? { getProvider: async () => ({ provider, model: 'model' }) } : {}),
-      labelsCache: cache,
-    });
-    return { session, messages };
-  }
-
-  it('builds without an AI call, labels once on first open, and reuses the cache', async () => {
-    const { provider, calls } = providerReturning([rootLabels]);
-    const cache = new Map<string, LevelLabels | null>();
-    const { session, messages } = labelSession(async () => groupFiles, provider, cache);
-    await session.load();
-    expect(calls()).toBe(0);
-    expect(levelMessages(messages).at(-1)?.diagram).toContain('…');
-    session.renderCurrent();
-    await flush();
-    expect(calls()).toBe(1);
-    const labeled = levelMessages(messages).at(-1);
-    expect(labeled?.children?.map((child) => child.label)).toContain('API');
-    expect(labeled?.diagram).toContain('Handles every HTTP route');
-    session.navigate('project');
-    await flush();
-    expect(calls()).toBe(1);
-    expect(cache.size).toBe(1);
-    session.dispose();
-  });
-
-  it('labels each group level once and reuses cached labels on reopen', async () => {
-    const { provider, calls } = providerReturning([rootLabels, backendLabels]);
-    const cache = new Map<string, LevelLabels | null>();
-    const { session, messages } = labelSession(async () => groupFiles, provider, cache);
-    await session.load();
-    session.renderCurrent();
-    await flush();
-    expect(calls()).toBe(1);
-    session.navigate('domain:backend');
-    await flush();
-    expect(calls()).toBe(2);
-    expect(levelMessages(messages).at(-1)?.children?.map((child) => child.label)).toContain(
-      'Read routes',
-    );
-    session.navigate('project');
-    await flush();
-    session.navigate('domain:backend');
-    await flush();
-    expect(calls()).toBe(2);
-    expect(cache.size).toBe(2);
-    session.dispose();
-  });
-
-  it('keeps deterministic output without a provider', async () => {
-    const cache = new Map<string, LevelLabels | null>();
-    const { session, messages } = labelSession(async () => groupFiles, undefined, cache);
-    await session.load();
-    session.renderCurrent();
-    await flush();
-    expect(cache.size).toBe(0);
-    const latest = levelMessages(messages).at(-1);
-    expect(latest?.children?.map((child) => child.label)).toContain('Backend');
-    expect(latest?.diagram).not.toContain('…');
-    session.dispose();
-  });
-
-  it('regenerates labels when the level summary changes after a refresh', async () => {
-    let current = groupFiles;
-    const { provider, calls } = providerReturning([rootLabels, rootLabels]);
-    const cache = new Map<string, LevelLabels | null>();
-    const { session } = labelSession(async () => current, provider, cache);
-    await session.load();
-    session.renderCurrent();
-    await flush();
-    expect(calls()).toBe(1);
-    current = [...groupFiles, facts('file:///w/src/utils/format.ts')];
-    await session.refresh();
-    await flush();
-    expect(calls()).toBe(2);
-    session.dispose();
-  });
-});
 
 describe('openArchitectureFile', () => {
   it('reports a deleted file with a status message and nothing else', async () => {
@@ -1163,11 +1029,11 @@ describe('openArchitectureFile', () => {
   });
 });
 
+
 describe('computeRelations', () => {
-  it('keeps imported and proven endpoint relationships separate with evidence', () => {
+  it('proves REST endpoint relationships with evidence', () => {
     const files = [
       facts('file:///w/src/api/users.ts', {
-        imports: [{ specifier: '../handlers/user', names: ['getUser'], line: 0 }],
         httpCalls: [{ method: 'GET', path: '/users', pathShape: '/users', line: 1 }],
       }),
       facts('file:///w/src/handlers/user.ts', {
@@ -1179,91 +1045,23 @@ describe('computeRelations', () => {
       ['file:///w/src/handlers/user.ts', 'n2'],
     ]);
     const relations = computeRelations(files, nodeMap);
-    expect(relations.map((relation) => relation.label).sort()).toEqual(['imports', 'matches endpoint']);
-    expect(relations.every((relation) => relation.toId === 'n2')).toBe(true);
-    expect(relations.find((relation) => relation.label === 'imports')?.evidence[0]).toMatchObject({
-      fromFile: 'file:///w/src/api/users.ts', toFile: 'file:///w/src/handlers/user.ts', line: 0,
-    });
-    expect(relations.find((relation) => relation.label === 'matches endpoint')?.evidence)
-      .toEqual(expect.arrayContaining([
+    expect(relations.map((relation) => relation.label)).toEqual(['matches endpoint']);
+    expect(relations[0].evidence).toEqual(
+      expect.arrayContaining([
         expect.objectContaining({ role: 'use site', line: 1 }),
         expect.objectContaining({ role: 'handler' }),
-      ]));
+      ]),
+    );
   });
 
-  it('does not let protocol imports relabel unrelated local imports', () => {
+  it('does not turn imports into relationships', () => {
     const files = [
-      facts('file:///w/src/gqlClient.ts', {
-        imports: [
-          { specifier: '@apollo/client', names: ['gql'], line: 0 },
-          { specifier: './api', names: ['api'], line: 1 },
-        ],
-      }),
-      facts('file:///w/src/tauriClient.ts', {
-        imports: [
-          { specifier: '@tauri-apps/api/core', names: ['invoke'], line: 0 },
-          { specifier: './api', names: ['api'], line: 1 },
-        ],
-      }),
-      facts('file:///w/src/api.ts'),
-    ];
-    const nodeMap = new Map([
-      ['file:///w/src/gqlClient.ts', 'n1'],
-      ['file:///w/src/tauriClient.ts', 'n2'],
-      ['file:///w/src/api.ts', 'n3'],
-    ]);
-    const relations = computeRelations(files, nodeMap);
-    expect(relations).toHaveLength(2);
-    expect(relations.every((relation) => relation.label === 'imports')).toBe(true);
-    expect(relations.every((relation) => relation.evidence[0].kind === 'import')).toBe(true);
-  });
-
-  it('keeps ordinary imports separate from independently evidenced endpoints', () => {
-    const files = [
-      facts('file:///w/src/client.ts', {
-        imports: [
-          { specifier: 'graphql', names: ['gql'], line: 0 },
-          { specifier: './server', names: ['server'], line: 1 },
-        ],
-        httpCalls: [{ method: 'GET', path: '/health', pathShape: '/health', line: 2 }],
-      }),
-      facts('file:///w/src/server.ts', {
-        handlers: [handlerOf('health', { method: 'GET', pathShape: '/health' })],
-      }),
-    ];
-    const nodeMap = new Map([
-      ['file:///w/src/client.ts', 'n1'],
-      ['file:///w/src/server.ts', 'n2'],
-    ]);
-    const relations = computeRelations(files, nodeMap);
-    expect(relations).toHaveLength(2);
-    expect(relations.map((relation) => relation.label).sort()).toEqual(['imports', 'matches endpoint']);
-    expect(relations.find((relation) => relation.label === 'imports')?.evidence).toHaveLength(1);
-    expect(relations.find((relation) => relation.label === 'matches endpoint')?.evidence).toHaveLength(2);
-  });
-
-  it('reports unresolved local imports and unregistered Tauri invocations', async () => {
-    const { analyzeArchitectureRelations } = await import('../src/architecture/relations');
-    const files = [facts('file:///w/src/caller.ts', {
-      imports: [{ specifier: './missing', names: ['missing'], line: 2 }],
-      httpCalls: [{ method: 'IPC', path: 'missing_command', pathShape: '', line: 4 }],
-    })];
-    const result = analyzeArchitectureRelations(files, new Map([[files[0].file, 'n1']]));
-    expect(result.relations).toEqual([]);
-    expect(result.unresolvedImports).toBe(1);
-    expect(result.unresolvedTauriCommands).toBe(1);
-  });
-
-  it('drops self-edges', () => {
-    const files = [
-      facts('file:///w/src/a.ts', {
-        imports: [{ specifier: './b', names: ['b'], line: 0 }],
-      }),
+      facts('file:///w/src/a.ts', { imports: [{ specifier: './b', names: ['b'], line: 0 }] }),
       facts('file:///w/src/b.ts'),
     ];
     const nodeMap = new Map([
       ['file:///w/src/a.ts', 'n1'],
-      ['file:///w/src/b.ts', 'n1'],
+      ['file:///w/src/b.ts', 'n2'],
     ]);
     expect(computeRelations(files, nodeMap)).toEqual([]);
   });
@@ -1300,24 +1098,21 @@ describe('mermaidForNode relationships', () => {
     expect(capped.match(/-\. "/g)?.length).toBe(13);
   });
 
-  it('emits real level relations as dashed edges', () => {
+  it('emits proven level relations as dashed edges', () => {
     const files = [
       facts('file:///w/src/routes/users.ts', {
-        imports: [
-          { specifier: 'graphql', names: ['gql'], line: 0 },
-          { specifier: '../db/user', names: ['user'], line: 1 },
-        ],
+        httpCalls: [{ method: 'GET', path: '/users', pathShape: '/users', line: 0 }],
       }),
-      facts('file:///w/src/routes/health.ts'),
-      facts('file:///w/src/routes/orders.ts'),
-      facts('file:///w/src/db/user.ts'),
-      facts('file:///w/src/db/order.ts'),
-      facts('file:///w/src/db/session.ts'),
+      facts('file:///w/src/db/user.ts', {
+        handlers: [handlerOf('getUser', { method: 'GET', pathShape: '/users' })],
+      }),
     ];
     const tree = buildArchitectureTree(files);
-    const relations = levelRelations(tree, files);
-    const diagram = mermaidForNode(tree, relations);
-    expect(diagram).toMatch(/n1 -\. "imports" \.-> n2/);
+    const backend = tree.children.find((child) => child.label === 'Backend');
+    expect(backend).toBeDefined();
+    const relations = levelRelations(backend!, files);
+    const diagram = mermaidForNode(backend!, relations, files);
+    expect(diagram).toMatch(/-\. "matches endpoint/);
   });
 });
 
@@ -1436,13 +1231,7 @@ describe('mermaidForNode flow rendering', () => {
     const diagram = mermaidForNode(node, [], files);
     expect(diagram).toContain('n1(["main.ts (1)"])');
     expect(diagram).toContain('n3[("user.ts (1)")]');
-    expect(diagram).toMatch(/n2\["service\.ts \(1\)<br\/>/);
-  });
-
-  it('truncates node subtext to the subtext cap', () => {
-    expect(truncateSubtext(description)).toHaveLength(60);
-    expect(truncateSubtext(description).endsWith('…')).toBe(true);
-    expect(mermaidForNode(node, [], files)).toContain(truncateSubtext(description));
+    expect(diagram).toContain('n2["service.ts (1)"]');
   });
 
   it('draws the parent arrow only to entry children', () => {
@@ -1472,113 +1261,8 @@ describe('mermaidForNode flow rendering', () => {
     expect(edgeVerbFor('imports', 'core', 'core')).toBe('imports');
   });
 
-  it('renders imports without guessing click or storage operations', () => {
-    const relations = levelRelations(node, files);
-    const diagram = mermaidForNode(node, relations, files);
-    expect(diagram).toContain('n1 -. "imports" .-> n2');
-    expect(diagram).toContain('n2 -. "imports" .-> n3');
-  });
-});
-
-describe('level labels', () => {
-  const mainFile = 'file:///w/src/main.ts';
-  const serviceFile = 'file:///w/src/service.ts';
-  const storeFile = 'file:///w/src/db/user.ts';
-  const files = [
-    facts(mainFile, { imports: [{ specifier: './service', names: ['service'], line: 0 }] }),
-    facts(serviceFile, { imports: [{ specifier: './db/user', names: ['user'], line: 0 }] }),
-    facts(storeFile, { imports: [{ specifier: 'rusqlite', names: ['Connection'], line: 0 }] }),
-  ];
-  const node = archNode({
-    id: 'project',
-    kind: 'project',
-    label: 'Project',
-    files: files.map((file) => file.file),
-    children: [
-      fileChild('storage', 'user.ts', storeFile),
-      fileChild('service', 'service.ts', serviceFile),
-      fileChild('main', 'main.ts', mainFile),
-    ],
-  });
-  const labels: LevelLabels = {
-    nodes: [
-      { id: 'main', label: 'Start', subtext: 'Boots the extension' },
-      { id: 'ghost', label: 'Ghost' },
-    ],
-    edges: [{ from: 'main', to: 'service', verb: 'invokes' }],
-  };
-
-  it('instructs the model to answer with strict JSON', () => {
-    expect(LEVEL_LABELS_SYSTEM).toContain('strict JSON only');
-    expect(LEVEL_LABELS_SYSTEM).toContain('"nodes"');
-  });
-
-  it('summarizes child id, count, samples, label, and role', () => {
-    const summary = buildLevelSummary(node, files);
-    expect(summary).toContain('- main | 1 files | label: main.ts | role: entry');
-    expect(summary).toContain('role: storage');
-    expect(summary).toContain('samples: main.ts');
-  });
-
-  it('parses, caps, and validates model output', () => {
-    const parsed = parseLevelLabels(
-      JSON.stringify({
-        nodes: [{ id: 'main', label: 'x'.repeat(120), subtext: 'y'.repeat(120) }],
-        edges: [{ from: 'main', to: 'service', verb: 'z'.repeat(60) }],
-      }),
-    );
-    expect(parsed?.nodes[0].label).toHaveLength(60);
-    expect(parsed?.nodes[0].subtext).toHaveLength(80);
-    expect(parsed?.edges[0].verb).toHaveLength(24);
-    expect(parseLevelLabels('not json')).toBeUndefined();
-    expect(parseLevelLabels('{"nodes":[],"edges":[]}')).toBeUndefined();
-  });
-
-  it('filters labels whose ids are unknown', () => {
-    const filtered = filterLevelLabels(node, labels);
-    expect(filtered.nodes.map((entry) => entry.id)).toEqual(['main']);
-    expect(filtered.edges).toHaveLength(1);
-  });
-
-  it('does not allow AI labels to alter factual graph rendering', () => {
+  it('renders only proven relationships, never imports', () => {
     const diagram = mermaidForNode(node, levelRelations(node, files), files);
-    expect(diagram).toContain('main.ts');
-    expect(diagram).not.toContain('Boots the extension');
-    expect(diagram).not.toContain('Ghost');
-    expect(diagram).toContain('-. "imports" .->');
-  });
-
-  it('reuses one cached AI call per level summary', async () => {
-    const response = JSON.stringify({
-      nodes: [{ id: 'main', label: 'Entry point', subtext: 'Starts the app' }],
-      edges: [{ from: 'main', to: 'service', verb: 'calls' }],
-    });
-    const { provider, calls } = providerReturning([response]);
-    const cache = new Map<string, LevelLabels | null>();
-    const first = await inferLevelLabels(node, files, { provider, model: 'model', cache });
-    expect(first?.nodes[0].label).toBe('Entry point');
-    expect(calls()).toBe(1);
-    const second = await inferLevelLabels(node, files, { provider, model: 'model', cache });
-    expect(second?.edges[0].verb).toBe('calls');
-    expect(calls()).toBe(1);
-  });
-
-  it('reads cached labels by summary hash', () => {
-    const cache = new Map<string, LevelLabels | null>([
-      [levelSummaryHash(buildLevelSummary(node, files)), labels],
-    ]);
-    expect(cachedLevelLabels(node, files, cache)?.nodes[0].id).toBe('main');
-  });
-
-  it('falls back deterministically without a provider or on invalid JSON', async () => {
-    expect(
-      await inferLevelLabels(node, files, { provider: undefined, model: 'model' }),
-    ).toBeUndefined();
-    const { provider } = providerReturning(['not json']);
-    const cache = new Map<string, LevelLabels | null>();
-    expect(
-      await inferLevelLabels(node, files, { provider, model: 'model', cache }),
-    ).toBeUndefined();
-    expect(cache.size).toBe(1);
+    expect(diagram).not.toContain('imports');
   });
 });

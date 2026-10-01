@@ -563,12 +563,7 @@ export function activate(context: vscode.ExtensionContext): void {
       await ArchitecturePanel.show({
         extensionUri: context.extensionUri,
         getFacts: () => scanRunner.getArchitectureFacts(),
-        getCoverage: () => scanRunner.getArchitectureCoverage(),
         onDidUpdateFacts: (listener) => scanRunner.onDidUpdateFacts(listener),
-        getProvider: async () => {
-          const active = await activeProvider(context);
-          return active ? { provider: active.provider, model: active.model } : undefined;
-        },
       });
     }),
     vscode.commands.registerCommand('devFirst.refreshArchitecture', () => {

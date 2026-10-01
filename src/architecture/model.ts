@@ -186,7 +186,7 @@ const FRONTEND_SUBSYSTEMS: SubsystemRule[] = [
     label: 'Pages',
     match: (entry) =>
       entry.segments.some((segment) => /^(pages?|views?|screens?)$/i.test(segment)) ||
-      /(Page|View|Screen)$/.test(entry.stem),
+      /(Page|Screen)$/.test(entry.stem),
   },
   {
     label: 'Components',
@@ -358,6 +358,16 @@ const SHARED_SUBSYSTEMS: SubsystemRule[] = [
 
 const UNCLASSIFIED_SUBSYSTEMS: SubsystemRule[] = [
   { label: 'Tests', match: (entry) => isTestFile(entry.uri) },
+  {
+    label: 'Integrations',
+    match: (entry) =>
+      /^tauri$/i.test(entry.stem) ||
+      entry.facts.imports.some((record) => /^@tauri-apps\//i.test(record.specifier)),
+  },
+  {
+    label: 'Config',
+    match: (entry) => /\.d\.ts$/i.test(entry.base),
+  },
   {
     label: 'Entry',
     match: (entry) =>
@@ -629,13 +639,16 @@ function packageDomainGroups(entries: FileEntry[], packages: PackageRoot[]): Dom
       buckets.set(match.root, [entry]);
     }
   }
+  const roleLabels = new Map<string, string>();
   const labelCounts = new Map<string, number>();
   for (const pkg of packages) {
     const list = buckets.get(pkg.root);
     if (!list || list.length === 0) {
       continue;
     }
-    labelCounts.set(pkg.name, (labelCounts.get(pkg.name) ?? 0) + 1);
+    const base = roleLabelFor(list) ?? pkg.name;
+    roleLabels.set(pkg.root, base);
+    labelCounts.set(base, (labelCounts.get(base) ?? 0) + 1);
   }
   const groups: DomainGroup[] = [];
   for (const pkg of packages) {
@@ -643,14 +656,15 @@ function packageDomainGroups(entries: FileEntry[], packages: PackageRoot[]): Dom
     if (!list || list.length === 0) {
       continue;
     }
-    const duplicated = (labelCounts.get(pkg.name) ?? 0) > 1;
+    const base = roleLabels.get(pkg.root) ?? pkg.name;
+    const duplicated = (labelCounts.get(base) ?? 0) > 1;
     const suffix = duplicated ? dominantFolderOf(list) : undefined;
     groups.push({
       key: `pkg:${pkg.root}`,
-      label: suffix ? `${pkg.name} · ${suffix}` : pkg.name,
+      label: suffix ? `${base} · ${suffix}` : base,
       description: suffix
-        ? `Code belonging to the ${pkg.name} package in ${suffix}.`
-        : `Code belonging to the ${pkg.name} package.`,
+        ? `${base} code in ${suffix}.`
+        : `${base} code.`,
       files: list
         .map((entry) => entry.facts)
         .sort((a, b) => a.file.localeCompare(b.file)),
@@ -658,6 +672,22 @@ function packageDomainGroups(entries: FileEntry[], packages: PackageRoot[]): Dom
   }
   groups.push(...signalDomainGroups(leftovers));
   return groups;
+}
+
+function roleLabelFor(entries: FileEntry[]): string | undefined {
+  const counts = new Map<DomainKey, number>();
+  for (const entry of entries) {
+    const key = classifyEntry(entry);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const ranked = [...counts.entries()].sort(
+    (a, b) => b[1] - a[1] || DOMAIN_ORDER.indexOf(a[0]) - DOMAIN_ORDER.indexOf(b[0]),
+  );
+  const best = ranked[0]?.[0];
+  if (!best || best === 'unclassified') {
+    return undefined;
+  }
+  return DOMAIN_META[best]?.label;
 }
 
 export function domainGroups(facts: FileFacts[]): DomainGroup[] {
@@ -670,6 +700,18 @@ export function domainGroups(facts: FileFacts[]): DomainGroup[] {
   return signalDomainGroups(entries);
 }
 
+const GENERIC_FOLDER_LABELS = new Set(['src', 'app', 'source', 'lib', 'packages', 'src-tauri']);
+
+function folderLabelFor(entry: FileEntry): string | undefined {
+  const segments = entry.folder.split('/').filter(Boolean);
+  const last = segments[segments.length - 1];
+  if (!last || last.length < 2 || GENERIC_FOLDER_LABELS.has(last.toLowerCase())) {
+    return undefined;
+  }
+  const label = last.replace(/[-_]+/g, ' ');
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
 function subsystemFor(entry: FileEntry, domain: DomainKey | undefined): string {
   const key = domain ?? classifyEntry(entry);
   for (const rule of SUBSYSTEM_RULES[key]) {
@@ -677,7 +719,7 @@ function subsystemFor(entry: FileEntry, domain: DomainKey | undefined): string {
       return rule.label;
     }
   }
-  return SUBSYSTEM_FALLBACK[key];
+  return folderLabelFor(entry) ?? SUBSYSTEM_FALLBACK[key];
 }
 
 function subsystemDescription(domainLabel: string, label: string): string {
@@ -1002,7 +1044,7 @@ function attachRelationships(root: ArchitectureNode, facts: FileFacts[]): void {
   walk(root, []);
   const fileNodeMap = new Map(facts.map((file) => [file.file, file.file]));
   const edges = new Map<string, { from: string; to: string }>();
-  for (const relation of analyzeArchitectureRelations(facts, fileNodeMap).relations) {
+  for (const relation of analyzeArchitectureRelations(facts, fileNodeMap)) {
     for (const evidence of relation.evidence) {
       const key = `${evidence.fromFile}\u0000${evidence.toFile}`;
       edges.set(key, { from: evidence.fromFile, to: evidence.toFile });

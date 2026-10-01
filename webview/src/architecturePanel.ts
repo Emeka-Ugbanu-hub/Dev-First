@@ -26,24 +26,6 @@ interface LevelMessage {
   children: ChildView[];
   breadcrumbs: Array<{ id: string; label: string; kind: string }>;
   diagram: string;
-  relations: Array<{
-    label: string;
-    fromLabel: string;
-    toLabel: string;
-    weight: number;
-    evidenceTotal?: number;
-    evidence: Array<{ fromFile: string; toFile: string; sourceFile: string; line: number; kind: string; role: string; symbol?: string; count?: number }>;
-  }>;
-  coverage: {
-    indexedFiles: number;
-    representedFiles: number;
-    unresolvedImports: number;
-    unresolvedTauriCommands: number;
-    unsupportedSourceFiles: number;
-    parseFailures: number;
-    oversizedSourceFiles: number;
-    scanLimitReached: boolean;
-  };
 }
 
 interface EmptyMessage {
@@ -82,7 +64,7 @@ const refreshIcon = document.getElementById('df-refresh-icon');
 const crumbs = document.getElementById('df-crumbs');
 const hint = document.getElementById('df-hint');
 const diagram = document.getElementById('df-diagram');
-const detail = document.getElementById('df-detail');
+
 const status = document.getElementById('df-status');
 
 let childIndex = new Map<string, ChildView>();
@@ -249,85 +231,6 @@ function renderBreadcrumbs(): void {
   }
 }
 
-function chipList(values: string[]): string {
-  if (values.length === 0) {
-    return '<span class="df-empty">none</span>';
-  }
-  return `<ul class="df-list">${values
-    .map((value) => `<li class="df-chip">${escapeHtml(value)}</li>`)
-    .join('')}</ul>`;
-}
-
-function renderDetail(node: DetailView, levelFiles: ChildView[], message: LevelMessage, hideFiles = false): void {
-  if (!detail) {
-    return;
-  }
-  const listed = (
-    levelFiles.length > 0
-      ? levelFiles.map((child) => child.file ?? '')
-      : node.files
-  )
-    .filter((path) => path.length > 0);
-  const heading = listed.length === 1 ? '1 file' : `${listed.length} files`;
-  detail.innerHTML = `
-    <span class="df-kind">${escapeHtml(node.kind)}</span>
-    <h2 class="df-title">${escapeHtml(node.label)}</h2>
-    <p class="df-description">${escapeHtml(node.description)}</p>
-    <div class="df-section">
-      <h3>Implemented by ${node.implementedBy} file${node.implementedBy === 1 ? '' : 's'}</h3>
-    </div>
-    <div class="df-section">
-      <h3>Used by</h3>
-      ${chipList(node.usedBy)}
-    </div>
-    <div class="df-section">
-      <h3>Depends on</h3>
-      ${chipList(node.dependsOn)}
-    </div>
-    <div class="df-section">
-      <h3>Verified relationships (${message.relations.length})</h3>
-      ${message.relations.length === 0 ? '<span class="df-empty">No verified cross-group relationships at this level.</span>' : `
-        <ul class="df-list">
-          ${message.relations.map((relation) => `
-            <li class="df-relation">
-              <span>${escapeHtml(relation.fromLabel)} ${escapeHtml(relation.label)} ${escapeHtml(relation.toLabel)}</span>
-              <ul class="df-files">${relation.evidence.map((evidence) => `
-                <li><button type="button" class="df-file" data-path="${escapeHtml(evidence.sourceFile)}" data-line="${evidence.line}" title="${escapeHtml(evidence.sourceFile)}:${evidence.line + 1}">${escapeHtml(evidence.role)} · ${escapeHtml(shortName(evidence.sourceFile))}:${evidence.line + 1}${evidence.symbol ? ` · ${escapeHtml(evidence.symbol)}` : ''}${evidence.count && evidence.count > 1 ? ` ×${evidence.count}` : ''}</button></li>
-              `).join('')}${relation.evidenceTotal && relation.evidenceTotal > relation.evidence.length ? `<li class="df-more">…and ${relation.evidenceTotal - relation.evidence.length} more</li>` : ''}</ul>
-            </li>
-          `).join('')}
-        </ul>
-      `}
-    </div>
-    <div class="df-section">
-      <h3>Analysis coverage</h3>
-      <p class="df-description">${message.coverage.representedFiles} of ${message.coverage.indexedFiles} indexed files are represented in this project map.</p>
-      <p class="df-description">${message.coverage.unresolvedImports} unresolved local or Rust imports; ${message.coverage.unresolvedTauriCommands} unverified Tauri command calls.</p>
-      <p class="df-description">${message.coverage.unsupportedSourceFiles} files use unsupported languages; ${message.coverage.parseFailures} files could not be parsed; ${message.coverage.oversizedSourceFiles} files exceeded the scan size limit.${message.coverage.scanLimitReached ? ' The file scan reached its 2,000-file cap.' : ''}</p>
-    </div>
-    ${hideFiles ? '' : `<div class="df-section">
-      <h3>${heading}</h3>
-      <ul class="df-files">
-        ${listed
-          .map(
-            (path) =>
-              `<li><button type="button" class="df-file" data-path="${escapeHtml(
-                path,
-              )}" title="${escapeHtml(path)}">${escapeHtml(shortName(path))}</button></li>`,
-          )
-          .join('')}
-      </ul>
-    </div>`}`;
-  detail.querySelectorAll<HTMLButtonElement>('button.df-file').forEach((button) => {
-    button.addEventListener('click', () =>
-      post({
-        type: 'openFile',
-        path: button.dataset.path ?? '',
-        line: Number(button.dataset.line ?? 0),
-      }),
-    );
-  });
-}
 
 function displayFolder(path: string): string {
   const clean = path.replace(/^file:\/\//, '');
@@ -375,7 +278,6 @@ async function render(message: LevelMessage): Promise<void> {
   const concepts = conceptChildren(message.children);
   const files = fileChildren(message.children);
   const filesOnly = !shouldRenderDiagram(message.children);
-  renderDetail(message.node, files, message, filesOnly);
   childIndex = new Map(concepts.map((child, index) => [`n${index + 1}`, child]));
   if (filesOnly) {
     renderFileLevel(message.node, files);
@@ -409,9 +311,6 @@ async function render(message: LevelMessage): Promise<void> {
 
 function renderEmpty(message: EmptyMessage): void {
   setHint('');
-  if (detail) {
-    detail.innerHTML = '';
-  }
   if (diagram) {
     diagram.innerHTML = `<p id="df-empty">${escapeHtml(message.message)}</p>`;
   }

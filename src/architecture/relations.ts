@@ -2,7 +2,6 @@ import type { FileFacts, HandlerRecord } from '../scan/duplication';
 import {
   endpointMethodsMatch,
   endpointShapesMatch,
-  resolveArchitectureSpecifier,
   rustCrateRoot,
 } from '../scan/crossFile';
 
@@ -28,12 +27,6 @@ export interface ArchitectureRelation {
   evidenceTotal?: number;
 }
 
-export interface ArchitectureAnalysis {
-  relations: ArchitectureRelation[];
-  unresolvedImports: number;
-  unresolvedTauriCommands: number;
-}
-
 interface RelationAccumulator extends Omit<ArchitectureRelation, 'evidence'> {
   evidence: ArchitectureRelationEvidence[];
 }
@@ -57,11 +50,9 @@ function groupEvidence(evidence: ArchitectureRelationEvidence[]): ArchitectureRe
 export function analyzeArchitectureRelations(
   facts: FileFacts[],
   nodeMap: Map<string, string>,
-): ArchitectureAnalysis {
+): ArchitectureRelation[] {
   const known = new Set(facts.map((file) => file.file));
   const pairs = new Map<string, RelationAccumulator>();
-  let unresolvedImports = 0;
-  let unresolvedTauriCommands = 0;
   const add = (
     fromFile: string,
     toFile: string,
@@ -86,29 +77,6 @@ export function analyzeArchitectureRelations(
     relation.evidence.push({ fromFile, toFile, sourceFile: fromFile, line, kind, role: 'use site', symbol });
     relation.evidence.push(...proofs);
   };
-
-  for (const file of facts) {
-    for (const entry of file.imports ?? []) {
-      const to = resolveArchitectureSpecifier(file.file, entry.specifier, known);
-      if (to && to !== file.file) {
-        add(file.file, to, entry.line, 'import', 'imports', entry.specifier);
-      } else if (
-        entry.specifier.startsWith('.') ||
-        entry.specifier.startsWith('/') ||
-        /^(crate|self|super)(?:::|$)/.test(entry.specifier)
-      ) {
-        unresolvedImports++;
-      }
-    }
-    for (const module of file.rustModules ?? []) {
-      const to = resolveArchitectureSpecifier(file.file, `self::${module.name}`, known);
-      if (to) {
-        add(file.file, to, module.line, 'module', 'declares module', module.name);
-      } else {
-        unresolvedImports++;
-      }
-    }
-  }
 
   const rustRoots = new Map<string, string | undefined>();
   const rootOf = (file: string): string | undefined => {
@@ -149,9 +117,6 @@ export function analyzeArchitectureRelations(
           rootOf(handlerFile) !== undefined &&
           (registered.get(`${rootOf(handlerFile)}\u0000${handler.name}`)?.length ?? 0) > 0,
       );
-      if (targets.length !== 1) {
-        unresolvedTauriCommands++;
-      }
       for (const { file: handlerFile, handler } of targets.length === 1 ? targets : []) {
         const location = registered.get(`${rootOf(handlerFile)}\u0000${handler.name}`)?.[0];
         if (!location) continue;
@@ -202,12 +167,12 @@ export function analyzeArchitectureRelations(
         a.fromId.localeCompare(b.fromId) ||
         a.toId.localeCompare(b.toId),
     );
-  return { relations, unresolvedImports, unresolvedTauriCommands };
+  return relations;
 }
 
 export function computeRelations(
   facts: FileFacts[],
   nodeMap: Map<string, string>,
 ): ArchitectureRelation[] {
-  return analyzeArchitectureRelations(facts, nodeMap).relations;
+  return analyzeArchitectureRelations(facts, nodeMap);
 }

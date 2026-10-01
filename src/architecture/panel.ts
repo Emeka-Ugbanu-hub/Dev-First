@@ -1,14 +1,6 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
-import type { LLMProvider } from '../llm/types';
-import type { ArchitectureScanCoverage, FileFacts } from '../scan/duplication';
-import {
-  buildLevelSummary,
-  inferLevelLabels,
-  levelLabelsCache,
-  levelSummaryHash,
-} from './labels';
-import type { LevelLabels } from './labels';
+import type { FileFacts } from '../scan/duplication';
 import {
   breadcrumbPath,
   buildArchitectureTree,
@@ -21,18 +13,10 @@ import type { ArchitectureRelation } from './relations';
 import { classifyLevelChildren, orderLevel } from './flow';
 import type { LevelRole } from './flow';
 
-export interface ArchitectureLabelProvider {
-  provider: LLMProvider;
-  model: string;
-}
-
 export interface ArchitecturePanelDeps {
   extensionUri: vscode.Uri;
   getFacts: () => Promise<FileFacts[]>;
-  getCoverage?: () => Promise<ArchitectureScanCoverage>;
   onDidUpdateFacts?: (listener: () => void) => { dispose(): void };
-  getProvider?: () => Promise<ArchitectureLabelProvider | undefined>;
-  labelsCache?: Map<string, LevelLabels | null>;
 }
 
 interface ArchitectureMessage {
@@ -47,17 +31,11 @@ interface ChildView {
   kind: ArchitectureKind;
   label: string;
   description: string;
-  subtext?: string;
   usedBy: string[];
   dependsOn: string[];
   implementedBy: number;
   fileCount: number;
   file?: string;
-}
-
-export interface LevelNodeOverride {
-  label?: string;
-  subtext?: string;
 }
 
 interface DetailView {
@@ -133,16 +111,6 @@ function mermaidText(label: string): string {
   return label.replace(/"/g, "'").replace(/[\r\n]+/g, ' ').trim();
 }
 
-export const MAX_SUBTEXT_CHARS = 60;
-
-export function truncateSubtext(value: string, max: number = MAX_SUBTEXT_CHARS): string {
-  const clean = value.replace(/\s+/g, ' ').trim();
-  if (clean.length <= max) {
-    return clean;
-  }
-  return `${clean.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
-}
-
 export function edgeVerbFor(label: string, fromRole: LevelRole, toRole: LevelRole): string {
   void fromRole;
   void toRole;
@@ -171,7 +139,7 @@ export function levelRelations(
         nodeMap.set(file, id);
       }
     });
-  return analyzeArchitectureRelations(facts, nodeMap).relations;
+  return analyzeArchitectureRelations(facts, nodeMap);
 }
 
 function nodeShape(role: LevelRole, text: string): string {
@@ -188,7 +156,6 @@ export function mermaidForNode(
   node: ArchitectureNode,
   relations: ArchitectureRelation[] = [],
   facts: FileFacts[] = [],
-  overrides?: Map<string, LevelNodeOverride>,
 ): string {
   const lines = ['flowchart TD', ...CLASS_DEFS];
   const ordered = orderLevel(node.children, facts);
@@ -207,12 +174,9 @@ export function mermaidForNode(
     if (!id) {
       continue;
     }
-    const override = overrides?.get(child.id);
     const role = roles.get(child.id) ?? 'core';
     const count = ` (${child.files.length})`;
-    const subtext = truncateSubtext(override?.subtext ?? child.description);
-    const label = override?.label ?? child.label;
-    const text = mermaidText(`${label}${count}${subtext ? `<br/>${subtext}` : ''}`);
+    const text = mermaidText(`${child.label}${count}`);
     lines.push(`  ${id}${nodeShape(role, text)}:::${KIND_CLASS[child.kind]}`);
   }
   const entries = concepts.filter((child) => roles.get(child.id) === 'entry');
@@ -303,28 +267,18 @@ export function createDebouncedRefresh(
 
 export interface ArchitectureSessionDeps {
   getFacts: () => Promise<FileFacts[]>;
-  getCoverage?: () => Promise<ArchitectureScanCoverage>;
   post: (message: unknown) => void;
   isVisible: () => boolean;
-  getProvider?: () => Promise<ArchitectureLabelProvider | undefined>;
-  labelsCache?: Map<string, LevelLabels | null>;
 }
 
 export interface RefreshOptions {
   auto?: boolean;
 }
 
-export const LEVEL_SUBTEXT_PLACEHOLDER = '…';
 
 export class ArchitectureSession {
   private root: ArchitectureNode | undefined;
   private facts: FileFacts[] = [];
-  private scanCoverage: ArchitectureScanCoverage = {
-    unsupportedSourceFiles: 0,
-    parseFailures: 0,
-    oversizedSourceFiles: 0,
-    scanLimitReached: false,
-  };
   private currentId = 'project';
   private revision = 0;
   private refreshing = false;
@@ -332,15 +286,8 @@ export class ArchitectureSession {
   private pendingRender = false;
   private disposed = false;
   private opened = false;
-  private providerMissing = false;
-  private readonly labelsCache: Map<string, LevelLabels | null>;
-  private readonly levelLabels = new Map<string, LevelLabels>();
-  private readonly pendingLabels = new Set<string>();
-  private readonly labelsAbort = new AbortController();
 
-  constructor(private readonly deps: ArchitectureSessionDeps) {
-    this.labelsCache = deps.labelsCache ?? levelLabelsCache;
-  }
+  constructor(private readonly deps: ArchitectureSessionDeps) {}
 
   get currentNodeId(): string {
     return this.currentId;
@@ -351,7 +298,6 @@ export class ArchitectureSession {
       return;
     }
     this.disposed = true;
-    this.labelsAbort.abort();
   }
 
   async load(): Promise<void> {
@@ -370,14 +316,10 @@ export class ArchitectureSession {
       return;
     }
     this.facts = facts;
-    this.scanCoverage = await this.deps.getCoverage?.() ?? this.scanCoverage;
     this.root = buildArchitectureTree(facts);
     this.revision++;
     this.currentId = resolveNodeAfterRebuild(this.currentId, this.root).id;
-    const node = this.postLevel();
-    if (node && this.opened) {
-      void this.requestLevelLabels(node);
-    }
+    this.postLevel();
   }
 
   async refresh(options: RefreshOptions = {}): Promise<void> {
@@ -413,10 +355,7 @@ export class ArchitectureSession {
   renderCurrent(): void {
     this.pendingRender = false;
     this.opened = true;
-    const node = this.postLevel();
-    if (node) {
-      void this.requestLevelLabels(node);
-    }
+    this.postLevel();
   }
 
   renderIfPending(): void {
@@ -435,10 +374,7 @@ export class ArchitectureSession {
       return;
     }
     this.currentId = node.id;
-    const rendered = this.postLevel();
-    if (rendered) {
-      void this.requestLevelLabels(rendered);
-    }
+    this.postLevel();
   }
 
   private async rebuild(options: RefreshOptions): Promise<void> {
@@ -451,17 +387,12 @@ export class ArchitectureSession {
       this.facts = [];
       this.root = undefined;
       this.revision++;
-      this.levelLabels.clear();
-      this.pendingLabels.clear();
       this.deps.post({ type: 'empty', message: NOTHING_INDEXED });
       return;
     }
     this.facts = facts;
-    this.scanCoverage = await this.deps.getCoverage?.() ?? this.scanCoverage;
     this.root = buildArchitectureTree(facts);
     this.revision++;
-    this.levelLabels.clear();
-    this.pendingLabels.clear();
     const node = resolveNodeAfterRebuild(previousId, this.root);
     const changed = node.id !== previousId;
     this.currentId = node.id;
@@ -471,10 +402,7 @@ export class ArchitectureSession {
       return;
     }
     this.pendingRender = false;
-    const rendered = this.postLevel();
-    if (rendered && this.opened) {
-      void this.requestLevelLabels(rendered);
-    }
+    this.postLevel();
     if (changed) {
       this.deps.post({ type: 'hint', text: `${MISSING_NODE_HINT} ${node.label}` });
     }
@@ -493,121 +421,20 @@ export class ArchitectureSession {
       for (const file of child.files) nodeMap.set(file, `n${index + 1}`);
     });
     const analysis = analyzeArchitectureRelations(this.facts, nodeMap);
-    const applied = this.levelLabels.get(node.id);
-    const placeholder = Boolean(this.deps.getProvider) && !this.providerMissing && !applied;
-    const overrides = new Map<string, LevelNodeOverride>();
-    for (const child of ordered) {
-      if (child.kind === 'file') {
-        continue;
-      }
-      const entry = applied?.nodes.find((item) => item.id === child.id);
-      const subtext =
-        entry?.subtext ?? (placeholder ? LEVEL_SUBTEXT_PLACEHOLDER : child.description);
-      overrides.set(child.id, {
-        ...(entry?.label ? { label: entry.label } : {}),
-        subtext,
-      });
-    }
-    const labels = new Map(
-      ordered
-        .filter((child) => child.kind !== 'file')
-        .map((child, index) => [`n${index + 1}`, overrides.get(child.id)?.label ?? child.label]),
-    );
     this.deps.post({
       type: 'level',
       node: detailOf(node),
-      children: ordered.map((child) => {
-        const view = childOf(child);
-        const override = overrides.get(child.id);
-        return override
-          ? { ...view, label: override.label ?? view.label, subtext: override.subtext }
-          : view;
-      }),
+      children: ordered.map((child) => childOf(child)),
       breadcrumbs: crumbs.map((crumb) => ({
         id: crumb.id,
         label: crumb.label,
         kind: crumb.kind,
       })),
-      diagram: mermaidForNode(node, analysis.relations, this.facts, overrides),
-      relations: analysis.relations.map((relation) => ({
-        ...relation,
-        label: relation.weight > 1 ? `${relation.label} ×${relation.weight}` : relation.label,
-        fromLabel: labels.get(relation.fromId) ?? relation.fromId,
-        toLabel: labels.get(relation.toId) ?? relation.toId,
-      })),
-      coverage: {
-        indexedFiles: this.facts.length,
-        representedFiles: this.root?.files.length ?? 0,
-        unresolvedImports: analysis.unresolvedImports,
-        unresolvedTauriCommands: analysis.unresolvedTauriCommands,
-        unsupportedSourceFiles: this.scanCoverage.unsupportedSourceFiles,
-        parseFailures: this.scanCoverage.parseFailures,
-        oversizedSourceFiles: this.scanCoverage.oversizedSourceFiles,
-        scanLimitReached: this.scanCoverage.scanLimitReached,
-      },
+      diagram: mermaidForNode(node, analysis, this.facts),
     });
     return node;
   }
 
-  private applyLevelLabels(node: ArchitectureNode, labels: LevelLabels): void {
-    this.levelLabels.set(node.id, labels);
-    if (node.id === this.currentId) {
-      this.postLevel();
-    }
-  }
-
-  private async requestLevelLabels(node: ArchitectureNode): Promise<void> {
-    if (this.disposed || !this.deps.getProvider || node.children.length === 0) {
-      return;
-    }
-    if (this.levelLabels.has(node.id)) {
-      return;
-    }
-    const summary = buildLevelSummary(node, this.facts);
-    const hash = levelSummaryHash(summary);
-    if (this.pendingLabels.has(hash)) {
-      return;
-    }
-    this.pendingLabels.add(hash);
-    const cached = this.labelsCache.get(hash);
-    if (cached) {
-      this.pendingLabels.delete(hash);
-      this.applyLevelLabels(node, cached);
-      return;
-    }
-    if (this.labelsCache.has(hash)) {
-      this.pendingLabels.delete(hash);
-      return;
-    }
-    const revision = this.revision;
-    let active: ArchitectureLabelProvider | undefined;
-    try {
-      active = await this.deps.getProvider();
-    } catch {
-      active = undefined;
-    }
-    if (this.disposed || revision !== this.revision) {
-      this.pendingLabels.delete(hash);
-      return;
-    }
-    if (!active) {
-      this.providerMissing = true;
-      this.pendingLabels.delete(hash);
-      this.postLevel();
-      return;
-    }
-    const labels = await inferLevelLabels(node, this.facts, {
-      provider: active.provider,
-      model: active.model,
-      signal: this.labelsAbort.signal,
-      cache: this.labelsCache,
-    });
-    this.pendingLabels.delete(hash);
-    if (this.disposed || revision !== this.revision || !labels) {
-      return;
-    }
-    this.applyLevelLabels(node, labels);
-  }
 }
 
 export interface OpenArchitectureFileDeps {
@@ -652,11 +479,8 @@ export class ArchitecturePanel {
   ) {
     this.session = new ArchitectureSession({
       getFacts: () => deps.getFacts(),
-      getCoverage: deps.getCoverage,
       post: (message) => this.post(message),
       isVisible: () => this.panel.visible,
-      getProvider: deps.getProvider,
-      labelsCache: deps.labelsCache,
     });
     this.debounce = createDebouncedRefresh(() => {
       void this.session.refresh({ auto: true });
@@ -900,7 +724,7 @@ export class ArchitecturePanel {
     .df-overview-item strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 500; }
     .df-overview-meta { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); font-size: 10px; }
     @media (max-width: 900px) { .df-overview-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 125px), 1fr)); } }
-    @media (max-width: 620px) { #df-main { flex-direction: column; } aside { width: 100%; max-height: 38vh; border-left: 0; border-top: 1px solid var(--vscode-panel-border); } #df-diagram-wrap { padding: 14px; } #df-hint { display: none; } }
+    @media (max-width: 620px) { #df-main { flex-direction: column; } #df-diagram-wrap { padding: 14px; } #df-hint { display: none; } }
     @media (prefers-reduced-motion: reduce) { .codicon-modifier-spin { animation: none; } }
     .df-clickable { cursor: pointer; }
     .df-clickable:hover > rect, .df-clickable:hover > path, .df-clickable:hover > polygon {
@@ -918,14 +742,7 @@ export class ArchitecturePanel {
       border-radius: var(--df-radius-md);
       white-space: pre-wrap;
     }
-    aside {
-      width: 320px;
-      flex: none;
-      border-left: 1px solid var(--vscode-panel-border);
-      background: var(--vscode-sideBar-background, var(--vscode-editorWidget-background));
-      padding: 16px;
-      overflow: auto;
-    }
+    #df-main { flex: 1; display: flex; min-height: 0; }
     .df-kind {
       display: inline-block;
       padding: 2px 6px;
@@ -991,7 +808,7 @@ export class ArchitecturePanel {
   </header>
   <main id="df-main">
     <section id="df-diagram-wrap"><div id="df-diagram"></div></section>
-    <aside id="df-detail"></aside>
+  
   </main>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>

@@ -325,28 +325,26 @@ describe('Rust modules and Tauri command evidence', () => {
     expect(new Set(ipc?.evidence.map((entry) => entry.role))).toEqual(new Set(['use site', 'registration', 'handler']));
   });
 
-  it('resolves crate imports and module declarations only to indexed Rust files', async () => {
+  it('does not turn Rust imports or module declarations into relationships', async () => {
     const lib: FileFacts = {
       file: 'file:///w/src/lib.rs',
       ...(await extract('mod db; use crate::db::read;', 'rust')),
     };
     const db: FileFacts = { file: 'file:///w/src/db.rs', ...(await extract('pub fn read() {}', 'rust')) };
     const external: FileFacts = { file: 'file:///w/src/not_db.rs', ...(await extract('pub fn x() {}', 'rust')) };
+    expect(lib.rustModules).toContainEqual({ name: 'db', line: 0 });
+    expect(lib.imports.some((entry) => entry.specifier.includes('crate::db'))).toBe(true);
     const nodeMap = new Map([[lib.file, 'lib'], [db.file, 'db'], [external.file, 'external']]);
-    const relations = computeRelations([lib, db, external], nodeMap);
-    expect(relations.filter((relation) => relation.fromId === 'lib' && relation.toId === 'db'))
-      .toEqual(expect.arrayContaining([
-        expect.objectContaining({ label: 'imports' }),
-        expect.objectContaining({ label: 'declares module' }),
-      ]));
-    expect(relations.some((relation) => relation.toId === 'external')).toBe(false);
+    expect(computeRelations([lib, db, external], nodeMap)).toEqual([]);
   });
 
-  it('resolves an explicit Rust super import back to the crate root', async () => {
+  it('does not turn Rust super imports into relationships', async () => {
     const root: FileFacts = { file: 'file:///w/src/lib.rs', ...(await extract('mod github;', 'rust')) };
     const github: FileFacts = { file: 'file:///w/src/github.rs', ...(await extract('use super::*;', 'rust')) };
-    const relations = computeRelations([root, github], new Map([[root.file, 'root'], [github.file, 'github']]));
-    expect(relations).toContainEqual(expect.objectContaining({ fromId: 'github', toId: 'root', label: 'imports' }));
+    expect(github.imports.some((entry) => entry.specifier.startsWith('super'))).toBe(true);
+    expect(
+      computeRelations([root, github], new Map([[root.file, 'root'], [github.file, 'github']])),
+    ).toEqual([]);
   });
 
   it('does not connect a Tauri handler until a crate registration is indexed', async () => {
@@ -362,7 +360,6 @@ describe('Rust modules and Tauri command evidence', () => {
     const result = analyzeArchitectureRelations([frontend, root, command], new Map([
       [frontend.file, 'frontend'], [root.file, 'shell'], [command.file, 'shell'],
     ]));
-    expect(result.relations.some((relation) => relation.label === 'invokes command')).toBe(false);
-    expect(result.unresolvedTauriCommands).toBe(1);
+    expect(result.some((relation) => relation.label === 'invokes command')).toBe(false);
   });
 });
