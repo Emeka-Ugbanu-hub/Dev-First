@@ -317,8 +317,8 @@ export type HostMessage =
   | { type: 'removeMessage'; id: string }
   | { type: 'unqueueMessage'; id: string }
   | { type: 'connection'; connection: ConnectionState }
-  | { type: 'connectResult'; ok: boolean; error?: string; models?: string[]; details?: Record<string, ModelMetadata>; preset?: string }
-  | { type: 'models'; models: string[]; details?: Record<string, ModelMetadata>; error?: string; preset?: string }
+  | { type: 'connectResult'; ok: boolean; error?: string; models?: string[]; details?: Record<string, ModelMetadata>; preset?: string; updatedAt?: number }
+  | { type: 'models'; models: string[]; details?: Record<string, ModelMetadata>; error?: string; preset?: string; updatedAt?: number; liveFailed?: boolean }
   | { type: 'selection'; selection: SelectionContext | null }
   | { type: 'usage'; tokens: number; limit: number; reserved?: number }
   | { type: 'commands'; commands: CommandInfo[] }

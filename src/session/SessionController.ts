@@ -33,8 +33,10 @@ import {
   modelInfo,
   modelsForProvider,
   readLiveModels,
+  readLiveModelsUpdatedAt,
   reasoningLevelsFor,
   storeLiveModels,
+  storeLiveModelsUpdatedAt,
 } from '../llm/catalog';
 import { HttpError } from '../llm/errors';
 import { adaptiveKind } from '../llm/adaptive';
@@ -604,6 +606,7 @@ export class SessionController {
       model: (presetChanged ? '' : config.model) || preset.defaultModel || '',
     };
     const candidate = createProvider(effective, apiKey?.trim() || undefined);
+    await this.registry.load();
 
     let live: string[] = [];
     let warning: string | undefined;
@@ -628,8 +631,13 @@ export class SessionController {
     }
     if (live.length > 0) {
       await storeLiveModels(this.context.globalState, preset.id, live);
+      await storeLiveModelsUpdatedAt(this.context.globalState, preset.id, Date.now());
     }
-    const models = modelsForProvider(preset.id, [...live, ...Object.keys(details)]);
+    const models = modelsForProvider(
+      preset.id,
+      [...live, ...Object.keys(details)],
+      this.registry.providerModelIds(preset.id),
+    );
     const chosenModel = effective.model || models[0] || (presetChanged ? '' : config.model);
     const settings = vscode.workspace.getConfiguration('devFirst');
     await settings.update('preset', preset.id, vscode.ConfigurationTarget.Global);
@@ -641,7 +649,15 @@ export class SessionController {
     this.keyPresent = Boolean(apiKey?.trim()) || !preset.requiresKey;
     this.connectionError = undefined;
     this.removeConnectionNotice();
-    this.post({ type: 'connectResult', ok: true, models, details, error: warning, preset: preset.id });
+    this.post({
+      type: 'connectResult',
+      ok: true,
+      models,
+      details,
+      error: warning,
+      preset: preset.id,
+      updatedAt: readLiveModelsUpdatedAt(this.context.globalState, preset.id),
+    });
     this.post({ type: 'connection', connection: this.buildConnectionState() });
     this.pushState();
   }
@@ -662,46 +678,85 @@ export class SessionController {
     const stored = readLiveModels(this.context.globalState, preset.id);
     const details = await fetchModelMetadata(preset.id, effective.baseUrl, key);
     await this.storeModelDetails(preset.id, details);
+    await this.registry.load();
     try {
       const live = await createProvider(effective, key).listModels();
       const available = [...live, ...Object.keys(details)];
       if (available.length > 0) {
         await storeLiveModels(this.context.globalState, preset.id, available);
+        await storeLiveModelsUpdatedAt(this.context.globalState, preset.id, Date.now());
       }
-      this.post({ type: 'models', models: modelsForProvider(preset.id, available), details, preset: preset.id });
+      const models = modelsForProvider(preset.id, available, this.registry.providerModelIds(preset.id));
+      this.post({
+        type: 'models',
+        models,
+        details,
+        preset: preset.id,
+        updatedAt: readLiveModelsUpdatedAt(this.context.globalState, preset.id),
+      });
       if (preset.id === getConfig().preset) this.pushState();
     } catch (error) {
-      const fallback = modelsForProvider(preset.id, [...stored, ...Object.keys(details)]);
+      const fallback = modelsForProvider(
+        preset.id,
+        [...stored, ...Object.keys(details)],
+        this.registry.providerModelIds(preset.id),
+      );
       const message = errorMessage(error);
-      const errorText = isAuthFailure(error)
+      const authFailure = isAuthFailure(error);
+      const errorText = authFailure
         ? this.describeConnectError(preset, message)
         : fallback.length === 0
           ? 'Could not fetch models — type a model id.'
           : undefined;
-      this.post({ type: 'models', models: fallback, details, error: errorText, preset: preset.id });
+      this.post({
+        type: 'models',
+        models: fallback,
+        details,
+        error: errorText,
+        preset: preset.id,
+        updatedAt: readLiveModelsUpdatedAt(this.context.globalState, preset.id),
+        liveFailed: !authFailure && fallback.length > 0,
+      });
       if (preset.id === getConfig().preset) this.pushState();
     }
   }
 
-  private postStoredModels(): void {
+  private async postStoredModels(): Promise<void> {
     const config = getConfig();
     const preset = findPreset(config.preset) ?? PRESETS[0];
-    const models = modelsForProvider(preset.id, readLiveModels(this.context.globalState, preset.id));
+    await this.registry.load();
+    const models = modelsForProvider(
+      preset.id,
+      readLiveModels(this.context.globalState, preset.id),
+      this.registry.providerModelIds(preset.id),
+    );
     if (models.length > 0) {
-      this.post({ type: 'models', models, details: this.modelDetails(preset.id), preset: preset.id });
+      this.post({
+        type: 'models',
+        models,
+        details: this.modelDetails(preset.id),
+        preset: preset.id,
+        updatedAt: readLiveModelsUpdatedAt(this.context.globalState, preset.id),
+      });
     }
   }
 
   private async refreshModelsInBackground(): Promise<void> {
-    const config = getConfig();
-    const preset = findPreset(config.preset) ?? PRESETS[0];
-    if (preset.requiresKey) {
-      const key = await getApiKeyForPreset(this.context, preset);
-      if (!key) {
-        return;
+    const active = findPreset(getConfig().preset) ?? PRESETS[0];
+    const presets = new Set<string>([active.id, ...this.connections.list().map((entry) => entry.preset)]);
+    for (const presetId of presets) {
+      const preset = findPreset(presetId);
+      if (!preset) {
+        continue;
       }
+      if (preset.requiresKey) {
+        const key = await getApiKeyForPreset(this.context, preset);
+        if (!key) {
+          continue;
+        }
+      }
+      await this.handleFetchModels(preset.id);
     }
-    await this.handleFetchModels(preset.id);
   }
 
   private async handleSetModel(model: string): Promise<void> {
@@ -833,7 +888,7 @@ export class SessionController {
       case 'ready':
         this.pushState();
         this.postSessions();
-        this.postStoredModels();
+        void this.postStoredModels();
         void this.refreshModelsInBackground();
         break;
       case 'switchSession':

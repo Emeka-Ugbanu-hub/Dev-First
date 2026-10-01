@@ -28,6 +28,23 @@ export async function storeLiveModels(
   await state.update(modelsStorageKey(presetId), models);
 }
 
+export function liveModelsUpdatedKey(presetId: string): string {
+  return `devFirst.models.${presetId}.updated`;
+}
+
+export function readLiveModelsUpdatedAt(state: Pick<MementoLike, 'get'>, presetId: string): number | undefined {
+  const value = state.get<number>(liveModelsUpdatedKey(presetId));
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+export async function storeLiveModelsUpdatedAt(
+  state: Pick<MementoLike, 'update'>,
+  presetId: string,
+  fetchedAt: number,
+): Promise<void> {
+  await state.update(liveModelsUpdatedKey(presetId), fetchedAt);
+}
+
 export function resolveCatalogModels(providerId: string, liveModels: string[]): string[] {
   const catalog = CATALOG[providerId] ?? {};
   const merged: string[] = [];
@@ -50,9 +67,10 @@ export function resolveCatalogModels(providerId: string, liveModels: string[]): 
   return merged;
 }
 
-export function modelsForProvider(providerId: string, liveModels: string[]): string[] {
-  if (liveModels.length > 0) {
-    return resolveCatalogModels(providerId, liveModels);
+export function modelsForProvider(providerId: string, liveModels: string[], runtimeModels: string[] = []): string[] {
+  const extras = [...liveModels, ...runtimeModels];
+  if (extras.length > 0) {
+    return resolveCatalogModels(providerId, extras);
   }
   const catalog = CATALOG[providerId];
   return catalog ? Object.keys(catalog) : [];

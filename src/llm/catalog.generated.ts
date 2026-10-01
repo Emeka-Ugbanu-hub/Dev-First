@@ -603,6 +603,70 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
         "pdf"
       ]
     },
+    "gpt-6.1-sol": {
+      "id": "gpt-6.1-sol",
+      "name": "GPT-6.1 Sol",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "capabilities": [
+        "tools",
+        "vision",
+        "pdf"
+      ]
+    },
+    "gpt-daybreak-blue-latest": {
+      "id": "gpt-daybreak-blue-latest",
+      "name": "Daybreak Blue",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "capabilities": [
+        "tools",
+        "vision",
+        "pdf"
+      ]
+    },
+    "gpt-daybreak-red-latest": {
+      "id": "gpt-daybreak-red-latest",
+      "name": "Daybreak Red",
+      "contextWindow": 400000,
+      "maxOutput": 128000,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "capabilities": [
+        "tools",
+        "vision"
+      ]
+    },
     "gpt-image-1": {
       "id": "gpt-image-1",
       "name": "gpt-image-1",
@@ -1077,6 +1141,27 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
         "vision",
         "pdf"
       ]
+    },
+    "claude-sonnet-5-5": {
+      "id": "claude-sonnet-5-5",
+      "name": "Claude Sonnet 5.5",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "capabilities": [
+        "tools",
+        "vision",
+        "pdf"
+      ]
     }
   },
   "gemini": {
@@ -1115,8 +1200,8 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "gemini-2.5-computer-use-preview-10-2025": {
       "id": "gemini-2.5-computer-use-preview-10-2025",
       "name": "Gemini 2.5 Computer Use Preview 10-2025",
-      "contextWindow": 131072,
-      "maxOutput": 65536,
+      "contextWindow": 128000,
+      "maxOutput": 64000,
       "reasoning": {
         "kind": "toggle"
       },
@@ -1228,7 +1313,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "gemini-3-pro-image": {
       "id": "gemini-3-pro-image",
       "name": "Nano Banana Pro",
-      "contextWindow": 131072,
+      "contextWindow": 65536,
       "maxOutput": 32768,
       "reasoning": {
         "kind": "effort",
@@ -1256,8 +1341,8 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "gemini-3.1-flash-image": {
       "id": "gemini-3.1-flash-image",
       "name": "Nano Banana 2",
-      "contextWindow": 65536,
-      "maxOutput": 65536,
+      "contextWindow": 131072,
+      "maxOutput": 32768,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -1314,7 +1399,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "gemini-3.1-flash-lite-image",
       "name": "Nano Banana 2 Lite",
       "contextWindow": 65536,
-      "maxOutput": 65536,
+      "maxOutput": 4096,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -1822,16 +1907,6 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "contextWindow": 32768,
       "maxOutput": 4096
     },
-    "anthropic/claude-3-haiku": {
-      "id": "anthropic/claude-3-haiku",
-      "name": "Claude 3 Haiku",
-      "contextWindow": 200000,
-      "maxOutput": 4096,
-      "capabilities": [
-        "tools",
-        "vision"
-      ]
-    },
     "anthropic/claude-fable-5": {
       "id": "anthropic/claude-fable-5",
       "name": "Claude Fable 5",
@@ -2089,6 +2164,27 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
         "pdf"
       ]
     },
+    "anthropic/claude-sonnet-5.5": {
+      "id": "anthropic/claude-sonnet-5.5",
+      "name": "Claude Sonnet 5.5",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "capabilities": [
+        "tools",
+        "vision",
+        "pdf"
+      ]
+    },
     "arcee-ai/trinity-large-thinking": {
       "id": "arcee-ai/trinity-large-thinking",
       "name": "Trinity Large Thinking",
@@ -2288,7 +2384,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "deepseek/deepseek-chat",
       "name": "DeepSeek Chat",
       "contextWindow": 163840,
-      "maxOutput": 16384,
+      "maxOutput": 16000,
       "capabilities": [
         "tools"
       ]
@@ -2338,20 +2434,11 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
         "tools"
       ]
     },
-    "deepseek/deepseek-r1-distill-llama-70b": {
-      "id": "deepseek/deepseek-r1-distill-llama-70b",
-      "name": "R1 Distill Llama 70B",
-      "contextWindow": 8192,
-      "maxOutput": 7372,
-      "reasoning": {
-        "kind": "toggle"
-      }
-    },
     "deepseek/deepseek-v3.1-terminus": {
       "id": "deepseek/deepseek-v3.1-terminus",
       "name": "DeepSeek V3.1 Terminus",
       "contextWindow": 163840,
-      "maxOutput": 32768,
+      "maxOutput": 65536,
       "reasoning": {
         "kind": "toggle"
       },
@@ -2375,7 +2462,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "deepseek/deepseek-v3.2-exp",
       "name": "DeepSeek V3.2 Exp",
       "contextWindow": 163840,
-      "maxOutput": 65536,
+      "maxOutput": 147456,
       "reasoning": {
         "kind": "toggle"
       },
@@ -2387,7 +2474,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "deepseek/deepseek-v4-flash",
       "name": "DeepSeek V4 Flash",
       "contextWindow": 1048576,
-      "maxOutput": 384000,
+      "maxOutput": 131072,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -2402,7 +2489,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "deepseek/deepseek-v4-flash-0731": {
       "id": "deepseek/deepseek-v4-flash-0731",
       "name": "DeepSeek V4 Flash 0731",
-      "contextWindow": 1310720,
+      "contextWindow": 1048576,
       "maxOutput": 943718,
       "reasoning": {
         "kind": "effort",
@@ -2420,7 +2507,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "deepseek/deepseek-v4-flash-vision-exp",
       "name": "DeepSeek V4 Flash Vision Exp",
       "contextWindow": 1048576,
-      "maxOutput": 943718,
+      "maxOutput": 262144,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -2454,7 +2541,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "deepseek/deepseek-v4-pro-0813",
       "name": "DeepSeek V4 Pro 0813",
       "contextWindow": 1048576,
-      "maxOutput": 384000,
+      "maxOutput": 393216,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -2492,6 +2579,24 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "maxOutput": 460800,
       "reasoning": {
         "kind": "toggle"
+      },
+      "capabilities": [
+        "tools",
+        "vision"
+      ]
+    },
+    "fireworks/ember-1": {
+      "id": "fireworks/ember-1",
+      "name": "Ember-1",
+      "contextWindow": 1048576,
+      "maxOutput": 943718,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "low",
+          "high",
+          "max"
+        ]
       },
       "capabilities": [
         "tools",
@@ -3061,18 +3166,6 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
         "tools"
       ]
     },
-    "inclusionai/ling-3.0-flash-fin:free": {
-      "id": "inclusionai/ling-3.0-flash-fin:free",
-      "name": "Ling 3.0 Flash Fin (free)",
-      "contextWindow": 262144,
-      "maxOutput": 32768,
-      "reasoning": {
-        "kind": "toggle"
-      },
-      "capabilities": [
-        "tools"
-      ]
-    },
     "inclusionai/ling-3.0-flash-sante:free": {
       "id": "inclusionai/ling-3.0-flash-sante:free",
       "name": "Ling 3.0 Flash Sante (free)",
@@ -3224,7 +3317,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "meta/muse-glimmer-30b",
       "name": "Muse Glimmer 30B",
       "contextWindow": 131072,
-      "maxOutput": 16384,
+      "maxOutput": 117964,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -3257,7 +3350,6 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "capabilities": [
         "tools",
         "vision",
-        "audio",
         "video",
         "pdf"
       ]
@@ -3280,7 +3372,6 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "capabilities": [
         "tools",
         "vision",
-        "audio",
         "video",
         "pdf"
       ]
@@ -3303,7 +3394,6 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "capabilities": [
         "tools",
         "vision",
-        "audio",
         "video",
         "pdf"
       ]
@@ -3327,7 +3417,6 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "capabilities": [
         "tools",
         "vision",
-        "audio",
         "video",
         "pdf"
       ]
@@ -3351,7 +3440,6 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "capabilities": [
         "tools",
         "vision",
-        "audio",
         "video",
         "pdf"
       ]
@@ -3372,7 +3460,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "minimax/minimax-01",
       "name": "MiniMax-01",
       "contextWindow": 1000192,
-      "maxOutput": 900172,
+      "maxOutput": 40000,
       "capabilities": [
         "vision"
       ]
@@ -3393,7 +3481,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "minimax/minimax-m2",
       "name": "MiniMax-M2",
       "contextWindow": 204800,
-      "maxOutput": 131072,
+      "maxOutput": 176947,
       "reasoning": {
         "kind": "toggle"
       },
@@ -3435,7 +3523,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "minimax/minimax-m2.7",
       "name": "MiniMax-M2.7",
       "contextWindow": 204800,
-      "maxOutput": 131072,
+      "maxOutput": 176947,
       "reasoning": {
         "kind": "toggle"
       },
@@ -3462,6 +3550,17 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "name": "Codestral 2508",
       "contextWindow": 256000,
       "maxOutput": 204800,
+      "capabilities": [
+        "tools",
+        "vision",
+        "pdf"
+      ]
+    },
+    "mistralai/devstral-2512": {
+      "id": "mistralai/devstral-2512",
+      "name": "Devstral 2",
+      "contextWindow": 262144,
+      "maxOutput": 209715,
       "capabilities": [
         "tools",
         "vision",
@@ -3514,6 +3613,17 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "name": "Mistral Large 2407",
       "contextWindow": 131072,
       "maxOutput": 104857,
+      "capabilities": [
+        "tools",
+        "vision",
+        "pdf"
+      ]
+    },
+    "mistralai/mistral-large-2512": {
+      "id": "mistralai/mistral-large-2512",
+      "name": "Mistral Large 3",
+      "contextWindow": 262144,
+      "maxOutput": 209715,
       "capabilities": [
         "tools",
         "vision",
@@ -3668,7 +3778,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "moonshotai/kimi-k2-thinking",
       "name": "Kimi K2 Thinking",
       "contextWindow": 262144,
-      "maxOutput": 98304,
+      "maxOutput": 235929,
       "reasoning": {
         "kind": "toggle"
       },
@@ -3763,45 +3873,9 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
         "vision"
       ]
     },
-    "nex-agi/nex-n2.5-mini:free": {
-      "id": "nex-agi/nex-n2.5-mini:free",
-      "name": "Nex-N2.5-Mini (free)",
-      "contextWindow": 262144,
-      "maxOutput": 235929,
-      "reasoning": {
-        "kind": "effort",
-        "values": [
-          "none",
-          "medium",
-          "high"
-        ]
-      },
-      "capabilities": [
-        "tools",
-        "vision"
-      ]
-    },
     "nex-agi/nex-n2.5-pro": {
       "id": "nex-agi/nex-n2.5-pro",
       "name": "Nex-N2.5-Pro",
-      "contextWindow": 262144,
-      "maxOutput": 235929,
-      "reasoning": {
-        "kind": "effort",
-        "values": [
-          "none",
-          "medium",
-          "high"
-        ]
-      },
-      "capabilities": [
-        "tools",
-        "vision"
-      ]
-    },
-    "nex-agi/nex-n2.5-pro:free": {
-      "id": "nex-agi/nex-n2.5-pro:free",
-      "name": "Nex-N2.5-Pro (free)",
       "contextWindow": 262144,
       "maxOutput": 235929,
       "reasoning": {
@@ -4803,6 +4877,48 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
         "pdf"
       ]
     },
+    "openai/gpt-6.1-sol": {
+      "id": "openai/gpt-6.1-sol",
+      "name": "GPT-6.1 Sol",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "capabilities": [
+        "tools",
+        "vision",
+        "pdf"
+      ]
+    },
+    "openai/gpt-6.1-sol-pro": {
+      "id": "openai/gpt-6.1-sol-pro",
+      "name": "GPT-6.1 Sol Pro",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "capabilities": [
+        "tools",
+        "vision",
+        "pdf"
+      ]
+    },
     "openai/gpt-audio": {
       "id": "openai/gpt-audio",
       "name": "GPT Audio",
@@ -4840,7 +4956,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "openai/gpt-oss-120b",
       "name": "GPT OSS 120B",
       "contextWindow": 131072,
-      "maxOutput": 65536,
+      "maxOutput": 117964,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -5061,6 +5177,28 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       },
       "capabilities": [
         "vision",
+        "video"
+      ]
+    },
+    "perceptron/perceptron-mk1.5": {
+      "id": "perceptron/perceptron-mk1.5",
+      "name": "Perceptron Mk1.5",
+      "contextWindow": 36864,
+      "maxOutput": 8192,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      "capabilities": [
+        "tools",
+        "vision",
+        "audio",
         "video"
       ]
     },
@@ -5403,7 +5541,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "qwen/qwen3-next-80b-a3b-instruct",
       "name": "Qwen3-Next 80B-A3B Instruct",
       "contextWindow": 262144,
-      "maxOutput": 16384,
+      "maxOutput": 235929,
       "capabilities": [
         "tools"
       ]
@@ -5447,7 +5585,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "qwen/qwen3-vl-30b-a3b-instruct",
       "name": "Qwen3 VL 30B A3B Instruct",
       "contextWindow": 262144,
-      "maxOutput": 32768,
+      "maxOutput": 16384,
       "capabilities": [
         "tools",
         "vision"
@@ -5531,7 +5669,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "qwen/qwen3.5-35b-a3b",
       "name": "Qwen3.5 35B-A3B",
       "contextWindow": 262144,
-      "maxOutput": 16384,
+      "maxOutput": 65536,
       "reasoning": {
         "kind": "toggle"
       },
@@ -5615,7 +5753,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "qwen/qwen3.6-27b",
       "name": "Qwen3.6 27B",
       "contextWindow": 262144,
-      "maxOutput": 262140,
+      "maxOutput": 81920,
       "reasoning": {
         "kind": "toggle"
       },
@@ -5794,6 +5932,27 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "qwen/qwen3.8-max-0902": {
       "id": "qwen/qwen3.8-max-0902",
       "name": "Qwen3.8 Max 0902",
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "capabilities": [
+        "tools",
+        "vision",
+        "video"
+      ]
+    },
+    "qwen/qwen3.8-max-prime": {
+      "id": "qwen/qwen3.8-max-prime",
+      "name": "Qwen 3.8 Max Prime",
       "contextWindow": 1000000,
       "maxOutput": 131072,
       "reasoning": {
@@ -6110,7 +6269,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "thinkingmachines/inkling": {
       "id": "thinkingmachines/inkling",
       "name": "Inkling",
-      "contextWindow": 1048576,
+      "contextWindow": 524288,
       "maxOutput": 471859,
       "reasoning": {
         "kind": "effort",
@@ -6132,7 +6291,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "thinkingmachines/inkling-small": {
       "id": "thinkingmachines/inkling-small",
       "name": "Inkling Small",
-      "contextWindow": 1048576,
+      "contextWindow": 524288,
       "maxOutput": 262144,
       "reasoning": {
         "kind": "effort",
@@ -6434,7 +6593,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "xiaomi/mimo-v2.6-flash": {
       "id": "xiaomi/mimo-v2.6-flash",
       "name": "MiMo-V2.6-Flash",
-      "contextWindow": 1048576,
+      "contextWindow": 1050000,
       "maxOutput": 131072,
       "reasoning": {
         "kind": "toggle"
@@ -6449,7 +6608,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "xiaomi/mimo-v2.6-pro": {
       "id": "xiaomi/mimo-v2.6-pro",
       "name": "MiMo-V2.6-Pro",
-      "contextWindow": 1048576,
+      "contextWindow": 1050000,
       "maxOutput": 131072,
       "reasoning": {
         "kind": "toggle"
@@ -6591,7 +6750,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "z-ai/glm-5.1",
       "name": "GLM-5.1",
       "contextWindow": 204800,
-      "maxOutput": 128000,
+      "maxOutput": 131072,
       "reasoning": {
         "kind": "toggle"
       },
@@ -6603,7 +6762,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "z-ai/glm-5.2",
       "name": "GLM-5.2",
       "contextWindow": 1048576,
-      "maxOutput": 131072,
+      "maxOutput": 943718,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -6615,24 +6774,11 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
         "tools"
       ]
     },
-    "z-ai/glm-5.2:free": {
-      "id": "z-ai/glm-5.2:free",
-      "name": "GLM 5.2 (free)",
-      "contextWindow": 32768,
-      "maxOutput": 29491,
-      "reasoning": {
-        "kind": "effort",
-        "values": [
-          "high",
-          "xhigh"
-        ]
-      }
-    },
     "z-ai/glm-5.3": {
       "id": "z-ai/glm-5.3",
       "name": "GLM-5.3",
-      "contextWindow": 1310720,
-      "maxOutput": 131072,
+      "contextWindow": 1048576,
+      "maxOutput": 943718,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -6648,8 +6794,8 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "z-ai/glm-5.3-flash": {
       "id": "z-ai/glm-5.3-flash",
       "name": "GLM-5.3-Flash",
-      "contextWindow": 1310720,
-      "maxOutput": 943718,
+      "contextWindow": 1048576,
+      "maxOutput": 943717,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -6681,6 +6827,23 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
         "tools",
         "vision",
         "video"
+      ]
+    },
+    "z-ai/glm-5.3-prime": {
+      "id": "z-ai/glm-5.3-prime",
+      "name": "GLM 5.3 Prime",
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
+      "reasoning": {
+        "kind": "effort",
+        "values": [
+          "low",
+          "high",
+          "max"
+        ]
+      },
+      "capabilities": [
+        "tools"
       ]
     },
     "z-ai/glm-5v-turbo": {
@@ -6812,7 +6975,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "~deepseek/deepseek-v4-flash-latest": {
       "id": "~deepseek/deepseek-v4-flash-latest",
       "name": "DeepSeek V4 Flash Latest",
-      "contextWindow": 1310720,
+      "contextWindow": 1048576,
       "maxOutput": 943718,
       "reasoning": {
         "kind": "effort",
@@ -6959,7 +7122,6 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "reasoning": {
         "kind": "effort",
         "values": [
-          "none",
           "low",
           "medium",
           "high",
@@ -7018,8 +7180,8 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "~z-ai/glm-flash-latest": {
       "id": "~z-ai/glm-flash-latest",
       "name": "GLM Flash Latest",
-      "contextWindow": 1310720,
-      "maxOutput": 131072,
+      "contextWindow": 1048576,
+      "maxOutput": 943718,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -7037,8 +7199,8 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
     "~z-ai/glm-latest": {
       "id": "~z-ai/glm-latest",
       "name": "GLM Latest",
-      "contextWindow": 1310720,
-      "maxOutput": 131072,
+      "contextWindow": 1048576,
+      "maxOutput": 943718,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -7225,7 +7387,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "deepseek-flash",
       "name": "DeepSeek V4.1 Flash",
       "contextWindow": 1000000,
-      "maxOutput": 384000,
+      "maxOutput": 393216,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -7243,7 +7405,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "deepseek-v4-flash",
       "name": "DeepSeek V4 Flash",
       "contextWindow": 1000000,
-      "maxOutput": 384000,
+      "maxOutput": 393216,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -7261,7 +7423,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "deepseek-v4-flash-vision-exp",
       "name": "DeepSeek V4 Flash Vision Exp",
       "contextWindow": 1000000,
-      "maxOutput": 384000,
+      "maxOutput": 393216,
       "reasoning": {
         "kind": "effort",
         "values": [
@@ -7279,7 +7441,7 @@ export const CATALOG: Record<string, Record<string, CatalogModel>> = {
       "id": "deepseek-v4-pro",
       "name": "DeepSeek V4 Pro",
       "contextWindow": 1000000,
-      "maxOutput": 384000,
+      "maxOutput": 393216,
       "reasoning": {
         "kind": "effort",
         "values": [

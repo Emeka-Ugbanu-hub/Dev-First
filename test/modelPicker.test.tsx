@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ConnectionState, ProviderConnection } from '../src/shared/protocol';
-import { ModelPicker, modelSelectionMessage } from '../webview/src/components/ModelPicker';
+import { ModelPicker, formatAge, latestVersionedSibling, modelSelectionMessage } from '../webview/src/components/ModelPicker';
 import { SettingsPanel } from '../webview/src/components/settings/SettingsPanel';
 
 const connection: ConnectionState = {
@@ -75,6 +75,70 @@ describe('modelSelectionMessage', () => {
       preset: 'anthropic',
       model: 'claude-haiku',
     });
+  });
+});
+
+describe('model freshness and aliases', () => {
+  it('shows when the list was last updated', () => {
+    const html = renderPicker({
+      modelsUpdatedAtByProvider: { openai: Date.now() - 3 * 60 * 60 * 1000 },
+    });
+    expect(html).toContain('Updated 3h ago');
+  });
+
+  it('warns when the live refresh failed but cached models are shown', () => {
+    const html = renderPicker({ modelsLiveFailedByProvider: { openai: true } });
+    expect(html).toContain('Live refresh failed');
+  });
+
+  it('offers a refresh action', () => {
+    const html = renderPicker();
+    expect(html).toContain('Refresh models');
+  });
+
+  it('labels a DeepSeek alias with its newest versioned sibling', () => {
+    const html = renderPicker({
+      connection: { preset: 'deepseek', provider: 'deepseek', model: 'deepseek-chat', connected: true, needsKey: false },
+      connections: [{ preset: 'deepseek', label: 'DeepSeek', model: 'deepseek-chat', active: true }],
+      models: ['deepseek-chat', 'deepseek-chat-v3.2'],
+    });
+    expect(html).toContain('newest versioned model');
+  });
+
+  it('formats freshness ages', () => {
+    const now = Date.now();
+    expect(formatAge(now - 10_000, now)).toBe('just now');
+    expect(formatAge(now - 5 * 60_000, now)).toBe('5m ago');
+    expect(formatAge(now - 3 * 60 * 60_000, now)).toBe('3h ago');
+    expect(formatAge(now - 2 * 24 * 60 * 60_000, now)).toBe('2d ago');
+  });
+});
+
+describe('latestVersionedSibling', () => {
+  it('picks the newest dotted version for the chat alias', () => {
+    expect(
+      latestVersionedSibling('deepseek-chat', [
+        'deepseek-chat',
+        'deepseek-chat-v3-0324',
+        'deepseek-chat-v3.1',
+        'deepseek-chat-v3.2',
+      ]),
+    ).toBe('deepseek-chat-v3.2');
+  });
+
+  it('skips distill variants for the reasoner alias', () => {
+    expect(
+      latestVersionedSibling('deepseek-reasoner', [
+        'deepseek-reasoner',
+        'deepseek-r1-distill-llama-70b',
+        'deepseek-r1-0528',
+      ]),
+    ).toBe('deepseek-r1-0528');
+  });
+
+  it('returns nothing for unknown aliases or missing siblings', () => {
+    expect(latestVersionedSibling('gpt-4o', ['gpt-4o-mini'])).toBeUndefined();
+    expect(latestVersionedSibling('deepseek-chat', ['deepseek-chat'])).toBeUndefined();
   });
 });
 

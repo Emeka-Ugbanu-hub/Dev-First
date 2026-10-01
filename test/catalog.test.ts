@@ -5,12 +5,14 @@ import {
   modelInfo,
   modelsForProvider,
   readLiveModels,
+  readLiveModelsUpdatedAt,
   reasoningFor,
   reasoningLevelsFor,
   reasoningLevelsFrom,
   resolveCatalogModels,
   snapReasoning,
   storeLiveModels,
+  storeLiveModelsUpdatedAt,
 } from '../src/llm/catalog';
 
 function anyProvider(): string {
@@ -209,5 +211,39 @@ describe('model list persistence', () => {
     };
     expect(readLiveModels(state, 'groq')).toEqual(['llama-3.3-70b']);
     expect(readLiveModels(state, 'openai')).toEqual([]);
+  });
+});
+
+describe('modelsForProvider runtime merge', () => {
+  it('orders live models, then runtime models, then the bundled catalog without duplicates', () => {
+    const result = modelsForProvider('deepseek', ['deepseek-chat'], ['deepseek-chat', 'deepseek-v9-experimental']);
+    expect(result[0]).toBe('deepseek-chat');
+    expect(result).toContain('deepseek-v9-experimental');
+    expect(new Set(result).size).toBe(result.length);
+  });
+
+  it('falls back to the bundled catalog when no live or runtime models exist', () => {
+    const result = modelsForProvider('deepseek', []);
+    expect(result.length).toBeGreaterThan(0);
+  });
+});
+
+describe('live model freshness timestamps', () => {
+  it('round-trips the last updated timestamp', async () => {
+    const store = new Map<string, unknown>();
+    const state = {
+      get: <T>(key: string) => store.get(key) as T | undefined,
+      update: async (key: string, value: unknown) => {
+        store.set(key, value);
+      },
+    };
+    await storeLiveModelsUpdatedAt(state, 'deepseek', 1234);
+    expect(readLiveModelsUpdatedAt(state, 'deepseek')).toBe(1234);
+    expect(readLiveModelsUpdatedAt(state, 'openai')).toBeUndefined();
+  });
+
+  it('ignores malformed timestamps', () => {
+    const state = { get: <T>(_key: string) => 'yesterday' as unknown as T | undefined };
+    expect(readLiveModelsUpdatedAt(state, 'deepseek')).toBeUndefined();
   });
 });

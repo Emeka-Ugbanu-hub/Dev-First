@@ -44,6 +44,7 @@ interface CacheShape {
   version: number;
   fetchedAt: number;
   models: Record<string, ModelInfo>;
+  byProvider?: Record<string, string[]>;
 }
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -51,6 +52,7 @@ const FETCH_TIMEOUT_MS = 8000;
 
 export class ModelRegistry {
   private models = new Map<string, ModelInfo>();
+  private providerModels = new Map<string, string[]>();
   private loaded = false;
 
   constructor(private readonly cacheFile: string) {}
@@ -94,13 +96,22 @@ export class ModelRegistry {
     return this.lookup(provider, modelId)?.contextWindow ?? fallbackLimit;
   }
 
+  providerModelIds(providerId: string): string[] {
+    return this.providerModels.get(providerId.toLowerCase()) ?? [];
+  }
+
   private async loadCache(): Promise<void> {
     try {
       const raw = await fs.readFile(this.cacheFile, 'utf-8');
       const parsed = JSON.parse(raw) as CacheShape;
-      if (parsed?.version === 2 && parsed?.models && Date.now() - (parsed.fetchedAt ?? 0) < CACHE_TTL_MS) {
+      if (parsed?.version === 3 && parsed?.models && Date.now() - (parsed.fetchedAt ?? 0) < CACHE_TTL_MS) {
         for (const [key, info] of Object.entries(parsed.models)) {
           this.models.set(key, info);
+        }
+        for (const [providerId, ids] of Object.entries(parsed.byProvider ?? {})) {
+          if (Array.isArray(ids) && ids.length > 0) {
+            this.providerModels.set(providerId, ids);
+          }
         }
         return;
       }
@@ -120,8 +131,10 @@ export class ModelRegistry {
       }
       const data = (await response.json()) as Record<string, any>;
       const models: Record<string, ModelInfo> = {};
+      const byProvider: Record<string, string[]> = {};
       for (const [providerId, provider] of Object.entries(data ?? {})) {
         const providerModels = (provider as any)?.models ?? {};
+        const ids: string[] = [];
         for (const [modelId, model] of Object.entries<any>(providerModels)) {
           const info: ModelInfo = {
             id: modelId,
@@ -134,12 +147,17 @@ export class ModelRegistry {
           };
           models[`${providerId}:${modelId}`.toLowerCase()] = info;
           models[modelId.toLowerCase()] = info;
+          ids.push(modelId);
+        }
+        if (ids.length > 0) {
+          byProvider[providerId.toLowerCase()] = ids;
         }
       }
       if (Object.keys(models).length > 0) {
         this.models = new Map(Object.entries(models));
+        this.providerModels = new Map(Object.entries(byProvider));
         await fs.mkdir(path.dirname(this.cacheFile), { recursive: true });
-        await fs.writeFile(this.cacheFile, JSON.stringify({ version: 2, fetchedAt: Date.now(), models }));
+        await fs.writeFile(this.cacheFile, JSON.stringify({ version: 3, fetchedAt: Date.now(), models, byProvider }));
       }
     } catch {
       // offline — fallback table covers common models

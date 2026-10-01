@@ -1048,6 +1048,18 @@ button:active:not(:disabled) {
   color: var(--vscode-descriptionForeground);
 }
 
+.model-freshness {
+  display: flex;
+  gap: 8px;
+  padding: 2px 7px 4px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.model-stale {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
 .model-group-title .codicon {
   font-size: 12px;
 }

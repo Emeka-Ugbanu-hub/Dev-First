@@ -75,6 +75,8 @@ export default function App() {
   const [modelsByProvider, setModelsByProvider] = useState<Record<string, string[]>>({});
   const [modelDetailsByProvider, setModelDetailsByProvider] = useState<Record<string, ModelMetadata[]>>({});
   const [modelsError, setModelsError] = useState<string | undefined>(undefined);
+  const [modelsUpdatedAtByProvider, setModelsUpdatedAtByProvider] = useState<Record<string, number>>({});
+  const [modelsLiveFailedByProvider, setModelsLiveFailedByProvider] = useState<Record<string, boolean>>({});
   const [connectResult, setConnectResult] = useState<ConnectResult | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [modelPickerRight, setModelPickerRight] = useState<number | undefined>(undefined);
@@ -168,6 +170,10 @@ export default function App() {
           modelsByProviderRef.current = { ...modelsByProviderRef.current, [message.preset]: message.models };
           setModelsByProvider(modelsByProviderRef.current);
           setModelDetailsByProvider((current) => ({ ...current, [message.preset!]: Object.values(message.details ?? {}) }));
+          if (message.updatedAt) {
+            setModelsUpdatedAtByProvider((current) => ({ ...current, [message.preset!]: message.updatedAt! }));
+          }
+          setModelsLiveFailedByProvider((current) => ({ ...current, [message.preset!]: Boolean(message.liveFailed) }));
           if (message.preset === activePresetRef.current) {
             setModels(message.models);
             setModelsError(message.error);
@@ -185,6 +191,10 @@ export default function App() {
           modelsByProviderRef.current = { ...modelsByProviderRef.current, [preset]: message.models ?? [] };
           setModelsByProvider(modelsByProviderRef.current);
           setModelDetailsByProvider((current) => ({ ...current, [preset]: Object.values(message.details ?? {}) }));
+          if (message.updatedAt) {
+            setModelsUpdatedAtByProvider((current) => ({ ...current, [preset]: message.updatedAt! }));
+          }
+          setModelsLiveFailedByProvider((current) => ({ ...current, [preset]: false }));
           if (preset === activePresetRef.current) {
             setModels(message.models ?? []);
             setModelsError(undefined);
@@ -696,6 +706,8 @@ export default function App() {
             modelsByProvider={modelsByProvider}
             modelDetailsByProvider={modelDetailsByProvider}
           modelsError={modelsError}
+          modelsUpdatedAtByProvider={modelsUpdatedAtByProvider}
+          modelsLiveFailedByProvider={modelsLiveFailedByProvider}
           anchorRight={modelPickerRight}
           onAddProvider={() => {
             setPickerOpen(false);
