@@ -26,6 +26,7 @@ interface LevelMessage {
   children: ChildView[];
   breadcrumbs: Array<{ id: string; label: string; kind: string }>;
   diagram: string;
+  summary?: string;
 }
 
 interface EmptyMessage {
@@ -60,6 +61,9 @@ const vscode = acquireVsCodeApi();
 
 const backButton = document.getElementById('df-back') as HTMLButtonElement | null;
 const refreshButton = document.getElementById('df-refresh') as HTMLButtonElement | null;
+const exportButton = document.getElementById('df-export') as HTMLButtonElement | null;
+const searchInput = document.getElementById('df-search') as HTMLInputElement | null;
+const summaryBox = document.getElementById('df-summary') as HTMLElement | null;
 const refreshIcon = document.getElementById('df-refresh-icon');
 const crumbs = document.getElementById('df-crumbs');
 const hint = document.getElementById('df-hint');
@@ -275,6 +279,15 @@ async function render(message: LevelMessage): Promise<void> {
   setHint('');
   breadcrumbTrail = message.breadcrumbs;
   renderBreadcrumbs();
+  if (summaryBox) {
+    if (message.summary) {
+      summaryBox.textContent = message.summary;
+      summaryBox.hidden = false;
+    } else {
+      summaryBox.hidden = true;
+      summaryBox.textContent = '';
+    }
+  }
   const concepts = conceptChildren(message.children);
   const files = fileChildren(message.children);
   const filesOnly = !shouldRenderDiagram(message.children);
@@ -356,6 +369,26 @@ if (refreshButton) {
   refreshButton.addEventListener('click', () => {
     setRefreshing(true);
     post({ type: 'refresh' });
+  });
+}
+
+if (searchInput) {
+  searchInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && searchInput.value.trim()) {
+      post({ type: 'search', query: searchInput.value.trim() });
+    }
+  });
+}
+
+if (exportButton) {
+  exportButton.addEventListener('click', () => {
+    const svg = diagram?.querySelector('svg');
+    if (!svg) {
+      setStatus('Nothing to export');
+      return;
+    }
+    const markup = new XMLSerializer().serializeToString(svg);
+    post({ type: 'exportDiagram', svg: markup });
   });
 }
 

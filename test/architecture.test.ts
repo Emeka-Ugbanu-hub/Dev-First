@@ -40,6 +40,8 @@ import {
   levelRelations,
   mermaidForNode,
   openArchitectureFile,
+  findNodeByQuery,
+  projectSummary,
 } from '../src/architecture/panel';
 
 function facts(file: string, overrides: Partial<FileFacts> = {}): FileFacts {
@@ -1335,5 +1337,29 @@ describe('mermaidForNode flow rendering', () => {
   it('renders only proven relationships, never imports', () => {
     const diagram = mermaidForNode(node, levelRelations(node, files), files);
     expect(diagram).not.toContain('imports');
+  });
+});
+
+describe('project summary and search', () => {
+  const files = [
+    facts('file:///w/src/App.tsx'),
+    facts('file:///w/src/services/user.ts'),
+    facts('file:///w/src/routes/users.ts'),
+  ];
+  const tree = buildArchitectureTree(files);
+
+  it('summarizes the project name, domains, and counts', () => {
+    const summary = projectSummary(files, tree, []);
+    expect(summary).toBeDefined();
+    expect(summary).toContain('src — ');
+    expect(summary).toContain('Frontend (1)');
+    expect(summary).toContain('Services (1)');
+    expect(summary).toContain('Backend (1)');
+  });
+
+  it('finds nodes by label or name fragment', () => {
+    expect(findNodeByQuery(tree, 'user')?.label).toBeDefined();
+    expect(findNodeByQuery(tree, 'App')?.label).toBe('App');
+    expect(findNodeByQuery(tree, 'zzz')).toBeUndefined();
   });
 });

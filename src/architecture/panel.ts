@@ -24,6 +24,8 @@ interface ArchitectureMessage {
   id?: string;
   path?: string;
   line?: number;
+  query?: string;
+  svg?: string;
 }
 
 interface ChildView {
@@ -221,6 +223,81 @@ export function mermaidForNode(
   return lines.join('\n');
 }
 
+export function findNodeByQuery(root: ArchitectureNode, query: string): ArchitectureNode | undefined {
+  const needle = query.trim().toLowerCase();
+  if (!needle) {
+    return undefined;
+  }
+  const matches: ArchitectureNode[] = [];
+  const walk = (node: ArchitectureNode): void => {
+    if (node.kind !== 'project' && node.label.toLowerCase().includes(needle)) {
+      matches.push(node);
+    }
+    for (const child of node.children) {
+      walk(child);
+    }
+  };
+  walk(root);
+  matches.sort((a, b) => {
+    const aExact = a.label.toLowerCase() === needle ? 0 : 1;
+    const bExact = b.label.toLowerCase() === needle ? 0 : 1;
+    if (aExact !== bExact) {
+      return aExact - bExact;
+    }
+    const aStarts = a.label.toLowerCase().startsWith(needle) ? 0 : 1;
+    const bStarts = b.label.toLowerCase().startsWith(needle) ? 0 : 1;
+    if (aStarts !== bStarts) {
+      return aStarts - bStarts;
+    }
+    return a.files.length - b.files.length || a.label.localeCompare(b.label);
+  });
+  return matches[0];
+}
+
+function commonDirectoryOf(files: string[]): string {
+  const paths = files.map((file) => decodeURIComponent(file.replace(/^file:\/\//, '')));
+  if (paths.length === 0) {
+    return '';
+  }
+  let prefix = paths[0].split('/');
+  for (const candidate of paths.slice(1)) {
+    const parts = candidate.split('/');
+    let index = 0;
+    while (index < prefix.length && index < parts.length && prefix[index] === parts[index]) {
+      index++;
+    }
+    prefix = prefix.slice(0, index);
+  }
+  return prefix.join('/');
+}
+
+export function projectSummary(
+  facts: FileFacts[],
+  tree: ArchitectureNode,
+  relations: ArchitectureRelation[],
+): string | undefined {
+  const domains = tree.children
+    .filter((child) => child.kind !== 'file')
+    .map((child) => `${child.label} (${child.files.length})`);
+  if (domains.length === 0) {
+    return undefined;
+  }
+  const root = commonDirectoryOf(facts.map((fact) => fact.file));
+  const name = root.split('/').filter(Boolean).pop() ?? tree.label;
+  const parts = [`${name} — ${domains.join(', ')}.`];
+  const calls = relations.find((relation) => relation.kind === 'tauri-command');
+  if (calls) {
+    const count = calls.distinct ?? calls.weight;
+    parts.push(`Frontend calls ${count} backend command${count === 1 ? '' : 's'}.`);
+  }
+  const endpoints = relations.find((relation) => relation.kind === 'rest-endpoint');
+  if (endpoints) {
+    const count = endpoints.distinct ?? endpoints.weight;
+    parts.push(`${count} verified endpoint${count === 1 ? '' : 's'}.`);
+  }
+  return parts.join(' ');
+}
+
 function detailOf(node: ArchitectureNode): DetailView {
   return {
     id: node.id,
@@ -377,6 +454,10 @@ export class ArchitectureSession {
     this.renderCurrent();
   }
 
+  findByQuery(query: string): ArchitectureNode | undefined {
+    return this.root ? findNodeByQuery(this.root, query) : undefined;
+  }
+
   navigate(id: string): void {
     if (!this.root) {
       return;
@@ -443,6 +524,9 @@ export class ArchitectureSession {
         kind: crumb.kind,
       })),
       diagram: mermaidForNode(node, analysis, this.facts),
+      ...(node.kind === 'project'
+        ? { summary: projectSummary(this.facts, node, analysis) }
+        : {}),
     });
     return node;
   }
@@ -574,7 +658,32 @@ export class ArchitecturePanel {
     }
     if (message.type === 'openFile' && typeof message.path === 'string') {
       await this.openFile(message.path, message.line);
+      return;
     }
+    if (message.type === 'search' && typeof message.query === 'string') {
+      const match = this.session.findByQuery(message.query);
+      if (match) {
+        this.session.navigate(match.id);
+      } else {
+        this.post({ type: 'hint', text: `No match for "${message.query.trim()}".` });
+      }
+      return;
+    }
+    if (message.type === 'exportDiagram' && typeof message.svg === 'string') {
+      await this.exportDiagram(message.svg);
+    }
+  }
+
+  private async exportDiagram(svg: string): Promise<void> {
+    const target = await vscode.window.showSaveDialog({
+      filters: { 'SVG image': ['svg'] },
+      saveLabel: 'Export architecture diagram',
+    });
+    if (!target) {
+      return;
+    }
+    await vscode.workspace.fs.writeFile(target, Buffer.from(svg, 'utf8'));
+    void vscode.window.setStatusBarMessage('Dev-First: diagram exported', 3000);
   }
 
   private async openFile(path: string, line = 0): Promise<void> {
@@ -675,7 +784,7 @@ export class ArchitecturePanel {
       border-bottom: 1px solid var(--vscode-panel-border);
       background: var(--vscode-editorWidget-background);
     }
-    #df-back, #df-refresh {
+    #df-back, #df-refresh, #df-export {
       display: inline-flex;
       align-items: center;
       gap: 4px;
@@ -687,9 +796,11 @@ export class ArchitecturePanel {
       cursor: pointer;
       font-size: 12px;
     }
-    #df-back:disabled, #df-refresh:disabled { opacity: 0.4; cursor: default; }
-    #df-refresh:hover:not(:disabled) { background: var(--df-hover); }
-    #df-refresh .codicon { font-size: 12px; }
+    #df-back:disabled, #df-refresh:disabled, #df-export:disabled { opacity: 0.4; cursor: default; }
+    #df-refresh:hover:not(:disabled), #df-export:hover:not(:disabled) { background: var(--df-hover); }
+    #df-refresh .codicon, #df-export .codicon { font-size: 12px; }
+    #df-search { width: 150px; padding: 2px 6px; border: 1px solid var(--df-border); border-radius: 4px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); font-size: 12px; }
+    #df-summary { padding: 0 0 14px; color: var(--vscode-descriptionForeground); font-size: 12px; }
     #df-crumbs { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
     .df-crumb {
       border: none;
@@ -815,11 +926,14 @@ export class ArchitecturePanel {
     <span id="df-status"></span>
     <button id="df-refresh" type="button" title="Refresh architecture">
       <span id="df-refresh-icon" class="codicon codicon-refresh" aria-hidden="true"></span>
-      Refresh
+    </button>
+    <input id="df-search" type="search" placeholder="Search…" aria-label="Search architecture" />
+    <button id="df-export" type="button" title="Export diagram (SVG)">
+      <span class="codicon codicon-export" aria-hidden="true"></span>
     </button>
   </header>
   <main id="df-main">
-    <section id="df-diagram-wrap"><div id="df-diagram"></div></section>
+    <section id="df-diagram-wrap"><div id="df-summary" hidden></div><div id="df-diagram"></div></section>
   
   </main>
   <script nonce="${nonce}" src="${scriptUri}"></script>
