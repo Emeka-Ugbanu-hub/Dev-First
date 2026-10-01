@@ -313,7 +313,7 @@ describe('Rust modules and Tauri command evidence', () => {
     const ipc = relations.find(
       (relation) => relation.fromId === 'frontend:greet' && relation.toId === 'backend:greet',
     );
-    expect(ipc?.label).toBe('invokes command');
+    expect(ipc?.label).toBe('calls');
     expect(ipc?.evidence.find((entry) => entry.role === 'use site')).toMatchObject({
       fromFile: frontend.file,
       toFile: backend.file,
@@ -360,6 +360,6 @@ describe('Rust modules and Tauri command evidence', () => {
     const result = analyzeArchitectureRelations([frontend, root, command], new Map([
       [frontend.file, 'frontend'], [root.file, 'shell'], [command.file, 'shell'],
     ]));
-    expect(result.some((relation) => relation.label === 'invokes command')).toBe(false);
+    expect(result.some((relation) => relation.label === 'calls')).toBe(false);
   });
 });

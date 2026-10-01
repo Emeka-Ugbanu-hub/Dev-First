@@ -21,8 +21,10 @@ export interface ArchitectureRelationEvidence {
 export interface ArchitectureRelation {
   fromId: string;
   toId: string;
+  kind?: ArchitectureRelationKind;
   label: string;
   weight: number;
+  distinct?: number;
   evidence: ArchitectureRelationEvidence[];
   evidenceTotal?: number;
 }
@@ -70,7 +72,7 @@ export function analyzeArchitectureRelations(
     const key = `${fromId}\u0000${toId}\u0000${kind}`;
     let relation = pairs.get(key);
     if (!relation) {
-      relation = { fromId, toId, label, weight: 0, evidence: [] };
+      relation = { fromId, toId, kind, label, weight: 0, evidence: [] };
       pairs.set(key, relation);
     }
     relation.weight++;
@@ -120,7 +122,7 @@ export function analyzeArchitectureRelations(
       for (const { file: handlerFile, handler } of targets.length === 1 ? targets : []) {
         const location = registered.get(`${rootOf(handlerFile)}\u0000${handler.name}`)?.[0];
         if (!location) continue;
-        add(file.file, handlerFile, call.line, 'tauri-command', 'invokes command', call.path, [
+        add(file.file, handlerFile, call.line, 'tauri-command', 'calls', call.path, [
           { fromFile: file.file, toFile: handlerFile, sourceFile: location.file, line: location.line, kind: 'tauri-command', role: 'registration', symbol: call.path },
           { fromFile: file.file, toFile: handlerFile, sourceFile: handlerFile, line: handler.line, kind: 'tauri-command', role: 'handler', symbol: call.path },
         ]);
@@ -155,8 +157,12 @@ export function analyzeArchitectureRelations(
   const relations = [...pairs.values()]
     .map((relation) => {
       const grouped = groupEvidence(relation.evidence);
+      const distinct = new Set(
+        grouped.map((entry) => entry.symbol).filter((symbol): symbol is string => Boolean(symbol)),
+      ).size;
       return {
         ...relation,
+        distinct,
         evidence: grouped.slice(0, MAX_RELATION_EVIDENCE),
         evidenceTotal: grouped.length,
       };

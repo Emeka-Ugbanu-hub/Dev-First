@@ -127,7 +127,7 @@ const LANGUAGE_BACKEND_EXT = new Set(['.rs', '.go', '.java', '.kt', '.kts', '.cs
 const LANGUAGE_INFRA_EXT = new Set(['.sh', '.bash', '.ps1']);
 const LANGUAGE_STYLE_EXT = new Set(['.css', '.scss', '.less', '.sass']);
 const LANGUAGE_CONFIG_EXT = new Set(['.ini']);
-const DATABASE_DRIVER_IMPORT = /^(rusqlite|sqlx|diesel|sqlite3?|better-sqlite3|prisma|sequelize|typeorm|knex|mongoose|mongodb|drizzle-orm)(\/|$)/i;
+const DATABASE_DRIVER_IMPORT = /^(rusqlite|sqlx|diesel|sqlite3?|better-sqlite3|prisma|sequelize|typeorm|knex|mongoose|mongodb|drizzle-orm)(\/|::|$)/i;
 const EXTERNAL_CLIENT_IMPORT = /^(reqwest|octocrab|github-graphql|@octokit|octokit)(\/|$)/i;
 const INFRA_DIR = /^(k8s|kubernetes|terraform|infra|deploy|deployments?|helm|charts?|ci|workflows?)$/i;
 const INFRA_BASE = /^(dockerfile|docker-compose\.ya?ml|compose\.ya?ml|jenkinsfile|\.gitlab-ci\.ya?ml)$/i;
@@ -639,6 +639,19 @@ function packageDomainGroups(entries: FileEntry[], packages: PackageRoot[]): Dom
       buckets.set(match.root, [entry]);
     }
   }
+  const roleFiles: FileEntry[] = [];
+  const splitRoles = new Set<DomainKey>(['database', 'external-services']);
+  for (const [rootKey, list] of buckets) {
+    const kept: FileEntry[] = [];
+    for (const entry of list) {
+      if (splitRoles.has(classifyEntry(entry))) {
+        roleFiles.push(entry);
+      } else {
+        kept.push(entry);
+      }
+    }
+    buckets.set(rootKey, kept);
+  }
   const roleLabels = new Map<string, string>();
   const labelCounts = new Map<string, number>();
   for (const pkg of packages) {
@@ -670,7 +683,7 @@ function packageDomainGroups(entries: FileEntry[], packages: PackageRoot[]): Dom
         .sort((a, b) => a.file.localeCompare(b.file)),
     });
   }
-  groups.push(...signalDomainGroups(leftovers));
+  groups.push(...signalDomainGroups([...leftovers, ...roleFiles]));
   return groups;
 }
 
@@ -1008,7 +1021,8 @@ export function refineTree(node: ArchitectureNode): void {
         parentLabel.length > 0 &&
         child.kind !== 'file' &&
         child.kind !== 'implementation' &&
-        child.files.length <= 1 &&
+        (child.files.length <= 1 ||
+          (child.kind === 'component' && child.files.length === node.files.length)) &&
         normalizedLabel(child.label) === parentLabel
       ) {
         collapsed.push(...child.children);

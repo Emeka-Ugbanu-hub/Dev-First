@@ -203,7 +203,19 @@ export function mermaidForNode(
   for (const edge of edges) {
     const fromArch = idToArch.get(edge.fromId);
     const toArch = idToArch.get(edge.toId);
-    const verb = edge.weight > 1 ? `${edge.label} ×${edge.weight}` : edge.label;
+    const count = edge.distinct ?? edge.weight;
+    const verb =
+      edge.kind === 'tauri-command'
+        ? count > 1
+          ? `calls ${count} commands`
+          : 'calls'
+        : edge.kind === 'rest-endpoint'
+          ? count > 1
+            ? `matches ${count} endpoints`
+            : 'matches endpoint'
+          : edge.weight > 1
+            ? `${edge.label} ×${edge.weight}`
+            : edge.label;
     lines.push(`  ${edge.fromId} -. "${mermaidText(verb)}" .-> ${edge.toId}`);
   }
   return lines.join('\n');

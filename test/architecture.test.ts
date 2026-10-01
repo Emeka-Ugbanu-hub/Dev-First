@@ -712,17 +712,60 @@ describe('refineTree', () => {
     expect(domain.children[0].label).toBe('a');
   });
 
-  it('keeps multi-file folder components when their label matches the subsystem', () => {
+  it('keeps a folder component when it covers only part of the subsystem', () => {
     const tree = buildArchitectureTree([
       facts('file:///w/src/components/A.ts'),
       facts('file:///w/src/components/B.ts'),
-      facts('file:///w/src/hooks/C.ts'),
+      facts('file:///w/src/Widget.tsx'),
     ]);
-    const frontend = tree.children.find((child) => child.label === 'Frontend');
-    const components = frontend?.children.find((child) => child.label === 'Components');
-    const group = components?.children.find((child) => child.kind === 'component');
+    const group = allNodes(tree).find((node) => node.kind === 'component');
     expect(group?.label).toBe('components');
     expect(group?.files).toHaveLength(2);
+  });
+
+  it('collapses a folder component that covers every file of its subsystem', () => {
+    const files = [
+      fileOf('file:a', 'a.ts', 'file:///w/a.ts'),
+      fileOf('file:b', 'b.ts', 'file:///w/b.ts'),
+    ];
+    const component = archNode({
+      id: 'component',
+      kind: 'component',
+      label: 'scripts',
+      files: ['file:///w/a.ts', 'file:///w/b.ts'],
+      children: files,
+    });
+    const domain = archNode({
+      id: 'domain',
+      kind: 'domain',
+      label: 'Scripts',
+      files: ['file:///w/a.ts', 'file:///w/b.ts'],
+      children: [component],
+    });
+    refineTree(domain);
+    expect(domain.children.map((child) => child.kind)).toEqual(['file', 'file']);
+  });
+
+  it('shows Database as its own domain when a package holds database files', () => {
+    const root = workspace({
+      'package.json': '{"name":"app"}',
+      'src/components/Button.tsx': '',
+      'src-tauri/Cargo.toml': '[package]\nname = "shell"\nversion = "0.1.0"\n',
+      'src-tauri/src/db.rs': '',
+      'src-tauri/src/main.rs': '',
+    });
+    const dbUri = `file://${join(root, 'src-tauri/src/db.rs')}`;
+    const tree = buildArchitectureTree([
+      factsFor(root, 'src/components/Button.tsx'),
+      facts(dbUri, { imports: [{ specifier: 'rusqlite::Connection', names: ['Connection'], line: 0 }] }),
+      factsFor(root, 'src-tauri/src/main.rs'),
+    ]);
+    const labels = tree.children.map((child) => child.label);
+    expect(labels).toContain('Database');
+    expect(labels).toContain('Backend');
+    expect(labels).toContain('Frontend');
+    const database = tree.children.find((child) => child.label === 'Database');
+    expect(database?.files).toEqual([dbUri]);
   });
 
   it('labels source-root entry files as Entry', () => {
@@ -1112,7 +1155,7 @@ describe('mermaidForNode relationships', () => {
     expect(backend).toBeDefined();
     const relations = levelRelations(backend!, files);
     const diagram = mermaidForNode(backend!, relations, files);
-    expect(diagram).toMatch(/-\. "matches endpoint/);
+    expect(diagram).toMatch(/-\. "matches 2 endpoints/);
   });
 });
 
