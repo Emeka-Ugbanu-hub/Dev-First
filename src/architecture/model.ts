@@ -388,13 +388,13 @@ const SUBSYSTEM_FALLBACK: Record<DomainKey, string> = {
   backend: 'Other',
   frontend: 'Other',
   database: 'Other',
-  infrastructure: 'Other',
+  infrastructure: 'Infrastructure',
   configuration: 'Config',
   'external-services': 'Other',
   workers: 'Other',
   shared: 'Other',
-  'desktop-shell': 'Modules',
-  unclassified: 'Modules',
+  'desktop-shell': 'Desktop shell',
+  unclassified: 'Utilities',
 };
 
 function decodePath(uri: string): string {
@@ -595,6 +595,18 @@ function signalDomainGroups(entries: FileEntry[]): DomainGroup[] {
   return groups;
 }
 
+function dominantFolderOf(entries: FileEntry[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const entry of entries) {
+    const top = entry.folder.split('/').filter(Boolean)[0];
+    if (top) {
+      counts.set(top, (counts.get(top) ?? 0) + 1);
+    }
+  }
+  const best = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0];
+  return best?.[0];
+}
+
 function packageDomainGroups(entries: FileEntry[], packages: PackageRoot[]): DomainGroup[] {
   const ordered = [...packages].sort((a, b) => b.root.length - a.root.length);
   const buckets = new Map<string, FileEntry[]>();
@@ -617,16 +629,28 @@ function packageDomainGroups(entries: FileEntry[], packages: PackageRoot[]): Dom
       buckets.set(match.root, [entry]);
     }
   }
+  const labelCounts = new Map<string, number>();
+  for (const pkg of packages) {
+    const list = buckets.get(pkg.root);
+    if (!list || list.length === 0) {
+      continue;
+    }
+    labelCounts.set(pkg.name, (labelCounts.get(pkg.name) ?? 0) + 1);
+  }
   const groups: DomainGroup[] = [];
   for (const pkg of packages) {
     const list = buckets.get(pkg.root);
     if (!list || list.length === 0) {
       continue;
     }
+    const duplicated = (labelCounts.get(pkg.name) ?? 0) > 1;
+    const suffix = duplicated ? dominantFolderOf(list) : undefined;
     groups.push({
       key: `pkg:${pkg.root}`,
-      label: pkg.name,
-      description: `Code belonging to the ${pkg.name} package.`,
+      label: suffix ? `${pkg.name} · ${suffix}` : pkg.name,
+      description: suffix
+        ? `Code belonging to the ${pkg.name} package in ${suffix}.`
+        : `Code belonging to the ${pkg.name} package.`,
       files: list
         .map((entry) => entry.facts)
         .sort((a, b) => a.file.localeCompare(b.file)),
@@ -691,6 +715,9 @@ function exportedComponentName(facts: FileFacts): string | undefined {
   return undefined;
 }
 
+const GENERIC_SOURCE_FOLDERS = new Set(['src', 'app', 'source', 'entry']);
+const ENTRY_STEMS = new Set(['app', 'main', 'index', 'entry', 'server']);
+
 function componentFor(entry: FileEntry): { key: string; label: string; description: string } {
   const named = exportedComponentName(entry.facts);
   if (named) {
@@ -708,7 +735,16 @@ function componentFor(entry: FileEntry): { key: string; label: string; descripti
     };
   }
   const folder = entry.folder;
-  const label = folder ? folder.split('/').pop() ?? folder : 'Root';
+  const segments = folder.split('/').filter(Boolean);
+  const last = segments[segments.length - 1] ?? '';
+  if (GENERIC_SOURCE_FOLDERS.has(last.toLowerCase()) && ENTRY_STEMS.has(entry.stem.toLowerCase())) {
+    return {
+      key: `entry:${folder}`,
+      label: 'Entry',
+      description: `Entry files under ${folder}.`,
+    };
+  }
+  const label = folder ? last || folder : 'Root';
   return {
     key: `dir:${folder || 'root'}`,
     label,
@@ -930,6 +966,7 @@ export function refineTree(node: ArchitectureNode): void {
         parentLabel.length > 0 &&
         child.kind !== 'file' &&
         child.kind !== 'implementation' &&
+        child.files.length <= 1 &&
         normalizedLabel(child.label) === parentLabel
       ) {
         collapsed.push(...child.children);

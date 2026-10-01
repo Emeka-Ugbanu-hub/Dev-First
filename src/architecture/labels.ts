@@ -40,6 +40,7 @@ export const LEVEL_LABELS_SYSTEM = [
   'You improve the labels of one level of a code architecture diagram.',
   'Use the deterministic children, roles, file samples, and edges as evidence.',
   'Name each node by its ROLE in the flow: entry point, core step, storage, or output surface.',
+  'At the project root, name each domain by its role: Frontend, Backend, Database, Workers, Infrastructure, Integrations — choose from the folder evidence.',
   'Respond with strict JSON only. No markdown, no prose, no code fences.',
   '{"nodes":[{"id":"","label":"","subtext":""}],"edges":[{"from":"","to":"","verb":""}]}',
   'Rules: copy every id exactly from the summary; only include nodes or edges you can improve; label is 1-4 words; subtext is one short factual sentence; verb is 1-3 words such as imports, calls, read/write, click, publishes.',

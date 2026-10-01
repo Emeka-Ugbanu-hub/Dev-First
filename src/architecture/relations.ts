@@ -16,6 +16,7 @@ export interface ArchitectureRelationEvidence {
   kind: ArchitectureRelationKind;
   role: 'use site' | 'registration' | 'handler';
   symbol?: string;
+  count?: number;
 }
 
 export interface ArchitectureRelation {
@@ -24,6 +25,7 @@ export interface ArchitectureRelation {
   label: string;
   weight: number;
   evidence: ArchitectureRelationEvidence[];
+  evidenceTotal?: number;
 }
 
 export interface ArchitectureAnalysis {
@@ -34,6 +36,22 @@ export interface ArchitectureAnalysis {
 
 interface RelationAccumulator extends Omit<ArchitectureRelation, 'evidence'> {
   evidence: ArchitectureRelationEvidence[];
+}
+
+const MAX_RELATION_EVIDENCE = 12;
+
+function groupEvidence(evidence: ArchitectureRelationEvidence[]): ArchitectureRelationEvidence[] {
+  const grouped = new Map<string, ArchitectureRelationEvidence>();
+  for (const item of evidence) {
+    const key = `${item.sourceFile}\u0000${item.role}\u0000${item.symbol ?? ''}\u0000${item.kind}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.count = (existing.count ?? 1) + 1;
+    } else {
+      grouped.set(key, { ...item, count: 1 });
+    }
+  }
+  return [...grouped.values()].sort((a, b) => a.sourceFile.localeCompare(b.sourceFile) || a.line - b.line);
 }
 
 export function analyzeArchitectureRelations(
@@ -170,13 +188,14 @@ export function analyzeArchitectureRelations(
   }
 
   const relations = [...pairs.values()]
-    .map((relation) => ({
-      ...relation,
-      evidence: relation.evidence.sort(
-        (a, b) => a.fromFile.localeCompare(b.fromFile) || a.line - b.line,
-      ),
-      weight: relation.weight,
-    }))
+    .map((relation) => {
+      const grouped = groupEvidence(relation.evidence);
+      return {
+        ...relation,
+        evidence: grouped.slice(0, MAX_RELATION_EVIDENCE),
+        evidenceTotal: grouped.length,
+      };
+    })
     .sort(
       (a, b) =>
         b.weight - a.weight ||

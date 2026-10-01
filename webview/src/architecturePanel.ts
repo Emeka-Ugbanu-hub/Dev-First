@@ -31,7 +31,8 @@ interface LevelMessage {
     fromLabel: string;
     toLabel: string;
     weight: number;
-    evidence: Array<{ fromFile: string; toFile: string; sourceFile: string; line: number; kind: string; role: string; symbol?: string }>;
+    evidenceTotal?: number;
+    evidence: Array<{ fromFile: string; toFile: string; sourceFile: string; line: number; kind: string; role: string; symbol?: string; count?: number }>;
   }>;
   coverage: {
     indexedFiles: number;
@@ -257,7 +258,7 @@ function chipList(values: string[]): string {
     .join('')}</ul>`;
 }
 
-function renderDetail(node: DetailView, levelFiles: ChildView[], message: LevelMessage): void {
+function renderDetail(node: DetailView, levelFiles: ChildView[], message: LevelMessage, hideFiles = false): void {
   if (!detail) {
     return;
   }
@@ -291,8 +292,8 @@ function renderDetail(node: DetailView, levelFiles: ChildView[], message: LevelM
             <li class="df-relation">
               <span>${escapeHtml(relation.fromLabel)} ${escapeHtml(relation.label)} ${escapeHtml(relation.toLabel)}</span>
               <ul class="df-files">${relation.evidence.map((evidence) => `
-                <li><button type="button" class="df-file" data-path="${escapeHtml(evidence.sourceFile)}" data-line="${evidence.line}" title="${escapeHtml(evidence.sourceFile)}:${evidence.line + 1}">${escapeHtml(evidence.role)} · ${escapeHtml(shortName(evidence.sourceFile))}:${evidence.line + 1}${evidence.symbol ? ` · ${escapeHtml(evidence.symbol)}` : ''}</button></li>
-              `).join('')}</ul>
+                <li><button type="button" class="df-file" data-path="${escapeHtml(evidence.sourceFile)}" data-line="${evidence.line}" title="${escapeHtml(evidence.sourceFile)}:${evidence.line + 1}">${escapeHtml(evidence.role)} · ${escapeHtml(shortName(evidence.sourceFile))}:${evidence.line + 1}${evidence.symbol ? ` · ${escapeHtml(evidence.symbol)}` : ''}${evidence.count && evidence.count > 1 ? ` ×${evidence.count}` : ''}</button></li>
+              `).join('')}${relation.evidenceTotal && relation.evidenceTotal > relation.evidence.length ? `<li class="df-more">…and ${relation.evidenceTotal - relation.evidence.length} more</li>` : ''}</ul>
             </li>
           `).join('')}
         </ul>
@@ -304,7 +305,7 @@ function renderDetail(node: DetailView, levelFiles: ChildView[], message: LevelM
       <p class="df-description">${message.coverage.unresolvedImports} unresolved local or Rust imports; ${message.coverage.unresolvedTauriCommands} unverified Tauri command calls.</p>
       <p class="df-description">${message.coverage.unsupportedSourceFiles} files use unsupported languages; ${message.coverage.parseFailures} files could not be parsed; ${message.coverage.oversizedSourceFiles} files exceeded the scan size limit.${message.coverage.scanLimitReached ? ' The file scan reached its 2,000-file cap.' : ''}</p>
     </div>
-    <div class="df-section">
+    ${hideFiles ? '' : `<div class="df-section">
       <h3>${heading}</h3>
       <ul class="df-files">
         ${listed
@@ -316,7 +317,7 @@ function renderDetail(node: DetailView, levelFiles: ChildView[], message: LevelM
           )
           .join('')}
       </ul>
-    </div>`;
+    </div>`}`;
   detail.querySelectorAll<HTMLButtonElement>('button.df-file').forEach((button) => {
     button.addEventListener('click', () =>
       post({
@@ -328,17 +329,42 @@ function renderDetail(node: DetailView, levelFiles: ChildView[], message: LevelM
   });
 }
 
+function displayFolder(path: string): string {
+  const clean = path.replace(/^file:\/\//, '');
+  const parts = clean.split('/').filter(Boolean);
+  parts.pop();
+  return decodeURIComponent(parts.slice(-2).join('/'));
+}
+
 function renderFileLevel(node: DetailView, files: ChildView[]): void {
   if (!diagram) {
     return;
   }
-  const count = files.length;
+  const cards = files
+    .map((child) => {
+      const path = child.file ?? '';
+      const name = path ? shortName(path) : child.label;
+      const folder = path ? displayFolder(path) : '';
+      return `<button type="button" class="df-file-card" data-path="${escapeHtml(path)}" title="${escapeHtml(path)}">
+        <span class="df-file-card-name">${escapeHtml(name)}</span>
+        ${folder ? `<span class="df-file-card-path">${escapeHtml(folder)}</span>` : ''}
+      </button>`;
+    })
+    .join('');
   diagram.innerHTML = `
-    <div class="df-files-only">
-      <span class="df-overview-kind">${escapeHtml(node.kind)}</span>
-      <strong>${escapeHtml(node.label)}</strong>
-      <span>${count === 1 ? '1 file' : `${count} files`}</span>
+    <div class="df-file-grid">
+      <div class="df-file-grid-header">
+        <span class="df-overview-kind">${escapeHtml(node.kind)}</span>
+        <strong>${escapeHtml(node.label)}</strong>
+        <span>${files.length === 1 ? '1 file' : `${files.length} files`}</span>
+      </div>
+      <div class="df-file-grid-cards">${cards}</div>
     </div>`;
+  diagram.querySelectorAll<HTMLButtonElement>('button.df-file-card').forEach((button) => {
+    button.addEventListener('click', () =>
+      post({ type: 'openFile', path: button.dataset.path ?? '', line: 0 }),
+    );
+  });
 }
 
 async function render(message: LevelMessage): Promise<void> {
@@ -348,9 +374,10 @@ async function render(message: LevelMessage): Promise<void> {
   renderBreadcrumbs();
   const concepts = conceptChildren(message.children);
   const files = fileChildren(message.children);
-  renderDetail(message.node, files, message);
+  const filesOnly = !shouldRenderDiagram(message.children);
+  renderDetail(message.node, files, message, filesOnly);
   childIndex = new Map(concepts.map((child, index) => [`n${index + 1}`, child]));
-  if (!shouldRenderDiagram(message.children)) {
+  if (filesOnly) {
     renderFileLevel(message.node, files);
     clearRenderingStatus();
     return;

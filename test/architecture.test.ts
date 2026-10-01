@@ -23,13 +23,6 @@ import {
   shouldRenderDiagram,
 } from '../webview/src/architectureView';
 import type { ArchitectureChild } from '../webview/src/architectureView';
-import {
-  DOMAIN_INFER_SYSTEM,
-  buildDomainSummary,
-  inferDomains,
-  parseInferredDomains,
-} from '../src/architecture/infer';
-import type { InferredDomain } from '../src/architecture/infer';
 import { computeRelations } from '../src/architecture/relations';
 import type { ArchitectureRelation } from '../src/architecture/relations';
 import { classifyLevelChildren, orderLevel } from '../src/architecture/flow';
@@ -558,7 +551,7 @@ describe('refineTree', () => {
   const fileOf = (id: string, label: string, uri: string): ArchitectureNode =>
     archNode({ id, kind: 'file', label, description: uri, files: [uri] });
 
-  it('collapses duplicate-label levels', () => {
+  it('keeps multi-file components whose label matches the parent', () => {
     const files = [
       fileOf('file:a', 'a.ts', 'file:///w/a.ts'),
       fileOf('file:b', 'b.ts', 'file:///w/b.ts'),
@@ -577,7 +570,7 @@ describe('refineTree', () => {
       children: [component],
     });
     refineTree(domain);
-    expect(domain.children.map((child) => child.id)).toEqual(['file:a', 'file:b']);
+    expect(domain.children.map((child) => child.id)).toEqual(['component']);
   });
 
   it('merges single-child chains and keeps the top label', () => {
@@ -730,19 +723,43 @@ describe('refineTree', () => {
     expect(domain.children[0].label).toBe('a');
   });
 
-  it('collapses duplicate labels in a built tree', () => {
+  it('keeps multi-file folder components when their label matches the subsystem', () => {
     const tree = buildArchitectureTree([
       facts('file:///w/src/components/A.ts'),
       facts('file:///w/src/components/B.ts'),
       facts('file:///w/src/hooks/C.ts'),
     ]);
-    expect(allNodes(tree).some((node) => node.kind === 'component')).toBe(false);
     const frontend = tree.children.find((child) => child.label === 'Frontend');
     const components = frontend?.children.find((child) => child.label === 'Components');
-    expect(components?.children.map((child) => child.kind)).toEqual(['file', 'file']);
-    expect(components?.children.map((child) => child.files[0]).sort()).toEqual([
-      'file:///w/src/components/A.ts',
-      'file:///w/src/components/B.ts',
+    const group = components?.children.find((child) => child.kind === 'component');
+    expect(group?.label).toBe('components');
+    expect(group?.files).toHaveLength(2);
+  });
+
+  it('labels source-root entry files as Entry', () => {
+    const tree = buildArchitectureTree([
+      facts('file:///w/scripts/build.mjs'),
+      facts('file:///w/src/App.tsx'),
+      facts('file:///w/src/main.tsx'),
+      facts('file:///w/src/widgets/Button.tsx'),
+    ]);
+    const entry = allNodes(tree).find((node) => node.label === 'Entry');
+    expect(entry?.files).toHaveLength(2);
+  });
+
+  it('disambiguates duplicate package domain labels with their dominant folder', () => {
+    const root = workspace({
+      'package.json': '{"name":"companion"}',
+      'src-tauri/Cargo.toml': '[package]\nname = "companion"\nversion = "0.1.0"\n',
+    });
+    const tree = buildArchitectureTree([
+      factsFor(root, 'src/App.tsx'),
+      factsFor(root, 'src/main.tsx'),
+      factsFor(root, 'src-tauri/src/main.rs'),
+    ]);
+    expect(tree.children.map((child) => child.label).sort()).toEqual([
+      'companion · src',
+      'companion · src-tauri',
     ]);
   });
 });
@@ -1146,122 +1163,6 @@ describe('openArchitectureFile', () => {
   });
 });
 
-describe('inferDomains', () => {
-  const files = [
-    ...routeFiles(3),
-    facts('file:///w/src/utils/format.ts'),
-    facts('file:///w/src/utils/parse.ts'),
-    facts('file:///w/src/utils/colors.ts'),
-  ];
-  const deterministic = buildArchitectureTree(files);
-  const validResponse = JSON.stringify({
-    domains: [
-      { label: 'API', description: 'HTTP layer.', folders: ['routes'], subsystems: ['Routes'] },
-      { label: 'Toolkit', description: 'Helpers.', folders: ['utils'], subsystems: ['Utils'] },
-    ],
-  });
-
-  it('replaces domains with one cached AI call', async () => {
-    const { provider, calls } = providerReturning([validResponse]);
-    const cache = new Map<string, InferredDomain[]>();
-    const tree = await inferDomains(files, deterministic, {
-      provider,
-      model: 'model',
-      cache,
-    });
-    expect(tree.children.map((child) => child.label).sort()).toEqual(['API', 'Toolkit']);
-    expect(calls()).toBe(1);
-    const second = await inferDomains(files, deterministic, {
-      provider,
-      model: 'model',
-      cache,
-    });
-    expect(second.children.map((child) => child.label).sort()).toEqual(['API', 'Toolkit']);
-    expect(calls()).toBe(1);
-  });
-
-  it('falls back to the deterministic tree when files are not assigned', async () => {
-    const { provider } = providerReturning([
-      JSON.stringify({
-        domains: [
-          { label: 'API', description: '', folders: ['nowhere'], subsystems: [] },
-        ],
-      }),
-    ]);
-    const tree = await inferDomains(files, deterministic, { provider, model: 'model' });
-    expect(tree).toBe(deterministic);
-  });
-
-  it('falls back on invalid JSON', async () => {
-    const { provider } = providerReturning(['not json at all']);
-    const tree = await inferDomains(files, deterministic, { provider, model: 'model' });
-    expect(tree).toBe(deterministic);
-  });
-
-  it('returns the deterministic tree without a provider', async () => {
-    const tree = await inferDomains(files, deterministic, {
-      provider: undefined,
-      model: 'model',
-    });
-    expect(tree).toBe(deterministic);
-  });
-
-  it('rejects malformed domains', () => {
-    expect(parseInferredDomains('{"domains":[]}')).toBeUndefined();
-    expect(parseInferredDomains('{"domains":[{"label":""}]}')).toBeUndefined();
-    expect(parseInferredDomains('{"domains":[{"label":"API","folders":[]}]}')).toBeUndefined();
-    expect(
-      parseInferredDomains('{"domains":[{"label":"Application","folders":["src"]}]}'),
-    ).toBeUndefined();
-    expect(parseInferredDomains('{"domains":[{"label":"API","folders":["src"]}]}')).toEqual([
-      { label: 'API', description: '', folders: ['src'], subsystems: [] },
-    ]);
-  });
-});
-
-describe('buildDomainSummary', () => {
-  it('reports extensions, roles, samples, and deterministic domains', () => {
-    const files = [
-      facts('file:///w/src/components/Button.tsx'),
-      facts('file:///w/src/components/Card.tsx'),
-      facts('file:///w/src/components/Modal.tsx'),
-      facts('file:///w/src/services/userService.ts'),
-      facts('file:///w/src/db/connection.ts', {
-        imports: [{ specifier: 'pg', names: ['Pool'], line: 0 }],
-      }),
-      facts('file:///w/src/db/user.ts', {
-        imports: [{ specifier: 'pg', names: ['Pool'], line: 0 }],
-      }),
-      facts('file:///w/src/db/order.ts', {
-        imports: [{ specifier: 'prisma', names: ['PrismaClient'], line: 0 }],
-      }),
-      facts('file:///w/src/ipc/bridge.ts', {
-        imports: [{ specifier: '@tauri-apps/api/core', names: ['invoke'], line: 0 }],
-      }),
-    ];
-    const tree = buildArchitectureTree(files);
-    const summary = buildDomainSummary(files, tree);
-    expect(summary).toContain('components (3 files) [ext .tsx x3] [roles components]');
-    expect(summary).toContain('[domain Frontend]');
-    expect(summary).toContain('[domain Database]');
-    expect(summary).toContain('roles db-imports');
-    expect(summary).toContain('roles services');
-    expect(summary).toContain('roles ipc');
-    expect(summary).toContain('samples: components/Button.tsx');
-    expect(summary).toContain('Deterministic domains:');
-  });
-
-  it('instructs the model to name domains by role and only rename Unclassified with evidence', () => {
-    expect(DOMAIN_INFER_SYSTEM).toContain(
-      'Frontend, Backend, Database, Workers, Infrastructure, Integrations',
-    );
-    expect(DOMAIN_INFER_SYSTEM).toContain('Keep the Unclassified label only');
-    expect(DOMAIN_INFER_SYSTEM).toContain(
-      'You may rename Unclassified only when you assign its folders to a named domain with evidence',
-    );
-  });
-});
-
 describe('computeRelations', () => {
   it('keeps imported and proven endpoint relationships separate with evidence', () => {
     const files = [
@@ -1385,8 +1286,8 @@ describe('mermaidForNode relationships', () => {
       ],
     });
     const diagram = mermaidForNode(node, relations);
-    expect(diagram).toContain('n1 -. "imports" .-> n2');
-    expect(diagram).toContain('n2 -. "invokes command" .-> n1');
+    expect(diagram).toContain('n1 -. "imports ×5" .-> n2');
+    expect(diagram).toContain('n2 -. "invokes command ×3" .-> n1');
     expect(diagram).not.toContain('missing');
     const many: ArchitectureRelation[] = Array.from({ length: 13 }, (_value, index) => ({
       fromId: 'n1',

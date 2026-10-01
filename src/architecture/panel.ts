@@ -239,7 +239,7 @@ export function mermaidForNode(
   for (const edge of edges) {
     const fromArch = idToArch.get(edge.fromId);
     const toArch = idToArch.get(edge.toId);
-    const verb = edge.label;
+    const verb = edge.weight > 1 ? `${edge.label} ×${edge.weight}` : edge.label;
     lines.push(`  ${edge.fromId} -. "${mermaidText(verb)}" .-> ${edge.toId}`);
   }
   return lines.join('\n');
@@ -531,6 +531,7 @@ export class ArchitectureSession {
       diagram: mermaidForNode(node, analysis.relations, this.facts, overrides),
       relations: analysis.relations.map((relation) => ({
         ...relation,
+        label: relation.weight > 1 ? `${relation.label} ×${relation.weight}` : relation.label,
         fromLabel: labels.get(relation.fromId) ?? relation.fromId,
         toLabel: labels.get(relation.toId) ?? relation.toId,
       })),
@@ -885,9 +886,16 @@ export class ArchitecturePanel {
     .df-overview-kind { flex: none; color: var(--vscode-descriptionForeground); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
     .df-overview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 145px), 1fr)); gap: 8px; }
     .df-overview-item { min-width: 0; min-height: 58px; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; padding: 8px 10px; border: 1px solid var(--df-border); border-radius: var(--df-radius-lg); background: var(--df-surface); color: var(--vscode-foreground); text-align: left; cursor: pointer; }
-    .df-files-only { width: 100%; max-width: 720px; margin: 0 auto; display: flex; align-items: center; gap: 8px; padding: 12px; border: 1px dashed var(--df-border); border-radius: var(--df-radius-lg); background: var(--df-surface); }
-    .df-files-only strong { font-size: 13px; }
-    .df-files-only > span:last-child { margin-left: auto; color: var(--df-muted); font-size: 12px; }
+    .df-file-grid { width: 100%; max-width: 1040px; margin: 0 auto; }
+    .df-file-grid-header { display: flex; align-items: center; gap: 10px; min-height: 48px; margin-bottom: 14px; padding: 10px 12px; border: 1px solid var(--vscode-focusBorder); border-radius: var(--df-radius-lg); background: var(--vscode-editorWidget-background); }
+    .df-file-grid-header strong { font-size: 14px; }
+    .df-file-grid-header > span:last-child { margin-left: auto; color: var(--vscode-descriptionForeground); font-size: 11px; }
+    .df-file-grid-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 180px), 1fr)); gap: 8px; }
+    .df-file-card { min-width: 0; min-height: 52px; display: flex; flex-direction: column; justify-content: center; gap: 2px; padding: 8px 10px; border: 1px solid var(--df-border); border-radius: var(--df-radius-lg); background: var(--df-surface); color: var(--vscode-foreground); text-align: left; cursor: pointer; overflow: hidden; }
+    .df-file-card:hover { border-color: var(--vscode-focusBorder); }
+    .df-file-card-name { font-size: 12px; font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .df-file-card-path { font-size: 10px; color: var(--df-muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .df-more { list-style: none; padding: 3px 0; color: var(--df-muted); font-size: 11px; }
     .df-overview-item:hover { border-color: var(--vscode-focusBorder); background: var(--vscode-list-hoverBackground); }
     .df-overview-item strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 500; }
     .df-overview-meta { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); font-size: 10px; }
