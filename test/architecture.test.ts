@@ -1307,13 +1307,13 @@ describe('mermaidForNode flow rendering', () => {
     expect(diagram).toContain('n2["service.ts (1)"]');
   });
 
-  it('draws the parent arrow only to entry children', () => {
+  it('draws a parent arrow to every child', () => {
     const diagram = mermaidForNode(node, [], files);
-    expect(diagram.match(/n0 -->/g)).toHaveLength(1);
+    expect(diagram.match(/n0 -->/g)).toHaveLength(3);
     expect(diagram).toContain('n0 --> n1');
   });
 
-  it('falls back to every child when no entry is identified', () => {
+  it('draws every child when no entry is identified', () => {
     const aFile = 'file:///w/src/db/a.ts';
     const bFile = 'file:///w/src/db/b.ts';
     const storageNode = archNode({

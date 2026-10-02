@@ -181,8 +181,7 @@ export function mermaidForNode(
     const text = mermaidText(`${child.label}${count}`);
     lines.push(`  ${id}${nodeShape(role, text)}:::${KIND_CLASS[child.kind]}`);
   }
-  const entries = concepts.filter((child) => roles.get(child.id) === 'entry');
-  for (const child of entries.length > 0 ? entries : concepts) {
+  for (const child of concepts) {
     const id = archToId.get(child.id);
     if (id) {
       lines.push(`  n0 --> ${id}`);
