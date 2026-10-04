@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
-import type { MapPaths } from './mapValidate';
+import type { MapPaths, StructuredMap } from './mapValidate';
 
 export interface StoredArchitectureMap {
-  version: 1;
+  version: 2;
   filesHash: string;
   mermaid: string;
   paths: MapPaths;
+  structured: StructuredMap;
   model: string;
   generatedAt: number;
 }
@@ -25,7 +26,7 @@ export function readStoredMap(state: {
     return undefined;
   }
   const candidate = stored as Partial<StoredArchitectureMap> & { paths?: unknown };
-  if (candidate.version !== 1) {
+  if (candidate.version !== 2) {
     return undefined;
   }
   if (
@@ -48,11 +49,21 @@ export function readStoredMap(state: {
     }
     clean[nodeId] = value;
   }
+  const structured = candidate.structured as unknown;
+  if (!structured || typeof structured !== 'object') {
+    return undefined;
+  }
+  const nodes = (structured as { nodes?: unknown }).nodes;
+  const edges = (structured as { edges?: unknown }).edges;
+  if (!Array.isArray(nodes) || !Array.isArray(edges)) {
+    return undefined;
+  }
   return {
-    version: 1,
+    version: 2,
     filesHash: candidate.filesHash,
     mermaid: candidate.mermaid,
     paths: clean,
+    structured: structured as StructuredMap,
     model: candidate.model,
     generatedAt: candidate.generatedAt,
   };

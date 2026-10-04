@@ -6,6 +6,7 @@ import type { FileFacts } from '../scan/duplication';
 import type { LLMProvider, ToolCall, ToolDef } from '../llm/types';
 import { buildMapDigest } from './mapDigest';
 import { buildMermaidMap, mapPathsOf, parseStructuredMap } from './mapValidate';
+import { buildLevelView } from './mapLevels';
 import {
   StoredArchitectureMap,
   architectureFilesHash,
@@ -27,8 +28,10 @@ export interface ArchitecturePanelDeps {
 
 interface ArchitectureMessage {
   type?: string;
+  id?: string;
   path?: string;
   svg?: string;
+  crumbs?: string[];
 }
 
 export const EMPTY_NO_MODEL = 'no-model';
@@ -42,6 +45,9 @@ export class ArchitecturePanel {
   private controller: AbortController | undefined;
   private generating = false;
   private lastRaw = '';
+  private levelPath: string[] = [];
+  private groupIndex = new Map<string, string[]>();
+  private currentStale = false;
   private disposed = false;
   private readonly projectName: string;
 
@@ -118,6 +124,23 @@ export class ArchitecturePanel {
     }
     if (message.type === 'showRaw') {
       this.post({ type: 'raw', text: this.lastRaw });
+      return;
+    }
+    if (message.type === 'drillDown' && typeof message.id === 'string') {
+      const target = this.groupIndex.get(message.id);
+      if (target && this.stored) {
+        this.levelPath = target;
+        this.postMap(this.stored, this.currentStale);
+      }
+      return;
+    }
+    if (message.type === 'up' && Array.isArray(message.crumbs)) {
+      if (this.stored) {
+        this.levelPath = message.crumbs.filter(
+          (segment): segment is string => typeof segment === 'string',
+        );
+        this.postMap(this.stored, this.currentStale);
+      }
     }
   }
 
@@ -235,10 +258,11 @@ export class ArchitecturePanel {
         return;
       }
       const map: StoredArchitectureMap = {
-        version: 1,
+        version: 2,
         filesHash: architectureFilesHash(facts.map((fact) => fact.file)),
         mermaid: buildMermaidMap(parsed),
         paths: mapPathsOf(parsed, (relative) => existsSync(path.join(this.deps.root, relative))),
+        structured: parsed,
         model: active.model,
         generatedAt: Date.now(),
       };
@@ -249,6 +273,7 @@ export class ArchitecturePanel {
       if (this.disposed) {
         return;
       }
+      this.levelPath = [];
       this.postMap(map, false);
     } finally {
       this.generating = false;
@@ -271,10 +296,15 @@ export class ArchitecturePanel {
   }
 
   private postMap(map: StoredArchitectureMap, stale: boolean): void {
+    this.currentStale = stale;
+    const view = buildLevelView(map.structured, this.levelPath, map.paths);
+    this.groupIndex = new Map(Object.entries(view.groups));
     this.post({
       type: 'map',
-      mermaid: map.mermaid,
-      paths: map.paths,
+      mermaid: view.mermaid,
+      paths: view.paths,
+      groups: view.groups,
+      breadcrumbs: view.breadcrumbs,
       stale,
       generatedAt: map.generatedAt,
       model: map.model,
@@ -399,7 +429,7 @@ export class ArchitecturePanel {
       border-bottom: 1px solid var(--vscode-panel-border);
       background: var(--vscode-editorWidget-background);
     }
-    #df-refresh, #df-export {
+    #df-refresh, #df-export, #df-zoom-in, #df-zoom-out, #df-zoom-fit {
       display: inline-flex;
       align-items: center;
       gap: 4px;
@@ -412,8 +442,11 @@ export class ArchitecturePanel {
       font-size: 12px;
     }
     #df-refresh:disabled, #df-export:disabled { opacity: 0.4; cursor: default; }
-    #df-refresh:hover:not(:disabled), #df-export:hover:not(:disabled) { background: var(--df-hover); }
+    #df-refresh:hover:not(:disabled), #df-export:hover:not(:disabled), #df-zoom-in:hover, #df-zoom-out:hover, #df-zoom-fit:hover { background: var(--df-hover); }
     #df-refresh .codicon, #df-export .codicon { font-size: 12px; }
+    #df-map-crumbs { display: flex; align-items: center; gap: 2px; font-size: 12px; color: var(--vscode-descriptionForeground); }
+    #df-map-crumbs button { background: none; border: none; color: var(--vscode-textLink-foreground); cursor: pointer; padding: 0 2px; font-size: 12px; }
+    #df-map-crumbs button[disabled] { color: var(--vscode-foreground); cursor: default; }
     #df-hint {
       min-width: 0;
       overflow: hidden;
@@ -438,9 +471,9 @@ export class ArchitecturePanel {
     #df-banner[hidden] { display: none; }
     .df-error { color: var(--vscode-errorForeground); }
     #df-main { flex: 1; display: flex; min-height: 0; }
-    #df-diagram-wrap { flex: 1; min-width: 0; overflow: auto; padding: 24px; }
-    #df-diagram { min-width: 100%; display: flex; justify-content: center; align-items: flex-start; }
-    #df-diagram svg { max-width: none; height: auto; }
+    #df-diagram-wrap { flex: 1; min-width: 0; overflow: hidden; padding: 24px; }
+    #df-diagram { min-width: 100%; min-height: 100%; display: block; overflow: hidden; cursor: grab; }
+    #df-diagram svg { display: block; max-width: none; height: auto; transform-origin: 0 0; }
     .df-state {
       margin: 48px auto;
       max-width: 480px;
@@ -496,8 +529,12 @@ export class ArchitecturePanel {
 </head>
 <body>
   <header>
+    <nav id="df-map-crumbs" aria-label="Architecture levels"></nav>
     <span id="df-hint" role="status"></span>
     <span id="df-status"></span>
+    <button id="df-zoom-out" type="button" title="Zoom out">&#8722;</button>
+    <button id="df-zoom-in" type="button" title="Zoom in">+</button>
+    <button id="df-zoom-fit" type="button" title="Fit to view">Fit</button>
     <button id="df-refresh" type="button" title="Reload architecture">
       <span id="df-refresh-icon" class="codicon codicon-refresh" aria-hidden="true"></span>
     </button>

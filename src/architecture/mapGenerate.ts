@@ -31,7 +31,7 @@ Then respond with a single JSON object only (no prose, no code fences, no markdo
 {"nodes":[{"id":"ui","label":"Components","group":"Frontend","path":"src/components"}],"edges":[{"from":"ui","to":"api","label":"calls"}]}
 
 Rules:
-- Build the hierarchy with groups for the main areas (Frontend, Backend, Services, Database, External Services...). A group name is 1-3 words.
+- Build the hierarchy with groups for the main areas (Frontend, Backend, Services, Database, External Services...). A group name is 1-3 words. Groups may nest with "/" (for example "Backend/Services") when it makes the architecture clearer.
 - One root node named after the project, connected to the main areas.
 - Real components of THIS codebase as nodes; label every node yourself, 1-3 words; labels only, no descriptions.
 - Edge labels describe behavior: reads, writes, calls, sends, emits, queries, returns. Show data movement between UI, backend, database, external APIs.

@@ -4,6 +4,8 @@ interface MapMessage {
   type: 'map';
   mermaid: string;
   paths: Record<string, string>;
+  groups?: Record<string, string[]>;
+  breadcrumbs?: Array<{ label: string; path: string[] }>;
   stale: boolean;
   generatedAt: number;
   model: string;
@@ -45,6 +47,11 @@ const diagram = document.getElementById('df-diagram');
 let paths: Record<string, string> = {};
 let hasMap = false;
 let lastError: ErrorMessage | undefined;
+let groups: Record<string, string[]> = {};
+let crumbs: Array<{ label: string; path: string[] }> = [];
+let viewScale = 1;
+let viewX = 0;
+let viewY = 0;
 let lastMermaid = '';
 let projectName = 'this project';
 let progressLines: string[] = [];
@@ -156,6 +163,12 @@ function wireNodes(): void {
   }
   diagram.querySelectorAll<SVGGElement>('g.node').forEach((element) => {
     const id = nodeIdFor(element);
+    const group = id ? groups[id] : undefined;
+    if (group) {
+      element.classList.add('df-clickable');
+      element.addEventListener('click', () => post({ type: 'drillDown', id }));
+      return;
+    }
     const target = id ? paths[id] : undefined;
     if (!target) {
       return;
@@ -165,9 +178,69 @@ function wireNodes(): void {
   });
 }
 
+function renderCrumbs(): void {
+  const nav = document.getElementById('df-map-crumbs');
+  if (!nav) {
+    return;
+  }
+  nav.innerHTML = crumbs
+    .map((crumb, index) => {
+      const last = index === crumbs.length - 1;
+      return `<button type="button" data-index="${index}"${last ? ' disabled' : ''}>${escapeHtml(crumb.label)}</button>`;
+    })
+    .join('<span>/</span>');
+}
+
+function applyTransform(): void {
+  const svg = diagram?.querySelector('svg') as SVGSVGElement | null;
+  if (svg) {
+    svg.style.transformOrigin = '0 0';
+    svg.style.transform = `translate(${viewX}px, ${viewY}px) scale(${viewScale})`;
+  }
+}
+
+function fitDiagram(): void {
+  if (!diagram) {
+    return;
+  }
+  const svg = diagram.querySelector('svg') as SVGSVGElement | null;
+  if (!svg) {
+    return;
+  }
+  const base = svg.getBoundingClientRect();
+  const container = diagram.getBoundingClientRect();
+  const baseWidth = base.width / viewScale;
+  const baseHeight = base.height / viewScale;
+  if (baseWidth <= 0 || baseHeight <= 0 || container.width <= 0) {
+    return;
+  }
+  viewScale = Math.max(0.1, Math.min(container.width / baseWidth, container.height / baseHeight, 1.25));
+  viewX = Math.max(0, (container.width - baseWidth * viewScale) / 2);
+  viewY = Math.max(0, (container.height - baseHeight * viewScale) / 2);
+  applyTransform();
+}
+
+function zoomBy(factor: number, clientX?: number, clientY?: number): void {
+  if (!diagram) {
+    return;
+  }
+  const container = diagram.getBoundingClientRect();
+  const centerX = (clientX ?? container.left + container.width / 2) - container.left;
+  const centerY = (clientY ?? container.top + container.height / 2) - container.top;
+  const next = Math.min(Math.max(viewScale * factor, 0.1), 4);
+  const ratio = next / viewScale;
+  viewX = centerX - (centerX - viewX) * ratio;
+  viewY = centerY - (centerY - viewY) * ratio;
+  viewScale = next;
+  applyTransform();
+}
+
 async function renderMap(message: MapMessage): Promise<void> {
   paths = message.paths ?? {};
+  groups = message.groups ?? {};
+  crumbs = message.breadcrumbs ?? [];
   hasMap = true;
+  renderCrumbs();
   progressLines = [];
   hideBanner();
   setRefreshing(false);
@@ -191,6 +264,11 @@ async function renderMap(message: MapMessage): Promise<void> {
     }
     diagram.innerHTML = svg;
     wireNodes();
+    viewScale = 1;
+    viewX = 0;
+    viewY = 0;
+    applyTransform();
+    requestAnimationFrame(() => fitDiagram());
     clearRenderingStatus();
   } catch {
     if (token !== renderToken || !diagram) {
@@ -337,5 +415,55 @@ if (exportButton) {
     post({ type: 'exportDiagram', svg: markup });
   });
 }
+
+document.getElementById('df-zoom-in')?.addEventListener('click', () => zoomBy(1.2));
+document.getElementById('df-zoom-out')?.addEventListener('click', () => zoomBy(1 / 1.2));
+document.getElementById('df-zoom-fit')?.addEventListener('click', () => fitDiagram());
+
+document.getElementById('df-map-crumbs')?.addEventListener('click', (event) => {
+  const button = (event.target as HTMLElement | null)?.closest('button');
+  if (!button) {
+    return;
+  }
+  const index = Number(button.getAttribute('data-index'));
+  const crumb = crumbs[index];
+  if (crumb) {
+    post({ type: 'up', crumbs: crumb.path });
+  }
+});
+
+diagram?.addEventListener(
+  'wheel',
+  (event) => {
+    event.preventDefault();
+    zoomBy(event.deltaY < 0 ? 1.1 : 0.9, event.clientX, event.clientY);
+  },
+  { passive: false },
+);
+
+let dragging = false;
+let dragX = 0;
+let dragY = 0;
+diagram?.addEventListener('pointerdown', (event) => {
+  if ((event.target as HTMLElement | null)?.closest('g.node')) {
+    return;
+  }
+  dragging = true;
+  dragX = event.clientX;
+  dragY = event.clientY;
+});
+window.addEventListener('pointermove', (event) => {
+  if (!dragging) {
+    return;
+  }
+  viewX += event.clientX - dragX;
+  viewY += event.clientY - dragY;
+  dragX = event.clientX;
+  dragY = event.clientY;
+  applyTransform();
+});
+window.addEventListener('pointerup', () => {
+  dragging = false;
+});
 
 post({ type: 'ready' });
