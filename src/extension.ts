@@ -69,6 +69,24 @@ export function activate(context: vscode.ExtensionContext): void {
   provider = new ChatViewProvider(context.extensionUri, session);
   const attention = new AttentionService(context);
 
+  let architectureAvailable: boolean | undefined;
+  const syncArchitectureAvailability = (connected: boolean): void => {
+    if (connected === architectureAvailable) {
+      return;
+    }
+    architectureAvailable = connected;
+    void vscode.commands.executeCommand(
+      'setContext',
+      'devFirst.architectureAvailable',
+      connected,
+    );
+  };
+  session.setConnectionListener(syncArchitectureAvailability);
+  syncArchitectureAvailability(false);
+  void activeProvider(context)
+    .then((active) => syncArchitectureAvailability(Boolean(active)))
+    .catch(() => syncArchitectureAvailability(false));
+
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, provider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -560,14 +578,20 @@ export function activate(context: vscode.ExtensionContext): void {
       void scanRunner.scanWholeFile(editor.document);
     }),
     vscode.commands.registerCommand('devFirst.openArchitecture', async () => {
+      const executeTool = session.readOnlyToolExecutor();
       await ArchitecturePanel.show({
         extensionUri: context.extensionUri,
+        root: workspaceRoot() ?? '',
+        state: context.globalState,
         getFacts: () => scanRunner.getArchitectureFacts(),
-        onDidUpdateFacts: (listener) => scanRunner.onDidUpdateFacts(listener),
+        getActive: () => activeProvider(context),
+        getTools: () => session.plannerToolDefs(),
+        executeTool:
+          executeTool ?? (() => Promise.resolve('Error: read-only tools are unavailable.')),
       });
     }),
     vscode.commands.registerCommand('devFirst.refreshArchitecture', () => {
-      void ArchitecturePanel.current?.refresh();
+      ArchitecturePanel.current?.reload();
     }),
   );
 }

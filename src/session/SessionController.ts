@@ -242,6 +242,7 @@ export class SessionController {
   private phaseListener?: (phase: Phase) => void;
   private errorListener?: (message: string) => void;
   private needsInputListener?: (message: string) => void;
+  private connectionListener?: (connected: boolean) => void;
   private knowledgeSource?: { refreshKnowledge(): Promise<void> };
 
   private queuedMessages: Array<{
@@ -526,7 +527,7 @@ export class SessionController {
     const config = getConfig();
     const preset = findPreset(config.preset) ?? PRESETS[0];
     const needsKey = preset.requiresKey && !this.keyPresent;
-    return {
+    const connection: ConnectionState = {
       preset: preset.id,
       provider: preset.provider,
       model: config.model,
@@ -534,6 +535,8 @@ export class SessionController {
       needsKey,
       error: this.connectionError,
     };
+    this.connectionListener?.(connection.connected);
+    return connection;
   }
 
   private buildConnections(): ProviderConnection[] {
@@ -1563,6 +1566,15 @@ export class SessionController {
     await this.refreshConnection();
   }
 
+  async plannerToolDefs(): Promise<ToolDef[]> {
+    const registry = await this.buildToolRegistry();
+    return registry.planner;
+  }
+
+  readOnlyToolExecutor(): ((call: ToolCall) => Promise<string>) | undefined {
+    return (call) => this.executePlannerTool(call);
+  }
+
   private async handleSend(
     rawText: string,
     selection?: SelectionContext,
@@ -2458,6 +2470,10 @@ export class SessionController {
 
   setNeedsInputListener(listener: (message: string) => void): void {
     this.needsInputListener = listener;
+  }
+
+  setConnectionListener(listener: (connected: boolean) => void): void {
+    this.connectionListener = listener;
   }
 
   setKnowledgeSource(source: { refreshKnowledge(): Promise<void> }): void {

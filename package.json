@@ -202,7 +202,7 @@
         },
         {
           "command": "devFirst.openArchitecture",
-          "when": "view == devFirst.chatView && config.devFirst.architecture",
+          "when": "view == devFirst.chatView && config.devFirst.architecture && devFirst.architectureAvailable",
           "group": "navigation"
         },
         {

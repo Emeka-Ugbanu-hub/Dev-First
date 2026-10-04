@@ -1,81 +1,59 @@
 import mermaid from 'mermaid';
-import {
-  activationFor,
-  conceptChildren,
-  fileChildren,
-  shouldRenderDiagram,
-} from './architectureView';
-import type { ArchitectureChild } from './architectureView';
 
-type ChildView = ArchitectureChild;
-
-interface DetailView {
-  id: string;
-  kind: string;
-  label: string;
-  description: string;
-  usedBy: string[];
-  dependsOn: string[];
-  implementedBy: number;
-  files: string[];
-}
-
-interface LevelMessage {
-  type: 'level';
-  node: DetailView;
-  children: ChildView[];
-  breadcrumbs: Array<{ id: string; label: string; kind: string }>;
-  diagram: string;
-  summary?: string;
+interface MapMessage {
+  type: 'map';
+  mermaid: string;
+  paths: Record<string, string>;
+  stale: boolean;
+  generatedAt: number;
+  model: string;
 }
 
 interface EmptyMessage {
   type: 'empty';
+  reason: string;
+  project?: string;
+}
+
+interface GeneratingMessage {
+  type: 'generating';
+  progress: string;
+  hasMap?: boolean;
+  project?: string;
+}
+
+interface ErrorMessage {
+  type: 'error';
   message: string;
+  hasMap: boolean;
 }
 
-interface RefreshingMessage {
-  type: 'refreshing';
-}
-
-interface RefreshedMessage {
-  type: 'refreshed';
-  text?: string;
-}
-
-interface HintMessage {
-  type: 'hint';
-  text: string;
-}
-
-type IncomingMessage =
-  | LevelMessage
-  | EmptyMessage
-  | RefreshingMessage
-  | RefreshedMessage
-  | HintMessage;
+type IncomingMessage = MapMessage | EmptyMessage | GeneratingMessage | ErrorMessage;
 
 declare function acquireVsCodeApi(): { postMessage(message: unknown): void };
 
 const vscode = acquireVsCodeApi();
 
-const backButton = document.getElementById('df-back') as HTMLButtonElement | null;
 const refreshButton = document.getElementById('df-refresh') as HTMLButtonElement | null;
 const exportButton = document.getElementById('df-export') as HTMLButtonElement | null;
-const searchInput = document.getElementById('df-search') as HTMLInputElement | null;
-const summaryBox = document.getElementById('df-summary') as HTMLElement | null;
 const refreshIcon = document.getElementById('df-refresh-icon');
-const crumbs = document.getElementById('df-crumbs');
 const hint = document.getElementById('df-hint');
+const status = document.getElementById('df-status');
+const banner = document.getElementById('df-banner');
 const diagram = document.getElementById('df-diagram');
 
-const status = document.getElementById('df-status');
-
-let childIndex = new Map<string, ChildView>();
-let breadcrumbTrail: Array<{ id: string; label: string }> = [];
+let paths: Record<string, string> = {};
+let hasMap = false;
+let lastMermaid = '';
+let projectName = 'this project';
+let progressLines: string[] = [];
 let renderToken = 0;
 let lastDark: boolean | undefined;
 let statusTimer: number | undefined;
+
+function post(message: unknown): void {
+  vscode.postMessage(message);
+}
 
 function setStatus(text: string, clearAfterMs?: number): void {
   if (!status) {
@@ -103,9 +81,6 @@ function clearRenderingStatus(): void {
 }
 
 function setRefreshing(active: boolean): void {
-  if (active) {
-    setStatus('Refreshing…');
-  }
   refreshIcon?.classList.toggle('codicon-modifier-spin', active);
   if (refreshButton) {
     refreshButton.disabled = active;
@@ -127,14 +102,20 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
-function shortName(path: string): string {
-  const clean = path.replace(/^file:\/\//, '');
-  const parts = clean.split('/');
-  return decodeURIComponent(parts[parts.length - 1] || clean);
+function hideBanner(): void {
+  if (!banner) {
+    return;
+  }
+  banner.hidden = true;
+  banner.innerHTML = '';
 }
 
-function post(message: unknown): void {
-  vscode.postMessage(message);
+function showBanner(message: string): void {
+  if (!banner) {
+    return;
+  }
+  banner.innerHTML = `<span class="df-error">${escapeHtml(message)}</span><button id="df-retry" class="df-action" type="button">Retry</button>`;
+  banner.hidden = false;
 }
 
 function ensureInit(): void {
@@ -161,152 +142,49 @@ function ensureInit(): void {
   });
 }
 
-function activate(child: ChildView): void {
-  post(activationFor(child));
+function nodeIdFor(element: SVGGElement): string | undefined {
+  const raw = element.id || element.getAttribute('data-id') || '';
+  const match = /flowchart-(.+?)-\d+$/.exec(raw);
+  const candidate = match?.[1] ?? raw.replace(/^flowchart-/, '');
+  return candidate || undefined;
 }
 
 function wireNodes(): void {
   if (!diagram) {
     return;
   }
-  const nodes = diagram.querySelectorAll<SVGGElement>('g.node');
-  nodes.forEach((element) => {
-    const match = /n(\d+)-\d+$/.exec(element.id);
-    const key = match ? `n${match[1]}` : element.getAttribute('data-id')?.split('-')[0];
-    const child = key ? childIndex.get(key) : undefined;
-    if (!child) {
+  diagram.querySelectorAll<SVGGElement>('g.node').forEach((element) => {
+    const id = nodeIdFor(element);
+    const target = id ? paths[id] : undefined;
+    if (!target) {
       return;
     }
     element.classList.add('df-clickable');
-    element.addEventListener('click', () => activate(child));
+    element.addEventListener('click', () => post({ type: 'openPath', path: target }));
   });
 }
 
-function renderOverview(node: DetailView, children: ChildView[]): void {
-  if (!diagram) return;
-  diagram.innerHTML = `
-    <div class="df-overview">
-      <div class="df-overview-root">
-        <span class="df-overview-kind">${escapeHtml(node.kind)}</span>
-        <strong>${escapeHtml(node.label)}</strong>
-        <span>${children.length} direct items</span>
-      </div>
-      <div class="df-overview-grid" aria-label="Architecture map items">
-        ${children.map((child, index) => {
-          const name = child.kind === 'file' && child.file ? shortName(child.file) : child.label;
-          const meta = child.kind === 'file' ? child.file ?? '' : `${child.fileCount} files`;
-          return `<button type="button" class="df-overview-item ${escapeHtml(child.kind)}" data-node-key="n${index + 1}" title="${escapeHtml(meta)}">
-            <span class="df-overview-kind">${escapeHtml(child.kind)}</span>
-            <strong>${escapeHtml(name)}</strong>
-            ${meta ? `<span class="df-overview-meta">${escapeHtml(meta)}</span>` : ''}
-          </button>`;
-        }).join('')}
-      </div>
-    </div>`;
-  diagram.querySelectorAll<HTMLButtonElement>('[data-node-key]').forEach((button) => {
-    const child = childIndex.get(button.dataset.nodeKey ?? '');
-    if (child) button.addEventListener('click', () => activate(child));
-  });
-}
-
-function renderBreadcrumbs(): void {
-  if (!crumbs) {
-    return;
-  }
-  crumbs.innerHTML = '';
-  breadcrumbTrail.forEach((crumb, index) => {
-    if (index > 0) {
-      const separator = document.createElement('span');
-      separator.className = 'df-crumb-sep';
-      separator.textContent = '/';
-      crumbs.appendChild(separator);
-    }
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = index === breadcrumbTrail.length - 1 ? 'df-crumb current' : 'df-crumb';
-    button.textContent = crumb.label;
-    if (index < breadcrumbTrail.length - 1) {
-      button.addEventListener('click', () => post({ type: 'navigate', id: crumb.id }));
-    }
-    crumbs.appendChild(button);
-  });
-  if (backButton) {
-    backButton.disabled = breadcrumbTrail.length < 2;
-  }
-}
-
-
-function displayFolder(path: string): string {
-  const clean = path.replace(/^file:\/\//, '');
-  const parts = clean.split('/').filter(Boolean);
-  parts.pop();
-  return decodeURIComponent(parts.slice(-2).join('/'));
-}
-
-function renderFileLevel(node: DetailView, files: ChildView[]): void {
+async function renderMap(message: MapMessage): Promise<void> {
+  paths = message.paths ?? {};
+  hasMap = true;
+  progressLines = [];
+  hideBanner();
+  setRefreshing(false);
+  setHint(message.stale ? 'code changed — reload to update' : '');
   if (!diagram) {
     return;
   }
-  const cards = files
-    .map((child) => {
-      const path = child.file ?? '';
-      const name = path ? shortName(path) : child.label;
-      const folder = path ? displayFolder(path) : '';
-      return `<button type="button" class="df-file-card" data-path="${escapeHtml(path)}" title="${escapeHtml(path)}">
-        <span class="df-file-card-name">${escapeHtml(name)}</span>
-        ${folder ? `<span class="df-file-card-path">${escapeHtml(folder)}</span>` : ''}
-      </button>`;
-    })
-    .join('');
-  diagram.innerHTML = `
-    <div class="df-file-grid">
-      <div class="df-file-grid-header">
-        <span class="df-overview-kind">${escapeHtml(node.kind)}</span>
-        <strong>${escapeHtml(node.label)}</strong>
-        <span>${files.length === 1 ? '1 file' : `${files.length} files`}</span>
-      </div>
-      <div class="df-file-grid-cards">${cards}</div>
-    </div>`;
-  diagram.querySelectorAll<HTMLButtonElement>('button.df-file-card').forEach((button) => {
-    button.addEventListener('click', () =>
-      post({ type: 'openFile', path: button.dataset.path ?? '', line: 0 }),
-    );
-  });
-}
-
-async function render(message: LevelMessage): Promise<void> {
+  if (message.mermaid === lastMermaid) {
+    setStatus('');
+    return;
+  }
+  lastMermaid = message.mermaid;
   const token = ++renderToken;
-  setHint('');
-  breadcrumbTrail = message.breadcrumbs;
-  renderBreadcrumbs();
-  if (summaryBox) {
-    if (message.summary) {
-      summaryBox.textContent = message.summary;
-      summaryBox.hidden = false;
-    } else {
-      summaryBox.hidden = true;
-      summaryBox.textContent = '';
-    }
-  }
-  const concepts = conceptChildren(message.children);
-  const files = fileChildren(message.children);
-  const filesOnly = !shouldRenderDiagram(message.children);
-  childIndex = new Map(concepts.map((child, index) => [`n${index + 1}`, child]));
-  if (filesOnly) {
-    renderFileLevel(message.node, files);
-    clearRenderingStatus();
-    return;
-  }
-  if (concepts.length > 12) {
-    renderOverview(message.node, concepts);
-    clearRenderingStatus();
-    return;
-  }
   setStatus('Rendering…');
   ensureInit();
   try {
     const id = `df-architecture-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const { svg } = await mermaid.render(id, message.diagram);
+    const { svg } = await mermaid.render(id, message.mermaid);
     if (token !== renderToken || !diagram) {
       return;
     }
@@ -317,17 +195,72 @@ async function render(message: LevelMessage): Promise<void> {
     if (token !== renderToken || !diagram) {
       return;
     }
-    diagram.innerHTML = `<pre class="df-fallback">${escapeHtml(message.diagram)}</pre>`;
+    diagram.innerHTML = `<pre class="df-fallback">${escapeHtml(message.mermaid)}</pre>`;
     setStatus('Diagram unavailable');
   }
 }
 
 function renderEmpty(message: EmptyMessage): void {
+  projectName = message.project ?? projectName;
+  paths = {};
+  hasMap = false;
+  lastMermaid = '';
+  progressLines = [];
+  renderToken++;
+  hideBanner();
+  setRefreshing(false);
   setHint('');
-  if (diagram) {
-    diagram.innerHTML = `<p id="df-empty">${escapeHtml(message.message)}</p>`;
+  setStatus('');
+  if (!diagram) {
+    return;
+  }
+  const note =
+    message.reason === 'no-model'
+      ? '<p class="df-state-note">Connect a model to draw the architecture</p>'
+      : message.reason === 'no-facts'
+        ? '<p class="df-state-note">Nothing indexed yet. Open or scan a source file, then try again.</p><button id="df-generate" class="df-action" type="button">Generate</button>'
+        : '<button id="df-generate" class="df-action" type="button">Generate</button>';
+  diagram.innerHTML = `<div class="df-state"><h2>${escapeHtml(projectName)}</h2><p>Draw this codebase</p>${note}</div>`;
+}
+
+function renderGenerating(message: GeneratingMessage): void {
+  projectName = message.project ?? projectName;
+  hideBanner();
+  setRefreshing(true);
+  const line = message.progress.trim();
+  if (line && progressLines[progressLines.length - 1] !== line) {
+    progressLines.push(line);
+    if (progressLines.length > 6) {
+      progressLines.shift();
+    }
+  }
+  if (message.hasMap && hasMap && diagram?.querySelector('svg')) {
+    setStatus(line);
+    return;
+  }
+  if (!diagram) {
+    return;
   }
   setStatus('');
+  diagram.innerHTML = `<div class="df-state"><h2>${escapeHtml(projectName)}</h2><p class="df-state-note">Building the architecture map…</p><ul class="df-progress">${progressLines
+    .map((entry) => `<li>${escapeHtml(entry)}</li>`)
+    .join('')}</ul></div>`;
+}
+
+function renderError(message: ErrorMessage): void {
+  setRefreshing(false);
+  if (message.hasMap && hasMap && diagram?.querySelector('svg')) {
+    setStatus('');
+    showBanner(message.message);
+    return;
+  }
+  hasMap = false;
+  setHint('');
+  setStatus('');
+  if (!diagram) {
+    return;
+  }
+  diagram.innerHTML = `<div class="df-state"><h2>${escapeHtml(projectName)}</h2><p class="df-error">${escapeHtml(message.message)}</p><button id="df-retry" class="df-action" type="button">Retry</button></div>`;
 }
 
 window.addEventListener('message', (event: MessageEvent) => {
@@ -335,48 +268,43 @@ window.addEventListener('message', (event: MessageEvent) => {
   if (!message || typeof message !== 'object') {
     return;
   }
-  if (message.type === 'level') {
-    void render(message);
+  if (message.type === 'map') {
+    void renderMap(message);
     return;
   }
   if (message.type === 'empty') {
     renderEmpty(message);
     return;
   }
-  if (message.type === 'refreshing') {
-    setRefreshing(true);
+  if (message.type === 'generating') {
+    renderGenerating(message);
     return;
   }
-  if (message.type === 'refreshed') {
-    setRefreshing(false);
-    setStatus(message.text ?? 'Updated just now', 3000);
-    return;
-  }
-  if (message.type === 'hint') {
-    setHint(message.text);
+  if (message.type === 'error') {
+    renderError(message);
   }
 });
 
-if (backButton) {
-  backButton.addEventListener('click', () => {
-    if (breadcrumbTrail.length > 1) {
-      post({ type: 'navigate', id: breadcrumbTrail[breadcrumbTrail.length - 2].id });
-    }
-  });
-}
+diagram?.addEventListener('click', (event) => {
+  const target = event.target as HTMLElement | null;
+  if (target?.closest('#df-generate, #df-retry')) {
+    post({ type: 'generate' });
+  }
+});
+
+banner?.addEventListener('click', (event) => {
+  const target = event.target as HTMLElement | null;
+  if (target?.closest('#df-retry')) {
+    hideBanner();
+    post({ type: 'reload' });
+  }
+});
 
 if (refreshButton) {
   refreshButton.addEventListener('click', () => {
+    hideBanner();
     setRefreshing(true);
-    post({ type: 'refresh' });
-  });
-}
-
-if (searchInput) {
-  searchInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && searchInput.value.trim()) {
-      post({ type: 'search', query: searchInput.value.trim() });
-    }
+    post({ type: 'reload' });
   });
 }
 
@@ -384,7 +312,7 @@ if (exportButton) {
   exportButton.addEventListener('click', () => {
     const svg = diagram?.querySelector('svg');
     if (!svg) {
-      setStatus('Nothing to export');
+      setStatus('Nothing to export', 3000);
       return;
     }
     const markup = new XMLSerializer().serializeToString(svg);

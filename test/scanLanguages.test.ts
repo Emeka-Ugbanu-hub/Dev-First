@@ -15,9 +15,6 @@ import {
   LANGUAGE_BY_EXTENSION,
   extractFileFacts,
 } from '../src/scan/duplication';
-import type { FileFacts } from '../src/scan/duplication';
-import { classifyFileDomain } from '../src/architecture/model';
-import { analyzeArchitectureRelations, computeRelations } from '../src/architecture/relations';
 
 const service = new TreeSitterService({ extensionUri: { fsPath: path.join(__dirname, '..') } });
 
@@ -43,29 +40,6 @@ const PROFILE_SAMPLES: Record<string, string> = {
   bash: 'check() {\n  if [ "$1" ]; then\n    while true; do break; done\n  fi\n}\n',
   powershell: 'function Check { if ($value) { foreach ($i in $list) { Write-Host $i } } }',
 };
-
-function facts(file: string, overrides: Partial<FileFacts> = {}): FileFacts {
-  return {
-    file,
-    imports: [],
-    exports: [],
-    handlers: [],
-    constants: [],
-    moduleCaches: [],
-    listeners: [],
-    storageKeys: [],
-    functions: [],
-    types: [],
-    httpClients: [],
-    httpCalls: [],
-    scopedHttpClients: [],
-    mutableState: [],
-    stateWrites: [],
-    sql: [],
-    secrets: [],
-    ...overrides,
-  };
-}
 
 async function extract(source: string, languageId: string) {
   const tree = await service.parse(source, languageId);
@@ -246,121 +220,6 @@ describe('multi-language fact extraction', () => {
     const result = await extract(source, 'powershell');
     expect(result.imports.map((record) => record.specifier)).toContain('ActiveDirectory');
     expect(result.functions.map((fn) => fn.name)).toContain('Get-Thing');
-  });
-});
-
-describe('language-aware domains', () => {
-  it('assigns server languages to Backend and leaves other unmatched languages unclassified', () => {
-    expect(classifyFileDomain(facts('file:///w/src/main.rs'))).toBe('backend');
-    expect(classifyFileDomain(facts('file:///w/src/Program.cs'))).toBe('backend');
-    expect(classifyFileDomain(facts('file:///w/src/engine.cpp'))).toBe('unclassified');
-    expect(classifyFileDomain(facts('file:///w/src/app.rb'))).toBe('unclassified');
-    expect(classifyFileDomain(facts('file:///w/src-tauri/crates/core/src/lib.rs'))).toBe(
-      'backend',
-    );
-    expect(classifyFileDomain(facts('file:///w/scripts/deploy.sh'))).toBe('infrastructure');
-    expect(classifyFileDomain(facts('file:///w/scripts/setup.ps1'))).toBe('infrastructure');
-    expect(classifyFileDomain(facts('file:///w/src/styles/app.css'))).toBe('frontend');
-    expect(classifyFileDomain(facts('file:///w/config/app.ini'))).toBe('configuration');
-  });
-});
-
-describe('Rust modules and Tauri command evidence', () => {
-  it('links frontend invocation only to a registered Rust command and records source evidence', async () => {
-    const frontendSource = [
-      "import { invoke } from '@tauri-apps/api/core';",
-      'export async function greet() {',
-      "  return invoke<string>('greet', { name: 'x' });",
-      '}',
-      '',
-    ].join('\n');
-    const rustSource = [
-      '#[tauri::command]',
-      'pub fn greet(name: String) -> String { name }',
-      '',
-    ].join('\n');
-    const registrationSource = [
-      'mod commands;',
-      'tauri::generate_handler![commands::greet];',
-      '',
-    ].join('\n');
-    const frontend: FileFacts = {
-      file: 'file:///w/src/components/GreetButton.tsx',
-      ...(await extract(frontendSource, 'typescript')),
-    };
-    const backend: FileFacts = {
-      file: 'file:///w/src-tauri/src/commands.rs',
-      ...(await extract(rustSource, 'rust')),
-    };
-    const registration: FileFacts = {
-      file: 'file:///w/src-tauri/src/lib.rs',
-      ...(await extract(registrationSource, 'rust')),
-    };
-    expect(frontend.httpCalls).toContainEqual(
-      expect.objectContaining({ method: 'IPC', path: 'greet' }),
-    );
-    expect(backend.handlers).toContainEqual(
-      expect.objectContaining({ name: 'greet', method: 'IPC' }),
-    );
-    const nodeMap = new Map([
-      [frontend.file, 'frontend:greet'],
-      [backend.file, 'backend:greet'],
-      [registration.file, 'backend:greet'],
-    ]);
-    expect(registration.rustModules).toContainEqual({ name: 'commands', line: 0 });
-    expect(registration.tauriCommandRegistrations).toContainEqual({ name: 'greet', line: 1 });
-    const relations = computeRelations([frontend, backend, registration], nodeMap);
-    const ipc = relations.find(
-      (relation) => relation.fromId === 'frontend:greet' && relation.toId === 'backend:greet',
-    );
-    expect(ipc?.label).toBe('calls');
-    expect(ipc?.evidence.find((entry) => entry.role === 'use site')).toMatchObject({
-      fromFile: frontend.file,
-      toFile: backend.file,
-      line: 2,
-      kind: 'tauri-command',
-      role: 'use site',
-      symbol: 'greet',
-    });
-    expect(new Set(ipc?.evidence.map((entry) => entry.role))).toEqual(new Set(['use site', 'registration', 'handler']));
-  });
-
-  it('does not turn Rust imports or module declarations into relationships', async () => {
-    const lib: FileFacts = {
-      file: 'file:///w/src/lib.rs',
-      ...(await extract('mod db; use crate::db::read;', 'rust')),
-    };
-    const db: FileFacts = { file: 'file:///w/src/db.rs', ...(await extract('pub fn read() {}', 'rust')) };
-    const external: FileFacts = { file: 'file:///w/src/not_db.rs', ...(await extract('pub fn x() {}', 'rust')) };
-    expect(lib.rustModules).toContainEqual({ name: 'db', line: 0 });
-    expect(lib.imports.some((entry) => entry.specifier.includes('crate::db'))).toBe(true);
-    const nodeMap = new Map([[lib.file, 'lib'], [db.file, 'db'], [external.file, 'external']]);
-    expect(computeRelations([lib, db, external], nodeMap)).toEqual([]);
-  });
-
-  it('does not turn Rust super imports into relationships', async () => {
-    const root: FileFacts = { file: 'file:///w/src/lib.rs', ...(await extract('mod github;', 'rust')) };
-    const github: FileFacts = { file: 'file:///w/src/github.rs', ...(await extract('use super::*;', 'rust')) };
-    expect(github.imports.some((entry) => entry.specifier.startsWith('super'))).toBe(true);
-    expect(
-      computeRelations([root, github], new Map([[root.file, 'root'], [github.file, 'github']])),
-    ).toEqual([]);
-  });
-
-  it('does not connect a Tauri handler until a crate registration is indexed', async () => {
-    const frontend: FileFacts = {
-      file: 'file:///w/src/caller.ts',
-      ...(await extract("invoke('greet');", 'typescript')),
-    };
-    const root: FileFacts = { file: 'file:///w/src-tauri/src/lib.rs', ...(await extract('', 'rust')) };
-    const command: FileFacts = {
-      file: 'file:///w/src-tauri/src/commands.rs',
-      ...(await extract('#[tauri::command] pub fn greet() {}', 'rust')),
-    };
-    const result = analyzeArchitectureRelations([frontend, root, command], new Map([
-      [frontend.file, 'frontend'], [root.file, 'shell'], [command.file, 'shell'],
-    ]));
-    expect(result.some((relation) => relation.label === 'calls')).toBe(false);
   });
 });
 
