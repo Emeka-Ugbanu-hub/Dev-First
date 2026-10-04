@@ -1,4 +1,5 @@
 import type { MapPaths, StructuredMap, StructuredNode } from './mapValidate';
+import { escapeEdgeLabel } from './mapValidate';
 
 export interface LevelBreadcrumb {
   label: string;
@@ -117,8 +118,9 @@ export function buildLevelView(
   }
   for (const edge of edgeAgg.values()) {
     const label = edge.label ? `${edge.label}${edge.count > 1 ? ` ×${edge.count}` : ''}` : edge.count > 1 ? `×${edge.count}` : '';
-    if (label) {
-      lines.push(`  ${edge.from} -->|${escapeLabel(label)}| ${edge.to}`);
+    const safe = escapeEdgeLabel(label);
+    if (safe) {
+      lines.push(`  ${edge.from} -->|${safe}| ${edge.to}`);
     } else {
       lines.push(`  ${edge.from} --> ${edge.to}`);
     }

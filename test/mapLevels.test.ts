@@ -55,4 +55,20 @@ describe('buildLevelView', () => {
     });
     expect(view.paths).toEqual({ inbox: 'src/components/Inbox.tsx' });
   });
+
+  it('sanitizes parentheses in aggregated edge labels', () => {
+    const parenMap: StructuredMap = {
+      nodes: [
+        { id: 'ui', label: 'Inbox', group: 'Frontend' },
+        { id: 'api', label: 'Commands', group: 'Backend' },
+      ],
+      edges: [
+        { from: 'ui', to: 'api', label: 'invoke(command)' },
+        { from: 'ui', to: 'api', label: 'invoke(command)' },
+      ],
+    };
+    const view = buildLevelView(parenMap, [], {});
+    expect(view.mermaid).toContain('invoke command ×2');
+    expect(view.mermaid).not.toContain('(command)');
+  });
 });

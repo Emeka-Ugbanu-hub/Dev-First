@@ -138,6 +138,13 @@ function escapeLabel(label: string): string {
   return label.replace(/"/g, "'").replace(/[\r\n]+/g, ' ').trim();
 }
 
+export function escapeEdgeLabel(label: string): string {
+  return label
+    .replace(/[()[\]{}|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export function buildMermaidMap(map: StructuredMap): string {
   const lines = ['flowchart TD'];
   const groups = new Map<string, StructuredNode[]>();
@@ -168,10 +175,13 @@ export function buildMermaidMap(map: StructuredMap): string {
   }
   for (const edge of map.edges) {
     if (edge.label) {
-      lines.push(`  ${edge.from} -->|${escapeLabel(edge.label)}| ${edge.to}`);
-    } else {
-      lines.push(`  ${edge.from} --> ${edge.to}`);
+      const label = escapeEdgeLabel(edge.label);
+      if (label) {
+        lines.push(`  ${edge.from} -->|${label}| ${edge.to}`);
+        continue;
+      }
     }
+    lines.push(`  ${edge.from} --> ${edge.to}`);
   }
   return lines.join('\n');
 }

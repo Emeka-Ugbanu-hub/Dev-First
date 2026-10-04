@@ -72,6 +72,21 @@ describe('buildMermaidMap', () => {
     expect(mermaid).toContain('ui -->|queries| db');
     expect(mermaid).toContain('root --> ui');
   });
+
+  it('sanitizes edge labels that would break mermaid syntax', () => {
+    const map = parseStructuredMap(
+      JSON.stringify({
+        nodes: [
+          { id: 'a', label: 'UI' },
+          { id: 'b', label: 'Backend' },
+        ],
+        edges: [{ from: 'a', to: 'b', label: 'invoke(command) [x]|y|' }],
+      }),
+    )!;
+    const mermaid = buildMermaidMap(map);
+    expect(mermaid).toContain('a -->|invoke command x y| b');
+    expect(mermaid).not.toContain('(command)');
+  });
 });
 
 describe('mapPathsOf', () => {
