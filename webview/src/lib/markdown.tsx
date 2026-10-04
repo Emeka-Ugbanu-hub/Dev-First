@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
 import rehypeHighlight from 'rehype-highlight';
 import { CodeBlock } from '../components/CodeBlock';
 import { MermaidDiagram } from '../components/MermaidDiagram';
@@ -12,7 +13,7 @@ export function Markdown({ text, streaming = false }: { text: string; streaming?
   return (
     <div className="md">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkBreaks]}
         // Syntax highlighting is expensive to redo for every streamed token.
         // The final render applies highlighting once the text has settled.
         rehypePlugins={streaming ? [] : [rehypeHighlight]}

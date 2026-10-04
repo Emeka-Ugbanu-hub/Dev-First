@@ -37,4 +37,10 @@ describe('Markdown', () => {
     const html = render('use `npm test` to run');
     expect(html).toContain('<code>npm test</code>');
   });
+
+  it('keeps single line breaks inside a paragraph', () => {
+    const html = render('**WHAT**\nIt seeds the setting on first launch.');
+    expect(html).toMatch(/<br\s*\/?>/);
+    expect(html).toContain('<strong>WHAT</strong>');
+  });
 });

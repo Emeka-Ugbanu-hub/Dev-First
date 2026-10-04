@@ -674,7 +674,8 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^3.5.1",
-    "@vscode/tree-sitter-wasm": "^0.3.1"
+    "@vscode/tree-sitter-wasm": "^0.3.1",
+    "remark-breaks": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.17.0",
