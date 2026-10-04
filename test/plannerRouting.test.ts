@@ -22,12 +22,12 @@ describe('planner routing decision table', () => {
     expect(prompt).toContain(
       'Respond to the latest user message; use earlier messages only when they help answer it or it refers to earlier work.',
     );
-    expect(prompt).toContain('Match investigation, tool use, and answer detail to the request.');
-    expect(prompt).toContain('Answer simple questions directly.');
-    expect(prompt).toContain('Read files or inspect related code when the answer depends on them.');
-    expect(prompt).toContain('For requested code changes, make a plan for approval.');
+    expect(prompt).toContain('classify it internally as simple, balanced, or deep');
+    expect(prompt).toContain('The class alone sets the investigation budget and the answer shape.');
+    expect(prompt).toContain('choose the lighter one');
+    expect(prompt).toContain('The reasoning setting never changes the class.');
     expect(prompt).toContain(
-      'prefer the shortest answer that gives a complete understanding — never drop a section the developer needs just to keep it short.',
+      "Prefer the shortest answer at the depth the question's class requires — never omit something the developer needs at that depth.",
     );
     expect(prompt).toContain(
       'Never resume or combine an earlier task unless the latest user message refers to it or needs that context to answer accurately.',
@@ -37,6 +37,7 @@ describe('planner routing decision table', () => {
     expect(prompt).toContain('| Route | Trigger | Response |');
     expect(prompt).toContain('smalltalk');
     expect(prompt).toContain('question-simple');
+    expect(prompt).toContain('question-balanced');
     expect(prompt).toContain('question-deep');
     expect(prompt).toContain('plan-refine');
     expect(prompt).toContain('change-new');
@@ -55,12 +56,13 @@ describe('planner routing decision table', () => {
 
   it('keeps code explanations focused and uses tools only when the answer needs them', () => {
     const prompt = buildPlannerSystemPrompt();
-    expect(prompt).toContain('use a supplied snippet when it is sufficient');
-    expect(prompt).toContain('inspect callers or related files only when the question depends on them');
-    expect(prompt).toContain('a design question may need WHY alone');
-    expect(prompt).toContain('never omit a needed part');
+    expect(prompt).toContain('Plain prose, a few sentences. No headings, labeled sections, or lists.');
+    expect(prompt).toContain('at most one targeted read');
+    expect(prompt).toContain('Do not follow callers or consumers.');
+    expect(prompt).toContain('Read exactly that one level.');
+    expect(prompt).toContain('Do not trace through the wider application.');
     expect(prompt).toContain('Do not add diagrams or key-file lists unless they materially help');
-    expect(prompt).toContain('expand the previous answer with the missing parts');
+    expect(prompt).toContain('move exactly one class deeper');
     expect(prompt).not.toMatch(/Question-deep answers use WHAT \/ HOW \/ WHY/);
     expect(prompt).not.toMatch(/include a Mermaid flow/);
   });

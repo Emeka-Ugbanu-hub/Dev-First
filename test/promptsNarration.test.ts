@@ -55,7 +55,7 @@ describe('planner preamble prompt', () => {
     const prompt = buildPlannerSystemPrompt();
     expect(prompt).toContain('Never open with a "Let me…" preamble');
     expect(prompt).toContain('the plan card carries the detail');
-    expect(prompt).toContain('Answer directly in a short paragraph');
+    expect(prompt).toContain('Plain prose, a few sentences. No headings, labeled sections, or lists.');
     expect(prompt).not.toContain('WHAT → HOW → WHY');
     expect(prompt).toContain('questions never call submit_plan');
   });

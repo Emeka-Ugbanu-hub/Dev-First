@@ -110,7 +110,7 @@ describe('PlannerService single-turn intent handling', () => {
     expect(provider.calls).toHaveLength(1);
     expect(provider.calls[0].reasoning).toEqual({ enabled: true, effort: 'max' });
     expect(executedTools).toEqual([]);
-    expect(provider.calls[0].messages[0].content).toContain('use a supplied snippet when it is sufficient');
+    expect(provider.calls[0].messages[0].content).toContain('use what is already present when it is sufficient');
   });
 
   it('streams reasoning and answers a question in the first selected-model call, even with an open draft', async () => {
@@ -127,7 +127,7 @@ describe('PlannerService single-turn intent handling', () => {
     expect(reasoning).toEqual(['This is a question about the file.']);
     expect(provider.calls).toHaveLength(1);
     expect(provider.calls[0].reasoning).toEqual({ enabled: true, effort: 'high' });
-    expect(provider.calls[0].messages[0].content).toContain('Questions (simple, deep, or follow-up) NEVER call submit_plan');
+    expect(provider.calls[0].messages[0].content).toContain('Questions (simple, balanced, deep, or follow-up) NEVER call submit_plan');
   });
 
   it('submits a requested change in the first call', async () => {

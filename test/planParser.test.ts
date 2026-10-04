@@ -347,8 +347,8 @@ describe('planner prompt learning fields', () => {
 
   it('keeps explanations structured only when useful and tradeoffs unforced', () => {
     const prompt = buildPlannerSystemPrompt();
-    expect(prompt).toContain('include WHAT, HOW, and WHY wherever the question depends on them');
-    expect(prompt).toContain('only when it materially helps');
+    expect(prompt).toContain('Investigate as far as the answer needs');
+    expect(prompt).toContain('only where they genuinely make it clearer');
     expect(prompt).not.toContain('WHAT → HOW → WHY');
     expect(prompt).not.toContain('with WHAT, HOW, and WHY headings');
   });
