@@ -2,21 +2,33 @@ export interface MapPaths {
   [nodeId: string]: string;
 }
 
+export interface StructuredNode {
+  id: string;
+  label: string;
+  group?: string;
+  path?: string;
+}
+
+export interface StructuredEdge {
+  from: string;
+  to: string;
+  label?: string;
+}
+
+export interface StructuredMap {
+  nodes: StructuredNode[];
+  edges: StructuredEdge[];
+}
+
 export interface ValidatedMap {
   mermaid: string;
   paths: MapPaths;
 }
 
-const FORBIDDEN_PATTERNS = [
-  /click /i,
-  /style /i,
-  /linkStyle/i,
-  /classDef/i,
-  /<script/i,
-  /<div/i,
-];
-
-const PATH_LINE = /^%%\s*([^\s=]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|(.+?))\s*$/;
+const MAX_NODES = 60;
+const MAX_EDGES = 120;
+const MAX_LABEL = 40;
+const MAX_GROUP = 28;
 
 function stripFences(raw: string): string {
   const lines = raw.trim().split(/\r?\n/);
@@ -33,49 +45,6 @@ function stripFences(raw: string): string {
   return lines.join('\n').trim();
 }
 
-function balanced(text: string): boolean {
-  let square = 0;
-  let round = 0;
-  let quoted = false;
-  let escaped = false;
-  for (const char of text) {
-    if (quoted) {
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-      if (char === '\\') {
-        escaped = true;
-        continue;
-      }
-      if (char === '"') {
-        quoted = false;
-      }
-      continue;
-    }
-    if (char === '"') {
-      quoted = true;
-      continue;
-    }
-    if (char === '[') {
-      square++;
-    } else if (char === ']') {
-      square--;
-      if (square < 0) {
-        return false;
-      }
-    } else if (char === '(') {
-      round++;
-    } else if (char === ')') {
-      round--;
-      if (round < 0) {
-        return false;
-      }
-    }
-  }
-  return !quoted && square === 0 && round === 0;
-}
-
 function normalizePath(value: string): string {
   return value
     .trim()
@@ -83,59 +52,136 @@ function normalizePath(value: string): string {
     .replace(/^(?:\.\/)+/, '');
 }
 
-export function validateMermaidMap(
-  raw: string,
-  exists: (relativePath: string) => boolean,
-): ValidatedMap | undefined {
+function sanitizeId(value: string): string {
+  return value.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+export function parseStructuredMap(raw: string): StructuredMap | undefined {
   if (typeof raw !== 'string') {
     return undefined;
   }
-  const source = stripFences(raw);
-  if (!source || !/^(flowchart|graph)\b/i.test(source)) {
+  const text = stripFences(raw);
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end <= start) {
     return undefined;
   }
-  for (const pattern of FORBIDDEN_PATTERNS) {
-    if (pattern.test(source)) {
-      return undefined;
-    }
-  }
-
-  const lines = source.split(/\r?\n/);
-  const markerIndex = lines.findIndex((line) => line.trim() === '%% PATHS');
-  const mermaidLines = markerIndex >= 0 ? lines.slice(0, markerIndex) : lines;
-  const pathLines = markerIndex >= 0 ? lines.slice(markerIndex + 1) : [];
-
-  for (const line of mermaidLines) {
-    if (line.trim().startsWith('%%')) {
-      return undefined;
-    }
-  }
-
-  const mermaid = mermaidLines.join('\n').trim();
-  if (!mermaid || !balanced(mermaid)) {
+  let data: Record<string, unknown>;
+  try {
+    data = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+  } catch {
     return undefined;
   }
+  if (!data || !Array.isArray(data.nodes)) {
+    return undefined;
+  }
+  const nodes: StructuredNode[] = [];
+  const idMap = new Map<string, string>();
+  for (const item of data.nodes) {
+    if (nodes.length >= MAX_NODES) {
+      break;
+    }
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const rawId = typeof record.id === 'string' ? record.id.trim() : '';
+    const label = typeof record.label === 'string' ? record.label.trim().slice(0, MAX_LABEL) : '';
+    if (!rawId || !label || idMap.has(rawId)) {
+      continue;
+    }
+    let id = sanitizeId(rawId);
+    while ([...idMap.values()].includes(id)) {
+      id = `${id}_`;
+    }
+    idMap.set(rawId, id);
+    const node: StructuredNode = { id, label };
+    if (typeof record.group === 'string' && record.group.trim()) {
+      node.group = record.group.trim().slice(0, MAX_GROUP);
+    }
+    if (typeof record.path === 'string' && record.path.trim()) {
+      node.path = normalizePath(record.path);
+    }
+    nodes.push(node);
+  }
+  if (nodes.length === 0) {
+    return undefined;
+  }
+  const known = new Set(nodes.map((node) => node.id));
+  const edges: StructuredEdge[] = [];
+  const edgeKeys = new Set<string>();
+  for (const item of Array.isArray(data.edges) ? data.edges : []) {
+    if (edges.length >= MAX_EDGES) {
+      break;
+    }
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const from = typeof record.from === 'string' ? idMap.get(record.from.trim()) : undefined;
+    const to = typeof record.to === 'string' ? idMap.get(record.to.trim()) : undefined;
+    if (!from || !to || from === to || !known.has(from) || !known.has(to)) {
+      continue;
+    }
+    const label = typeof record.label === 'string' ? record.label.trim().slice(0, MAX_LABEL) : '';
+    const key = `${from}\u0000${to}\u0000${label}`;
+    if (edgeKeys.has(key)) {
+      continue;
+    }
+    edgeKeys.add(key);
+    edges.push(label ? { from, to, label } : { from, to });
+  }
+  return { nodes, edges };
+}
 
+function escapeLabel(label: string): string {
+  return label.replace(/"/g, "'").replace(/[\r\n]+/g, ' ').trim();
+}
+
+export function buildMermaidMap(map: StructuredMap): string {
+  const lines = ['flowchart TD'];
+  const groups = new Map<string, StructuredNode[]>();
+  const ungrouped: StructuredNode[] = [];
+  for (const node of map.nodes) {
+    if (node.group) {
+      const list = groups.get(node.group);
+      if (list) {
+        list.push(node);
+      } else {
+        groups.set(node.group, [node]);
+      }
+    } else {
+      ungrouped.push(node);
+    }
+  }
+  for (const node of ungrouped) {
+    lines.push(`  ${node.id}["${escapeLabel(node.label)}"]`);
+  }
+  let index = 0;
+  for (const [group, nodes] of groups) {
+    lines.push(`  subgraph g${index}["${escapeLabel(group)}"]`);
+    for (const node of nodes) {
+      lines.push(`    ${node.id}["${escapeLabel(node.label)}"]`);
+    }
+    lines.push('  end');
+    index++;
+  }
+  for (const edge of map.edges) {
+    if (edge.label) {
+      lines.push(`  ${edge.from} -->|${escapeLabel(edge.label)}| ${edge.to}`);
+    } else {
+      lines.push(`  ${edge.from} --> ${edge.to}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+export function mapPathsOf(map: StructuredMap, exists: (relativePath: string) => boolean): MapPaths {
   const paths: MapPaths = {};
-  for (const line of pathLines) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-    const match = PATH_LINE.exec(trimmed);
-    if (!match) {
-      return undefined;
-    }
-    const nodeId = match[1];
-    const rawPath = match[2] ?? match[3] ?? match[4] ?? '';
-    const path = normalizePath(rawPath);
-    if (!nodeId || !path) {
-      continue;
-    }
-    if (exists(path)) {
-      paths[nodeId] = path;
+  for (const node of map.nodes) {
+    if (node.path && exists(node.path)) {
+      paths[node.id] = node.path;
     }
   }
-
-  return { mermaid, paths };
+  return paths;
 }

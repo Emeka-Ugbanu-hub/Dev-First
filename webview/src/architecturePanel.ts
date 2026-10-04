@@ -28,7 +28,7 @@ interface ErrorMessage {
   hasMap: boolean;
 }
 
-type IncomingMessage = MapMessage | EmptyMessage | GeneratingMessage | ErrorMessage;
+type IncomingMessage = MapMessage | EmptyMessage | GeneratingMessage | ErrorMessage | { type: 'raw'; text?: string };
 
 declare function acquireVsCodeApi(): { postMessage(message: unknown): void };
 
@@ -44,6 +44,7 @@ const diagram = document.getElementById('df-diagram');
 
 let paths: Record<string, string> = {};
 let hasMap = false;
+let lastError: ErrorMessage | undefined;
 let lastMermaid = '';
 let projectName = 'this project';
 let progressLines: string[] = [];
@@ -260,7 +261,8 @@ function renderError(message: ErrorMessage): void {
   if (!diagram) {
     return;
   }
-  diagram.innerHTML = `<div class="df-state"><h2>${escapeHtml(projectName)}</h2><p class="df-error">${escapeHtml(message.message)}</p><button id="df-retry" class="df-action" type="button">Retry</button></div>`;
+  diagram.innerHTML = `<div class="df-state"><h2>${escapeHtml(projectName)}</h2><p class="df-error">${escapeHtml(message.message)}</p><button id="df-retry" class="df-action" type="button">Retry</button> <button id="df-raw" class="df-action" type="button">Show raw output</button></div>`;
+  lastError = message;
 }
 
 window.addEventListener('message', (event: MessageEvent) => {
@@ -282,6 +284,12 @@ window.addEventListener('message', (event: MessageEvent) => {
   }
   if (message.type === 'error') {
     renderError(message);
+    return;
+  }
+  if (message.type === 'raw') {
+    if (diagram) {
+      diagram.innerHTML = `<div class="df-state"><h2>${escapeHtml(projectName)}</h2><p class="df-state-note">Raw model output</p><pre class="df-raw">${escapeHtml(message.text || 'No raw output available.')}</pre><button id="df-raw-back" class="df-action" type="button">Back</button></div>`;
+    }
   }
 });
 
@@ -289,6 +297,16 @@ diagram?.addEventListener('click', (event) => {
   const target = event.target as HTMLElement | null;
   if (target?.closest('#df-generate, #df-retry')) {
     post({ type: 'generate' });
+    return;
+  }
+  if (target?.closest('#df-raw')) {
+    post({ type: 'showRaw' });
+    return;
+  }
+  if (target?.closest('#df-raw-back')) {
+    if (lastError) {
+      renderError(lastError);
+    }
   }
 });
 

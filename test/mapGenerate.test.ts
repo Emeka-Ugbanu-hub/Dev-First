@@ -206,31 +206,11 @@ describe('generateArchitectureMap', () => {
 });
 
 describe('MAP_SYSTEM_PROMPT', () => {
-  it('is exactly the required prompt', () => {
-    const expected = `You are a software architect. The digest below is supporting context, not the whole picture.
-Explore this codebase however you think is best to understand how it actually works.
-Base every label and arrow on what you read. Trust files over the digest.
-
-Your diagram exists so a developer who has never seen this codebase can look at it
-and understand how it works. Preserve the structural understanding: the layers,
-the components, their responsibilities, and how data moves between them. The result
-should read like a clear explanation of the architecture, not a list of files.
-
-Then respond with RAW Mermaid only (no prose, no code fences). Rules:
-- Start with: flowchart TD
-- Hierarchy with subgraphs for the main areas (Frontend, Backend, Services, Database, External Services...), nested only when clearer.
-- One root node named after the project, connected to the main areas.
-- Real components of THIS codebase as nodes; label every node yourself, 1-3 words; labels only, no descriptions inside nodes.
-- Arrows describe behavior: reads, writes, calls, sends, emits, queries, returns. Show data movement between UI, backend, database, external APIs.
-- Mark entry points, database/storage, external services explicitly.
-- Never invent files/components not supported by what you read. Omit rather than guess.
-- Keep it readable (~40 nodes max). Quote labels: n1["User Service"].
-- No click/style/linkStyle/classDef directives, no HTML.
-- End with a path map, one line per node that maps to a real folder or file:
-%% PATHS
-%% ui = src/components
-%% db = src-tauri/src/db.rs`;
-
-    expect(MAP_SYSTEM_PROMPT).toBe(expected);
+  it('requests a strict JSON structure with groups and paths', () => {
+    expect(MAP_SYSTEM_PROMPT).toContain('Then respond with a single JSON object only');
+    expect(MAP_SYSTEM_PROMPT).toContain('"nodes"');
+    expect(MAP_SYSTEM_PROMPT).toContain('Build the hierarchy with groups for the main areas');
+    expect(MAP_SYSTEM_PROMPT).toContain('at most 40 nodes and 60 edges');
+    expect(MAP_SYSTEM_PROMPT).toContain('Output the JSON object only');
   });
 });

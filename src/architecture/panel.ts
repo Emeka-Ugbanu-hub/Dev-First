@@ -5,7 +5,7 @@ import * as path from 'path';
 import type { FileFacts } from '../scan/duplication';
 import type { LLMProvider, ToolCall, ToolDef } from '../llm/types';
 import { buildMapDigest } from './mapDigest';
-import { validateMermaidMap } from './mapValidate';
+import { buildMermaidMap, mapPathsOf, parseStructuredMap } from './mapValidate';
 import {
   StoredArchitectureMap,
   architectureFilesHash,
@@ -41,6 +41,7 @@ export class ArchitecturePanel {
   private stored: StoredArchitectureMap | undefined;
   private controller: AbortController | undefined;
   private generating = false;
+  private lastRaw = '';
   private disposed = false;
   private readonly projectName: string;
 
@@ -113,6 +114,10 @@ export class ArchitecturePanel {
     }
     if (message.type === 'exportDiagram' && typeof message.svg === 'string') {
       await this.exportDiagram(message.svg);
+      return;
+    }
+    if (message.type === 'showRaw') {
+      this.post({ type: 'raw', text: this.lastRaw });
     }
   }
 
@@ -219,13 +224,12 @@ export class ArchitecturePanel {
         });
         return;
       }
-      const validated = validateMermaidMap(raw, (relative) =>
-        existsSync(path.join(this.deps.root, relative)),
-      );
-      if (!validated) {
+      this.lastRaw = raw;
+      const parsed = parseStructuredMap(raw);
+      if (!parsed) {
         this.post({
           type: 'error',
-          message: 'The model returned a diagram that is not valid Mermaid. Try again.',
+          message: 'The model did not return a usable structure. Try again.',
           hasMap: Boolean(this.stored),
         });
         return;
@@ -233,8 +237,8 @@ export class ArchitecturePanel {
       const map: StoredArchitectureMap = {
         version: 1,
         filesHash: architectureFilesHash(facts.map((fact) => fact.file)),
-        mermaid: validated.mermaid,
-        paths: validated.paths,
+        mermaid: buildMermaidMap(parsed),
+        paths: mapPathsOf(parsed, (relative) => existsSync(path.join(this.deps.root, relative))),
         model: active.model,
         generatedAt: Date.now(),
       };
@@ -450,6 +454,7 @@ export class ArchitecturePanel {
     .df-state h2 { margin: 0; color: var(--vscode-foreground); font-size: 18px; font-weight: 600; }
     .df-state p { margin: 0; }
     .df-state-note { font-size: 12px; }
+    .df-raw { max-height: 55vh; overflow: auto; padding: 10px; border: 1px solid var(--vscode-panel-border); border-radius: 4px; background: var(--vscode-textCodeBlock-background); white-space: pre-wrap; word-break: break-word; font-size: 11px; text-align: left; width: 100%; box-sizing: border-box; }
     .df-action {
       padding: 6px 14px;
       border: 1px solid var(--vscode-button-border, transparent);
