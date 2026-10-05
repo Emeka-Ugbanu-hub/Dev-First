@@ -677,6 +677,7 @@ button:active:not(:disabled) {
   flex-shrink: 0;
   display: flex;
   align-items: center;
+  cursor: pointer;
 }
 
 .rail-track {
@@ -690,7 +691,7 @@ button:active:not(:disabled) {
   position: absolute;
   left: 4px;
   width: 34px;
-  height: 8px;
+  height: 14px;
   margin: 0;
   padding: 0;
   border: 0;
@@ -727,6 +728,16 @@ button:active:not(:disabled) {
 .rail-tick.neighboring::before {
   width: 14px;
   opacity: 0.68;
+}
+
+.message-flash {
+  border-radius: 8px;
+  animation: df-message-flash 1.2s ease-out;
+}
+
+@keyframes df-message-flash {
+  0% { background: color-mix(in srgb, var(--vscode-focusBorder, #007fd4) 20%, transparent); }
+  100% { background: transparent; }
 }
 
 .rail-card {

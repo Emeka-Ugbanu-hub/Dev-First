@@ -29,6 +29,7 @@ import { PromptRail } from './components/PromptRail';
 import { appendDelta } from '../../src/shared/stream';
 import { buildSearchPattern, collectSearchTexts } from './lib/search';
 import { shouldFollow } from './lib/scroll';
+import { needsCorrection, promptJumpTop } from './lib/promptJump';
 import { shouldDockPlan } from './lib/planDock';
 import { htmlToMarkdown } from './lib/htmlToMarkdown';
 import { setKnownFiles } from './lib/fileLinks';
@@ -589,8 +590,27 @@ export default function App() {
     if (!container || !message) return false;
     pendingPromptJump.current = null;
     followRef.current = false;
-    const top = message.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
-    container.scrollTo({ top: Math.max(0, top - container.clientHeight * 0.4), behavior: 'smooth' });
+    const desiredTop = () =>
+      promptJumpTop(
+        message.getBoundingClientRect().top,
+        container.getBoundingClientRect().top,
+        container.scrollTop,
+      );
+    container.scrollTo({ top: desiredTop(), behavior: 'auto' });
+    message.classList.remove('message-flash');
+    window.requestAnimationFrame(() => {
+      message.classList.add('message-flash');
+      window.setTimeout(() => message.classList.remove('message-flash'), 1200);
+    });
+    for (const delay of [0, 250, 600]) {
+      window.setTimeout(() => {
+        if (!container.isConnected) return;
+        const desired = desiredTop();
+        if (needsCorrection(container.scrollTop, desired)) {
+          container.scrollTo({ top: desired, behavior: 'auto' });
+        }
+      }, delay);
+    }
     return true;
   };
 

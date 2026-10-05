@@ -53,7 +53,19 @@ export function PromptRail({
   }
 
   return (
-    <div className="prompt-rail" ref={railRef}>
+    <div
+      className="prompt-rail"
+      ref={railRef}
+      onClick={(event) => {
+        if ((event.target as HTMLElement).closest('button, .rail-card')) return;
+        const rect = railRef.current?.getBoundingClientRect();
+        if (!rect || prompts.length === 0) return;
+        const y = event.clientY - rect.top;
+        const index = tickGap > 0 ? Math.round((y - tickStart) / tickGap) : 0;
+        const clamped = Math.max(0, Math.min(prompts.length - 1, index));
+        onJump(prompts[clamped].id);
+      }}
+    >
       <div className="rail-track" aria-label="Prompt timeline">
         {prompts.map((prompt, index) => (
           <button
