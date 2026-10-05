@@ -702,6 +702,10 @@ button:active:not(:disabled) {
   cursor: pointer;
 }
 
+.rail-tick:active:not(:disabled) {
+  transform: translateY(-50%) scale(0.98);
+}
+
 .rail-tick::before {
   content: '';
   position: absolute;
