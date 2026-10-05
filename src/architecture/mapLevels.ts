@@ -45,41 +45,31 @@ export function buildLevelView(
   const directNodes: StructuredNode[] = [];
   for (const node of map.nodes) {
     const segments = segmentsOf(node);
-    if (inSubtree(segments)) {
-      if (segments.length === levelPath.length) {
-        directNodes.push(node);
-        bucketOf.set(node.id, `node:${node.id}`);
-      } else {
-        const childPath = segments.slice(0, levelPath.length + 1);
-        const key = childPath.join('/');
-        if (!childGroups.has(key)) {
-          childGroups.set(key, childPath[childPath.length - 1] ?? key);
-        }
-        bucketOf.set(node.id, `group:${key}`);
-      }
-    } else if (segments.length > 0) {
-      bucketOf.set(node.id, `out:${segments[0]}`);
+    if (!inSubtree(segments)) {
+      continue;
+    }
+    if (segments.length === levelPath.length) {
+      directNodes.push(node);
+      bucketOf.set(node.id, `node:${node.id}`);
     } else {
-      bucketOf.set(node.id, 'out:Root');
+      const childPath = segments.slice(0, levelPath.length + 1);
+      const key = childPath.join('/');
+      if (!childGroups.has(key)) {
+        childGroups.set(key, childPath[childPath.length - 1] ?? key);
+      }
+      bucketOf.set(node.id, `group:${key}`);
     }
   }
 
   const idByBucket = new Map<string, string>();
   const groups: Record<string, string[]> = {};
-  const boundaryLabels = new Map<string, string>();
+  const groupLabels = new Map<string, string>();
   let groupIndex = 0;
-  let outIndex = 0;
   for (const [key, label] of childGroups) {
     const mermaidId = `grp${groupIndex++}`;
     idByBucket.set(`group:${key}`, mermaidId);
     groups[mermaidId] = key.split('/');
-    boundaryLabels.set(`group:${key}`, label);
-  }
-  const outKeys = [...new Set([...bucketOf.values()].filter((value) => value.startsWith('out:')))];
-  for (const key of outKeys) {
-    const label = key.slice(4);
-    idByBucket.set(key, `out${outIndex++}`);
-    boundaryLabels.set(key, label);
+    groupLabels.set(`group:${key}`, label);
   }
 
   const lines = ['flowchart TD'];
@@ -87,10 +77,7 @@ export function buildLevelView(
     lines.push(`  ${node.id}["${escapeLabel(node.label)}"]`);
   }
   for (const [key, mermaidId] of idByBucket) {
-    if (key.startsWith('node:')) {
-      continue;
-    }
-    lines.push(`  ${mermaidId}["${escapeLabel(boundaryLabels.get(key) ?? key)}"]`);
+    lines.push(`  ${mermaidId}["${escapeLabel(groupLabels.get(key) ?? key)}"]`);
   }
 
   const edgeAgg = new Map<string, { from: string; to: string; label: string; count: number }>();
@@ -98,9 +85,6 @@ export function buildLevelView(
     const fromBucket = bucketOf.get(edge.from);
     const toBucket = bucketOf.get(edge.to);
     if (!fromBucket || !toBucket || fromBucket === toBucket) {
-      continue;
-    }
-    if (fromBucket.startsWith('out:') && toBucket.startsWith('out:')) {
       continue;
     }
     const from = idByBucket.get(fromBucket) ?? edge.from;

@@ -42,10 +42,13 @@ describe('buildLevelView', () => {
     expect(view.breadcrumbs.map((crumb) => crumb.label)).toEqual(['Project', 'Backend']);
   });
 
-  it('shows boundary nodes for edges leaving the current subtree', () => {
-    const view = buildLevelView(map, ['Backend'], {});
-    expect(view.mermaid).toMatch(/out\d+\["Frontend"\]/);
-    expect(view.mermaid).toMatch(/out\d+ -->\|calls ×2\| commands/);
+  it('hides nodes and edges outside the current subtree', () => {
+    const project = buildLevelView(map, [], {});
+    expect(project.mermaid).toContain('grp0 -->|calls ×2| grp1');
+    const backend = buildLevelView(map, ['Backend'], {});
+    expect(backend.mermaid).not.toMatch(/out\d+/);
+    expect(backend.mermaid).not.toContain('Frontend');
+    expect(backend.mermaid).not.toContain('calls');
   });
 
   it('keeps only paths for the visible level nodes', () => {
