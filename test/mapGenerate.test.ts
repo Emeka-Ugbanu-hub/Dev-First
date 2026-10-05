@@ -210,6 +210,8 @@ describe('MAP_SYSTEM_PROMPT', () => {
     expect(MAP_SYSTEM_PROMPT).toContain('Then respond with a single JSON object only');
     expect(MAP_SYSTEM_PROMPT).toContain('"nodes"');
     expect(MAP_SYSTEM_PROMPT).toContain('Build the hierarchy with groups for the main areas');
+    expect(MAP_SYSTEM_PROMPT).toContain('Every node must belong to a group');
+    expect(MAP_SYSTEM_PROMPT).toContain('at most 7 nodes');
     expect(MAP_SYSTEM_PROMPT).toContain('at most 40 nodes and 60 edges');
     expect(MAP_SYSTEM_PROMPT).toContain('Output the JSON object only');
   });

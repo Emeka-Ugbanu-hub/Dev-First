@@ -27,6 +27,17 @@ function escapeLabel(label: string): string {
   return label.replace(/"/g, "'").replace(/[\r\n]+/g, ' ').trim();
 }
 
+const MAX_LEVEL_EDGES = 12;
+const MAX_EDGE_LABEL = 22;
+
+function clipEdgeLabel(label: string): string {
+  const safe = escapeEdgeLabel(label);
+  if (safe.length <= MAX_EDGE_LABEL) {
+    return safe;
+  }
+  return `${safe.slice(0, MAX_EDGE_LABEL - 1).trimEnd()}…`;
+}
+
 function slug(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'group';
 }
@@ -77,7 +88,7 @@ export function buildLevelView(
     lines.push(`  ${node.id}["${escapeLabel(node.label)}"]`);
   }
   for (const [key, mermaidId] of idByBucket) {
-    lines.push(`  ${mermaidId}["${escapeLabel(groupLabels.get(key) ?? key)}"]`);
+    lines.push(`  ${mermaidId}(["${escapeLabel(groupLabels.get(key) ?? key)}"])`);
   }
 
   const edgeAgg = new Map<string, { from: string; to: string; label: string; count: number }>();
@@ -100,9 +111,14 @@ export function buildLevelView(
       edgeAgg.set(key, { from, to, label: edge.label ?? '', count: 1 });
     }
   }
-  for (const edge of edgeAgg.values()) {
-    const label = edge.label ? `${edge.label}${edge.count > 1 ? ` ×${edge.count}` : ''}` : edge.count > 1 ? `×${edge.count}` : '';
-    const safe = escapeEdgeLabel(label);
+  const ranked = [...edgeAgg.values()].sort((a, b) => b.count - a.count);
+  for (const edge of ranked.slice(0, MAX_LEVEL_EDGES)) {
+    const label = edge.label
+      ? `${edge.label}${edge.count > 1 ? ` ×${edge.count}` : ''}`
+      : edge.count > 1
+        ? `×${edge.count}`
+        : '';
+    const safe = clipEdgeLabel(label);
     if (safe) {
       lines.push(`  ${edge.from} -->|${safe}| ${edge.to}`);
     } else {

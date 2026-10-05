@@ -142,8 +142,8 @@ function ensureInit(): void {
     flowchart: {
       htmlLabels: false,
       useMaxWidth: false,
-      nodeSpacing: 70,
-      rankSpacing: 90,
+      nodeSpacing: 90,
+      rankSpacing: 130,
       padding: 18,
       curve: 'basis',
     },
@@ -157,12 +157,43 @@ function nodeIdFor(element: SVGGElement): string | undefined {
   return candidate || undefined;
 }
 
+function clearHighlight(): void {
+  if (!diagram) {
+    return;
+  }
+  diagram.querySelectorAll('.df-dim, .df-hi').forEach((element) => {
+    element.classList.remove('df-dim', 'df-hi');
+  });
+}
+
+function highlightEdges(nodeId: string): void {
+  if (!diagram || !nodeId) {
+    return;
+  }
+  const escaped = nodeId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`(^|[-_])${escaped}([-_]|$)`);
+  diagram.querySelectorAll<SVGPathElement>('path.flowchart-link').forEach((path) => {
+    const id = path.id ?? '';
+    const connected = /^L[-_]/.test(id) && pattern.test(id.slice(2));
+    path.classList.toggle('df-dim', !connected);
+    path.classList.toggle('df-hi', connected);
+  });
+  diagram.querySelectorAll<SVGGElement>('g.node').forEach((element) => {
+    const id = nodeIdFor(element);
+    element.classList.toggle('df-dim', Boolean(id) && id !== nodeId);
+  });
+}
+
 function wireNodes(): void {
   if (!diagram) {
     return;
   }
   diagram.querySelectorAll<SVGGElement>('g.node').forEach((element) => {
     const id = nodeIdFor(element);
+    if (id) {
+      element.addEventListener('mouseenter', () => highlightEdges(id));
+      element.addEventListener('mouseleave', clearHighlight);
+    }
     const group = id ? groups[id] : undefined;
     if (group) {
       element.classList.add('df-clickable');

@@ -24,9 +24,9 @@ describe('buildLevelView', () => {
   it('shows groups as single nodes with aggregated edges at the project level', () => {
     const view = buildLevelView(map, [], { inbox: 'src/components/Inbox.tsx' });
     expect(view.mermaid).toContain('root["companion"]');
-    expect(view.mermaid).toContain('grp0["Frontend"]');
-    expect(view.mermaid).toContain('grp1["Backend"]');
-    expect(view.mermaid).toContain('grp2["Database"]');
+    expect(view.mermaid).toContain('grp0(["Frontend"])');
+    expect(view.mermaid).toContain('grp1(["Backend"])');
+    expect(view.mermaid).toContain('grp2(["Database"])');
     expect(view.mermaid).toContain('grp0 -->|calls ×2| grp1');
     expect(view.mermaid).toContain('grp1 -->|writes| grp2');
     expect(Object.values(view.groups)).toEqual([['Frontend'], ['Backend'], ['Database']]);
@@ -36,7 +36,7 @@ describe('buildLevelView', () => {
   it('drills into a group and exposes its child groups', () => {
     const view = buildLevelView(map, ['Backend'], {});
     expect(view.mermaid).toContain('commands["Commands"]');
-    expect(view.mermaid).toContain('grp0["Services"]');
+    expect(view.mermaid).toContain('grp0(["Services"])');
     expect(view.mermaid).toContain('commands -->|uses| grp0');
     expect(view.groups.grp0).toEqual(['Backend', 'Services']);
     expect(view.breadcrumbs.map((crumb) => crumb.label)).toEqual(['Project', 'Backend']);
@@ -73,5 +73,32 @@ describe('buildLevelView', () => {
     const view = buildLevelView(parenMap, [], {});
     expect(view.mermaid).toContain('invoke command ×2');
     expect(view.mermaid).not.toContain('(command)');
+  });
+
+  it('caps the number of edges per level', () => {
+    const nodes = Array.from({ length: 15 }, (_value, index) => ({
+      id: `n${index}`,
+      label: `Node ${index}`,
+    }));
+    const edges = Array.from({ length: 14 }, (_value, index) => ({
+      from: `n${index}`,
+      to: `n${index + 1}`,
+    }));
+    const view = buildLevelView({ nodes, edges }, [], {});
+    expect((view.mermaid.match(/ -->/g) ?? []).length).toBeLessThanOrEqual(12);
+  });
+
+  it('truncates long edge labels', () => {
+    const nodes = [
+      { id: 'a', label: 'A' },
+      { id: 'b', label: 'B' },
+    ];
+    const view = buildLevelView(
+      { nodes, edges: [{ from: 'a', to: 'b', label: 'reads and writes the entire state store' }] },
+      [],
+      {},
+    );
+    expect(view.mermaid).toContain('…');
+    expect(view.mermaid).not.toContain('entire state store');
   });
 });

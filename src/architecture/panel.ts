@@ -509,6 +509,8 @@ export class ArchitecturePanel {
       color: var(--vscode-descriptionForeground);
     }
     .df-clickable { cursor: pointer; }
+    .df-dim { opacity: 0.12; }
+    .df-hi { stroke-width: 2.5px !important; }
     .df-clickable:hover > rect, .df-clickable:hover > path, .df-clickable:hover > polygon {
       stroke: var(--vscode-focusBorder) !important;
       stroke-width: 2px !important;
