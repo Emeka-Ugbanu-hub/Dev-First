@@ -29,7 +29,7 @@ import { PromptRail } from './components/PromptRail';
 import { appendDelta } from '../../src/shared/stream';
 import { buildSearchPattern, collectSearchTexts } from './lib/search';
 import { shouldFollow } from './lib/scroll';
-import { needsCorrection, promptJumpTop } from './lib/promptJump';
+import { nearestPromptIndex, needsCorrection, promptJumpTop } from './lib/promptJump';
 import { shouldDockPlan } from './lib/planDock';
 import { htmlToMarkdown } from './lib/htmlToMarkdown';
 import { setKnownFiles } from './lib/fileLinks';
@@ -95,6 +95,7 @@ export default function App() {
   const [activePromptId, setActivePromptId] = useState<string | undefined>(undefined);
   const scrollAdjust = useRef<{ id: string; top: number } | null>(null);
   const pendingPromptJump = useRef<string | null>(null);
+  const jumpLockRef = useRef(0);
   const boundaryLoadCooldown = useRef(0);
   const previousPhase = useRef<Phase>('idle');
   const [dismissedSelectionKey, setDismissedSelectionKey] = useState<string | null>(null);
@@ -539,20 +540,25 @@ export default function App() {
       const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
       followRef.current = shouldFollow(distanceFromBottom);
       setShowScrollTop(distanceFromBottom > 120);
+      if (Date.now() < jumpLockRef.current) {
+        return;
+      }
       const userElements = Array.from(element.querySelectorAll('[data-message-role="user"]')) as HTMLElement[];
       if (userElements.length === 0) {
         return;
       }
       const containerTop = element.getBoundingClientRect().top;
-      const readingLine = containerTop + element.clientHeight * 0.4;
       let active = userElements[0];
       if (distanceFromBottom <= 40) {
         active = userElements[userElements.length - 1];
       } else {
-        for (const candidate of userElements) {
-          if (candidate.getBoundingClientRect().top <= readingLine) {
-            active = candidate;
-          }
+        const centers = userElements.map((candidate) => {
+          const rect = candidate.getBoundingClientRect();
+          return rect.top + rect.height / 2;
+        });
+        const index = nearestPromptIndex(containerTop, element.clientHeight, centers);
+        if (index >= 0) {
+          active = userElements[index];
         }
       }
       setActivePromptId(active.dataset.messageId);
@@ -590,11 +596,14 @@ export default function App() {
     if (!container || !message) return false;
     pendingPromptJump.current = null;
     followRef.current = false;
+    jumpLockRef.current = Date.now() + 700;
     const desiredTop = () =>
       promptJumpTop(
         message.getBoundingClientRect().top,
         container.getBoundingClientRect().top,
         container.scrollTop,
+        container.clientHeight,
+        message.getBoundingClientRect().height,
       );
     container.scrollTo({ top: desiredTop(), behavior: 'auto' });
     message.classList.remove('message-flash');

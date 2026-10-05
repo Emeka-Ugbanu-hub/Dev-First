@@ -1,14 +1,29 @@
 import { describe, expect, it } from 'vitest';
-import { needsCorrection, promptJumpTop } from '../webview/src/lib/promptJump';
+import { nearestPromptIndex, needsCorrection, promptJumpTop } from '../webview/src/lib/promptJump';
 
 describe('promptJumpTop', () => {
-  it('anchors the message near the top with the offset', () => {
-    expect(promptJumpTop(500, 100, 0)).toBe(388);
-    expect(promptJumpTop(500, 100, 50)).toBe(438);
+  it('centers the message in the viewport', () => {
+    expect(promptJumpTop(500, 100, 0, 600, 200)).toBe(200);
+    expect(promptJumpTop(500, 100, 50, 600, 200)).toBe(250);
+  });
+
+  it('top-aligns messages taller than the viewport', () => {
+    expect(promptJumpTop(500, 100, 0, 600, 700)).toBe(388);
   });
 
   it('never scrolls above zero', () => {
-    expect(promptJumpTop(100, 100, 0)).toBe(0);
+    expect(promptJumpTop(100, 100, 0, 600, 200)).toBe(0);
+  });
+});
+
+describe('nearestPromptIndex', () => {
+  it('picks the prompt center nearest the viewport center', () => {
+    expect(nearestPromptIndex(100, 600, [150, 450, 900])).toBe(1);
+    expect(nearestPromptIndex(100, 600, [350, 500])).toBe(0);
+  });
+
+  it('returns -1 for an empty list', () => {
+    expect(nearestPromptIndex(100, 600, [])).toBe(-1);
   });
 });
 

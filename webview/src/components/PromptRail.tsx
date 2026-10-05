@@ -42,8 +42,9 @@ export function PromptRail({
   }, [prompts.length]);
 
   const tickGap = prompts.length > 1
-    ? Math.min(10, Math.max(0, railHeight - 12) / (prompts.length - 1))
+    ? Math.min(14, Math.max(0, railHeight - 12) / (prompts.length - 1))
     : 0;
+  const tickHeight = tickGap > 0 ? Math.min(12, Math.max(6, tickGap)) : 12;
   const tickStart = Math.max(6, (railHeight - tickGap * (prompts.length - 1)) / 2);
   const hoveredPrompt = hovered ? prompts.find((prompt) => prompt.id === hovered.id) : undefined;
   const hoveredIndex = hovered ? prompts.findIndex((prompt) => prompt.id === hovered.id) : -1;
@@ -71,7 +72,7 @@ export function PromptRail({
           <button
             key={prompt.id}
             className={`rail-tick ${prompt.id === activeId ? 'active' : ''} ${prompt.id === hovered?.id ? 'previewing' : ''} ${Math.abs(index - hoveredIndex) === 1 ? 'neighboring' : ''}`}
-            style={{ top: `${tickStart + index * tickGap}px` }}
+            style={{ top: `${tickStart + index * tickGap}px`, height: `${tickHeight}px` }}
             aria-label={`Jump to prompt ${index + 1}`}
             onMouseEnter={(event) => {
               if (closeTimer.current) clearTimeout(closeTimer.current);

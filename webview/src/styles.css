@@ -691,7 +691,7 @@ button:active:not(:disabled) {
   position: absolute;
   left: 4px;
   width: 34px;
-  height: 14px;
+  height: 12px;
   margin: 0;
   padding: 0;
   border: 0;
@@ -707,8 +707,8 @@ button:active:not(:disabled) {
   position: absolute;
   left: 8px;
   top: 50%;
-  width: 4px;
-  height: 2px;
+  width: 6px;
+  height: 3px;
   border-radius: 4px;
   background: var(--vscode-descriptionForeground);
   opacity: 0.48;
@@ -717,12 +717,17 @@ button:active:not(:disabled) {
 }
 
 .rail-tick:hover::before,
-.rail-tick.active::before,
 .rail-tick.previewing::before,
 .rail-tick:focus-visible::before {
-  width: 25px;
+  width: 28px;
   opacity: 0.9;
   background: var(--vscode-foreground);
+}
+
+.rail-tick.active::before {
+  width: 28px;
+  opacity: 1;
+  background: var(--vscode-focusBorder, var(--vscode-foreground));
 }
 
 .rail-tick.neighboring::before {
