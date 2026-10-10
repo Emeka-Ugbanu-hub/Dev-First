@@ -2872,6 +2872,173 @@ body.vscode-light .hljs-meta {
   font-size: var(--df-font-small);
 }
 
+.recovery-drift,
+.recovery-mcp-note {
+  display: flex;
+  align-items: center;
+  gap: var(--df-space-2);
+  padding: var(--df-space-2) var(--df-space-3);
+  border: 1px solid var(--vscode-inputValidation-warningBorder, var(--df-border));
+  border-radius: var(--df-radius-md);
+  background: var(--vscode-inputValidation-warningBackground, transparent);
+  color: var(--vscode-foreground);
+  font-size: var(--df-font-small);
+  line-height: 1.4;
+}
+
+.recovery-drift .codicon {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.recovery-mcp-note {
+  border-color: var(--df-border);
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+}
+
+.recovery-section-title {
+  font-size: var(--df-font-micro);
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--vscode-descriptionForeground);
+}
+
+.recovery-processes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--df-space-2);
+}
+
+.recovery-process {
+  display: flex;
+  align-items: center;
+  gap: var(--df-space-2);
+  font-size: var(--df-font-small);
+}
+
+.recovery-process-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--vscode-descriptionForeground);
+}
+
+.recovery-process-dot.alive {
+  background: var(--vscode-testing-iconPassed, var(--vscode-gitDecoration-addedResourceForeground, #73c991));
+}
+
+.recovery-process-dot.gone {
+  background: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c);
+}
+
+.recovery-process-command {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.recovery-browser {
+  display: flex;
+  align-items: center;
+  gap: var(--df-space-2);
+  font-size: var(--df-font-small);
+}
+
+.recovery-browser .codicon {
+  color: var(--vscode-descriptionForeground);
+}
+
+.recovery-browser-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.recovery-pending-prompt {
+  font-weight: 600;
+}
+
+.recovery-pending-command {
+  display: inline-block;
+  margin-top: var(--df-space-2);
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.14));
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--df-font-small);
+  overflow-wrap: anywhere;
+}
+
+.recovery-pending-cwd {
+  margin-top: var(--df-space-1);
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--df-font-small);
+  overflow-wrap: anywhere;
+}
+
+.recovery-pending-actions {
+  display: flex;
+  gap: var(--df-space-3);
+  margin-top: var(--df-space-2);
+}
+
+/* ---------- Run review card ---------- */
+
+.run-review-card {
+  display: flex;
+  flex-direction: column;
+  margin: var(--df-space-3) 0;
+  border: 1px solid var(--df-border);
+  border-radius: var(--df-radius-lg);
+  background: var(--df-surface);
+  flex-shrink: 0;
+}
+
+.run-review-header {
+  display: flex;
+  align-items: center;
+  gap: var(--df-space-3);
+  padding: var(--df-space-3) var(--df-space-4);
+}
+
+.run-review-header .codicon {
+  color: var(--vscode-descriptionForeground);
+}
+
+.run-review-title {
+  font-size: var(--df-font-label);
+  font-weight: 600;
+}
+
+.run-review-count {
+  font-size: var(--df-font-small);
+  color: var(--vscode-descriptionForeground);
+}
+
+.run-review-status {
+  flex: 0 0 auto;
+  min-width: 58px;
+  font-size: var(--df-font-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.run-review-modified {
+  color: var(--vscode-gitDecoration-modifiedResourceForeground, #e2c08d);
+}
+
+.run-review-added {
+  color: var(--vscode-gitDecoration-addedResourceForeground, #73c991);
+}
+
+.run-review-deleted {
+  color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c);
+}
+
 /* ---------- Plan task list (the plan card is the single task card) ---------- */
 
 .plan-card {
@@ -3892,10 +4059,12 @@ body.vscode-light .hljs-meta {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 23px;
+  gap: 4px;
   height: 24px;
+  padding: 0 6px;
   border-radius: 6px;
   color: var(--vscode-descriptionForeground);
+  font-size: 11px;
   transition: color 120ms ease, background 120ms ease;
 }
 

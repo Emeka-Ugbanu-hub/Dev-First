@@ -72,6 +72,28 @@ export interface RunOperation {
   status: RunOperationStatus;
   startedAt: number;
   finishedAt?: number;
+  beforeHash?: string;
+  afterHash?: string;
+  expected?: string;
+}
+
+export interface RunChangedFile {
+  path: string;
+  status: 'modified' | 'added' | 'deleted';
+}
+
+export interface RunProcessRecord {
+  id: string;
+  pid: number;
+  command: string;
+  cwd?: string;
+  startedAt: number;
+}
+
+export interface RunReviewFile {
+  path: string;
+  status: 'modified' | 'added' | 'deleted';
+  originalUri?: string;
 }
 
 export type PendingDecisionKind = 'terminal' | 'question';
@@ -107,6 +129,11 @@ export interface RunRecord {
   checkpointId?: string;
   workspaceHash: string;
   operations: RunOperation[];
+  changedFiles?: RunChangedFile[];
+  stepHashes?: string[];
+  reasoning?: string;
+  processes?: RunProcessRecord[];
+  browser?: { port: number; url?: string };
   pending?: PendingDecisionRecord;
   createdAt: number;
   updatedAt: number;
@@ -289,7 +316,7 @@ export interface UiState {
   model: string;
   pasteFileLines: number;
   queued?: QueuedPromptRecord[];
-  recovery?: { run: RunRecord };
+  recovery?: { run: RunRecord; runDrift?: boolean; processesAlive?: number[] };
 }
 
 export type WebviewMessage =
@@ -322,9 +349,10 @@ export type WebviewMessage =
   | { type: 'approvePlan' }
   | { type: 'discardPlan' }
   | { type: 'stop' }
-  | { type: 'resumeRun'; id: string }
+  | { type: 'resumeRun'; id: string; force?: boolean }
   | { type: 'discardRun'; id: string }
   | { type: 'rollbackRun'; id: string }
+  | { type: 'resolveRecoveredDecision'; runId: string; approved: boolean }
   | { type: 'newSession' }
   | { type: 'switchSession'; id: string }
   | { type: 'deleteSession'; id: string }
@@ -335,6 +363,12 @@ export type WebviewMessage =
   | { type: 'rejectAll' }
   | { type: 'openChange'; path: string; changeId?: string }
   | { type: 'openFileDiff'; path: string; runId: string }
+  | { type: 'openRunReview'; runId: string }
+  | { type: 'revertRunFile'; path: string; runId?: string }
+  | { type: 'acceptRunReview'; runId: string }
+  | { type: 'stopRunProcess'; runId: string; pid: number }
+  | { type: 'forgetRunProcess'; runId: string; pid: number }
+  | { type: 'forgetBrowser'; runId: string }
   | { type: 'explainChange'; path: string }
   | { type: 'acceptRun'; runId: string }
   | { type: 'rejectRun'; runId: string }
@@ -365,6 +399,7 @@ export type HostMessage =
   | { type: 'checkpoint'; messageId: string; checkpointId: string }
   | { type: 'activity'; messageId: string; activity: ToolActivity }
   | { type: 'changes'; changes: ChangeSummary[]; currentRunId?: string }
+  | { type: 'runReview'; runId: string; files: RunReviewFile[] }
   | { type: 'rejectConflict'; path: string }
   | {
       type: 'redoState';

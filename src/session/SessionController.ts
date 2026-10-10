@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { promises as fs } from 'fs';
+import { existsSync, promises as fs } from 'fs';
 import { DiffManager } from '../diff/DiffManager';
 import { AgentService } from '../agent/AgentService';
 import { ToolBox, ToolExecutionContext } from '../agent/ToolBox';
@@ -19,8 +19,10 @@ import {
   ProviderConnection,
   QueuedPromptRecord,
   QuestionRequest,
+  RunChangedFile,
   RunOperation,
   RunRecord,
+  RunReviewFile,
   RunStatus,
   SelectionContext,
   TerminalApprovalDecision,
@@ -47,6 +49,19 @@ import { HttpError } from '../llm/errors';
 import { adaptiveKind } from '../llm/adaptive';
 import { SessionStore, StoredSession } from './SessionStore';
 import { RunJournalStore } from './RunJournalStore';
+import {
+  FILE_EDIT_TOOLS,
+  absoluteWorkspacePath,
+  appendStepHash,
+  buildRunOperation,
+  classifyOperationRetry,
+  filterAlivePids,
+  parseOperationExpectations,
+  serializeOperationExpectations,
+  sha1File,
+  upsertRunChangedFile,
+  validateRecoveredDecision,
+} from './runRecovery';
 import { PromptFamily, promptFamilyFor } from '../planner/prompts';
 import { ReasoningOptions } from '../llm/types';
 import {
@@ -265,6 +280,8 @@ export class SessionController {
   private readonly runJournal: RunJournalStore;
   private currentRun: RunRecord | undefined;
   private recoveryRun: RunRecord | undefined;
+  private recoveryDrift = false;
+  private stepHashChain: Promise<void> = Promise.resolve();
   private runningQueued: { id: string; text: string; createdAt: number } | undefined;
   private disposed = false;
 
@@ -281,6 +298,7 @@ export class SessionController {
     this.connections = new ConnectionsStore(context.globalState);
     this.memory = new MemoryStore(workspaceRoot() ?? process.cwd(), context.globalStorageUri.fsPath);
     this.background = new BackgroundProcesses(workspaceRoot() ?? process.cwd());
+    this.background.onChange(() => this.refreshRunProcesses());
     this.store = new SessionStore(path.join(context.globalStorageUri.fsPath, 'sessions'));
     this.runJournal = new RunJournalStore(path.join(context.globalStorageUri.fsPath, 'runs'));
     void this.initializeSession();
@@ -337,8 +355,32 @@ export class SessionController {
       model: config.model,
       pasteFileLines: config.pasteFileLines,
       queued: this.queuedRecords(),
-      ...(this.recoveryRun ? { recovery: { run: this.recoveryRun } } : {}),
+      ...(this.recoveryRun
+        ? {
+            recovery: {
+              run: this.recoveryRun,
+              ...(this.recoveryDrift ? { runDrift: true } : {}),
+              ...this.recoveryProcessesAlive(),
+            },
+          }
+        : {}),
     };
+  }
+
+  private recoveryProcessesAlive(): { processesAlive?: number[] } {
+    const pids = (this.recoveryRun?.processes ?? []).map((entry) => entry.pid);
+    if (pids.length === 0) {
+      return {};
+    }
+    const alive = filterAlivePids(pids, (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    return alive.length > 0 ? { processesAlive: alive } : {};
   }
 
   private async initializeSession(): Promise<void> {
@@ -553,6 +595,7 @@ export class SessionController {
     this.runningQueued = undefined;
     this.currentRun = undefined;
     this.recoveryRun = undefined;
+    this.recoveryDrift = false;
     this.approvalMemory.clear();
     this.externalDirectories.clear();
     void this.context.workspaceState.update(ACTIVE_SESSION_KEY, this.sessionId);
@@ -970,13 +1013,25 @@ export class SessionController {
         this.stop();
         break;
       case 'resumeRun':
-        await this.resumeRun(message.id);
+        await this.resumeRun(message.id, message.force);
         break;
       case 'discardRun':
         await this.discardRun(message.id);
         break;
       case 'rollbackRun':
         await this.rollbackRun(message.id);
+        break;
+      case 'resolveRecoveredDecision':
+        await this.resolveRecoveredDecision(message.runId, message.approved);
+        break;
+      case 'stopRunProcess':
+        await this.stopRunProcess(message.runId, message.pid);
+        break;
+      case 'forgetRunProcess':
+        await this.forgetRunProcess(message.runId, message.pid);
+        break;
+      case 'forgetBrowser':
+        await this.forgetBrowser(message.runId);
         break;
       case 'newSession':
         this.newSession();
@@ -998,7 +1053,20 @@ export class SessionController {
         }
         break;
       case 'acceptRun':
-        await this.diffManager.acceptRun(message.runId);
+        if (await this.isRecoveredRun(message.runId)) {
+          await this.acceptRunReview(message.runId);
+        } else {
+          await this.diffManager.acceptRun(message.runId);
+        }
+        break;
+      case 'acceptRunReview':
+        await this.acceptRunReview(message.runId);
+        break;
+      case 'openRunReview':
+        await this.openRunReview(message.runId);
+        break;
+      case 'revertRunFile':
+        await this.revertRunFile(message.path, message.runId);
         break;
       case 'rejectRun':
         for (const conflictPath of await this.diffManager.rejectRun(message.runId)) {
@@ -1996,6 +2064,13 @@ export class SessionController {
     const registryInfo = this.registry.lookup(preset.provider, config.model);
     const catalogInfo = modelInfo(preset.id, config.model);
     const family = promptFamilyFor(preset.provider, config.model);
+    const executorReasoningSupported =
+      Boolean(catalogInfo?.reasoning) || (registryInfo?.supportsReasoning ?? false) ||
+      (this.selectedModelMetadata(preset.id, config.model, preset.provider).reasoningLevels?.length ?? 0) > 0;
+    const executorReasoning = this.reasoningOptions(executorReasoningSupported, preset.id);
+    const reasoningLabel = executorReasoning
+      ? executorReasoning.effort ?? (executorReasoning.enabled ? 'on' : 'off')
+      : undefined;
 
     await this.createCheckpoint(plan.title ?? 'run');
     this.diffManager.setRunContext({
@@ -2015,6 +2090,7 @@ export class SessionController {
         stepIndex: 0,
         completedSteps: [],
         operations: [],
+        ...(reasoningLabel ? { reasoning: reasoningLabel } : {}),
         ...(this.lastCheckpointId ? { checkpointId: this.lastCheckpointId } : {}),
         workspaceHash: this.lastCheckpointId ?? (await this.hashWorkspaceFiles()),
         createdAt: now,
@@ -2023,6 +2099,9 @@ export class SessionController {
     } else {
       if (!this.currentRun.checkpointId && this.lastCheckpointId) {
         this.currentRun.checkpointId = this.lastCheckpointId;
+      }
+      if (reasoningLabel && !this.currentRun.reasoning) {
+        this.currentRun.reasoning = reasoningLabel;
       }
       this.currentRun.updatedAt = now;
     }
@@ -2036,9 +2115,6 @@ export class SessionController {
     this.markRun('executing');
     this.abortController = new AbortController();
 
-    const executorReasoningSupported =
-      Boolean(catalogInfo?.reasoning) || (registryInfo?.supportsReasoning ?? false) ||
-      (this.selectedModelMetadata(preset.id, config.model, preset.provider).reasoningLevels?.length ?? 0) > 0;
     const agent = new AgentService(provider, config.model, this.buildToolbox(), {
       maxSteps: config.maxSteps,
       tools: registry.executor,
@@ -2047,7 +2123,7 @@ export class SessionController {
       autoCompact: config.autoCompact,
       contextLimitTokens: this.effectiveContextLimit(),
       parallelTools: config.parallelTools,
-      reasoning: this.reasoningOptions(executorReasoningSupported, preset.id),
+      reasoning: executorReasoning,
       resolveReasoning: () => this.reasoningOptions(executorReasoningSupported, preset.id),
       planFilePath: plan.filePath,
     });
@@ -2402,6 +2478,11 @@ export class SessionController {
         autoLaunch: config.browserAutoLaunch,
         profileDir: path.join(this.context.globalStorageUri.fsPath, 'browser-profile'),
       });
+      const run = this.currentRun;
+      if (run) {
+        run.browser = { port: config.browserPort };
+        void this.saveRunNow();
+      }
     }
     return this.browser;
   }
@@ -2424,7 +2505,7 @@ export class SessionController {
     const controller = this;
     class JournalToolBox extends ToolBox {
       async execute(name: string, argsJson: string, context: ToolExecutionContext): Promise<string> {
-        const operationId = controller.beginRunOperation(name, argsJson);
+        const operationId = await controller.beginRunOperation(name, argsJson);
         try {
           const result = await super.execute(name, argsJson, context);
           controller.finishRunOperation(operationId, !result.startsWith('Error:'));
@@ -2571,12 +2652,26 @@ export class SessionController {
   }
 
   private async openFileDiff(filePath: string, runId: string): Promise<void> {
-    if (!this.diffManager.hasDiffContent(runId, filePath)) {
-      void vscode.window.setStatusBarMessage('Dev-First: diff no longer available', 3000);
-      return;
-    }
     const root = workspaceRoot();
     if (!root) {
+      return;
+    }
+    if (!this.diffManager.hasDiffContent(runId, filePath)) {
+      const run = await this.loadAnyRun(runId);
+      const entry = run?.changedFiles?.find((file) => file.path === filePath);
+      if (!run?.checkpointId || !entry) {
+        void vscode.window.setStatusBarMessage('Dev-First: diff no longer available', 3000);
+        return;
+      }
+      const left =
+        entry.status === 'added'
+          ? OriginalContentProvider.emptyUri(filePath)
+          : OriginalContentProvider.checkpointUriFor(filePath, run.checkpointId);
+      const right =
+        entry.status === 'deleted'
+          ? OriginalContentProvider.emptyUri(filePath)
+          : vscode.Uri.file(path.join(root, filePath));
+      await vscode.commands.executeCommand('vscode.diff', left, right, `${path.basename(filePath)} (Dev-First)`);
       return;
     }
     const status = this.diffManager.runFiles(runId).find((file) => file.path === filePath)?.status ?? 'modified';
@@ -3145,7 +3240,18 @@ export class SessionController {
     await this.saveRun(run);
   }
 
+  private refreshRunProcesses(): void {
+    if (!this.currentRun) {
+      return;
+    }
+    void this.saveRunNow();
+  }
+
   private async saveRun(run: RunRecord): Promise<void> {
+    if (run === this.currentRun) {
+      const records = this.background.records();
+      run.processes = records.length > 0 ? records : undefined;
+    }
     run.updatedAt = Date.now();
     try {
       await this.runJournal.save(run);
@@ -3164,25 +3270,22 @@ export class SessionController {
       this.recoveryRun = run;
     } else if (this.recoveryRun?.id === run.id) {
       this.recoveryRun = undefined;
+      this.recoveryDrift = false;
     }
     if (status === 'completed' || status === 'stopped' || status === 'failed' || status === 'interrupted') {
       this.currentRun = undefined;
     }
   }
 
-  private beginRunOperation(tool: string, argsJson: string): string | undefined {
+  private async beginRunOperation(tool: string, argsJson: string): Promise<string | undefined> {
     const run = this.currentRun;
     if (!run || (run.status !== 'executing' && run.status !== 'waiting')) {
       return undefined;
     }
-    const target = this.operationTarget(argsJson);
-    const operation: RunOperation = {
-      id: randomId('op'),
-      tool,
-      status: 'started',
-      startedAt: Date.now(),
-      ...(target ? { target } : {}),
-    };
+    const operation = await buildRunOperation(tool, argsJson, workspaceRoot() ?? process.cwd());
+    if (!operation) {
+      return undefined;
+    }
     run.operations = [...run.operations, operation].slice(-500);
     run.activeTool = tool;
     run.updatedAt = Date.now();
@@ -3202,20 +3305,56 @@ export class SessionController {
     if (operation) {
       operation.status = ok ? 'succeeded' : 'failed';
       operation.finishedAt = Date.now();
+      if (ok) {
+        void this.captureOperationOutcome(run, operation);
+      }
     }
     run.activeTool = undefined;
     run.updatedAt = Date.now();
     void this.saveRunNow();
   }
 
-  private operationTarget(argsJson: string): string | undefined {
-    try {
-      const args = JSON.parse(argsJson) as Record<string, unknown>;
-      if (typeof args.path === 'string') return args.path;
-      if (typeof args.command === 'string') return args.command;
-      if (typeof args.directory === 'string') return args.directory;
-    } catch {}
-    return undefined;
+  private async captureOperationOutcome(run: RunRecord, operation: RunOperation): Promise<void> {
+    const root = workspaceRoot() ?? process.cwd();
+    if ((operation.tool === 'write_file' || operation.tool === 'edit_file') && operation.target) {
+      const afterHash = await sha1File(absoluteWorkspacePath(root, operation.target));
+      if (afterHash) {
+        operation.afterHash = afterHash;
+      }
+      if (afterHash && afterHash !== operation.beforeHash) {
+        run.changedFiles = upsertRunChangedFile(run.changedFiles, {
+          path: operation.target,
+          status: operation.beforeHash ? 'modified' : 'added',
+        });
+      }
+    } else if (operation.tool === 'apply_patch') {
+      const expectations = parseOperationExpectations(operation);
+      if (expectations.length === 0) {
+        return;
+      }
+      let changed = false;
+      for (const entry of expectations) {
+        const after = (await sha1File(absoluteWorkspacePath(root, entry.path))) ?? null;
+        entry.after = after;
+        entry.captured = true;
+        if (entry.status === 'deleted' ? entry.before !== null && after === null : after !== null && after !== entry.before) {
+          changed = true;
+        }
+      }
+      operation.expected = serializeOperationExpectations(expectations);
+      if (changed) {
+        for (const entry of expectations) {
+          run.changedFiles = upsertRunChangedFile(run.changedFiles, {
+            path: entry.path,
+            status: entry.status,
+          });
+        }
+      }
+    } else {
+      return;
+    }
+    run.updatedAt = Date.now();
+    await this.saveRun(run);
   }
 
   private setRunPending(pending: PendingDecisionRecord): void {
@@ -3266,6 +3405,18 @@ export class SessionController {
     run.stepIndex = active >= 0 ? active : this.todos.length;
     run.updatedAt = Date.now();
     void this.saveRunNow();
+    this.enqueueStepHash(run);
+  }
+
+  private enqueueStepHash(run: RunRecord): void {
+    this.stepHashChain = this.stepHashChain.then(async () => {
+      const hash = await this.hashWorkspaceFiles();
+      if (!hash || this.currentRun?.id !== run.id) {
+        return;
+      }
+      run.stepHashes = appendStepHash(run.stepHashes, hash);
+      await this.saveRun(run);
+    });
   }
 
   private async hashWorkspaceFiles(): Promise<string> {
@@ -3300,7 +3451,7 @@ export class SessionController {
         } catch {}
       }
     }
-    this.selectRecoveryRun(runs);
+    await this.selectRecoveryRun(runs);
   }
 
   private async loadRecoveryRun(): Promise<void> {
@@ -3310,26 +3461,99 @@ export class SessionController {
     } catch {
       runs = [];
     }
-    this.selectRecoveryRun(runs);
+    await this.selectRecoveryRun(runs);
   }
 
-  private selectRecoveryRun(runs: RunRecord[]): void {
+  private async selectRecoveryRun(runs: RunRecord[]): Promise<void> {
     this.recoveryRun = runs
       .filter((run) => run.sessionId === this.sessionId && run.status === 'interrupted')
       .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    this.recoveryDrift = false;
+    const stepHashes = this.recoveryRun?.stepHashes;
+    if (!stepHashes?.length) {
+      return;
+    }
+    const current = await this.hashWorkspaceFiles();
+    this.recoveryDrift = Boolean(current) && current !== stepHashes[stepHashes.length - 1];
   }
 
-  private async resumeRun(id: string): Promise<void> {
+  private async verifyStartedOperations(run: RunRecord): Promise<string | undefined> {
+    const root = workspaceRoot() ?? process.cwd();
+    for (const operation of run.operations) {
+      if (operation.status !== 'started') {
+        continue;
+      }
+      const outcome = await this.operationRetryOutcome(operation, root);
+      if (outcome === 'succeeded') {
+        operation.status = 'succeeded';
+        operation.finishedAt = Date.now();
+        continue;
+      }
+      if (outcome === 'failed') {
+        operation.status = 'failed';
+        operation.finishedAt = Date.now();
+        run.activeTool = undefined;
+        continue;
+      }
+      const expectations = parseOperationExpectations(operation);
+      if (expectations.length > 0) {
+        return expectations.map((entry) => entry.path).join(', ');
+      }
+      return operation.target || operation.tool;
+    }
+    return undefined;
+  }
+
+  private async operationRetryOutcome(operation: RunOperation, root: string): Promise<'succeeded' | 'failed' | 'uncertain'> {
+    const expectations = parseOperationExpectations(operation);
+    if (expectations.length > 0) {
+      let matchesAfter = expectations.every((entry) => entry.captured);
+      let matchesBefore = true;
+      for (const entry of expectations) {
+        const current = (await sha1File(absoluteWorkspacePath(root, entry.path))) ?? null;
+        if (current !== entry.after) {
+          matchesAfter = false;
+        }
+        if (current !== entry.before) {
+          matchesBefore = false;
+        }
+      }
+      if (matchesAfter) {
+        return 'succeeded';
+      }
+      return matchesBefore ? 'failed' : 'uncertain';
+    }
+    const currentHash =
+      operation.target && FILE_EDIT_TOOLS.has(operation.tool)
+        ? await sha1File(absoluteWorkspacePath(root, operation.target))
+        : undefined;
+    return classifyOperationRetry(operation, currentHash);
+  }
+
+  private async resumeRun(id: string, force?: boolean): Promise<void> {
+    void force;
     const run = await this.runJournal.load(id);
     if (!run || run.status !== 'interrupted') {
       this.addNotice('That run cannot be resumed.');
       return;
     }
-    if (run.activeTool) {
-      this.addNotice('That run was interrupted during a tool call. Review the workspace changes before continuing.');
+    const uncertainTarget = await this.verifyStartedOperations(run);
+    if (uncertainTarget) {
+      await this.saveRun(run);
+      if (this.recoveryRun?.id === run.id) {
+        this.recoveryRun = run;
+      }
+      this.addNotice(
+        `Cannot resume safely: the workspace state for ${uncertainTarget} is uncertain. Review the changes, then roll back or discard this run.`,
+      );
+      this.pushState();
       return;
     }
-    if (run.workspaceHash !== (await this.currentWorkspaceHash(run))) {
+    await this.saveRun(run);
+    if (this.recoveryRun?.id === run.id) {
+      this.recoveryRun = run;
+    }
+    if (!run.stepHashes?.length && run.workspaceHash !== (await this.currentWorkspaceHash(run))) {
       this.addNotice('The workspace changed since that run was interrupted. Start a new request instead.');
       return;
     }
@@ -3358,6 +3582,7 @@ export class SessionController {
     run.updatedAt = Date.now();
     this.currentRun = run;
     this.recoveryRun = undefined;
+    this.recoveryDrift = false;
     await this.saveRunNow();
     this.pushState();
     await this.startExecution(this.plan, provider, true);
@@ -3370,6 +3595,7 @@ export class SessionController {
     }
     if (this.recoveryRun?.id === id) {
       this.recoveryRun = undefined;
+      this.recoveryDrift = false;
     }
     this.pushState();
   }
@@ -3380,6 +3606,207 @@ export class SessionController {
       await this.revertToCheckpoint(run.checkpointId);
     }
     await this.discardRun(id);
+  }
+
+  private async loadAnyRun(runId: string): Promise<RunRecord | undefined> {
+    if (this.currentRun?.id === runId) {
+      return this.currentRun;
+    }
+    if (this.recoveryRun?.id === runId) {
+      return this.recoveryRun;
+    }
+    return this.runJournal.load(runId);
+  }
+
+  private async isRecoveredRun(runId: string): Promise<boolean> {
+    if (this.recoveryRun?.id === runId) {
+      return true;
+    }
+    if (this.diffManager.hasDiffContent(runId)) {
+      return false;
+    }
+    const run = await this.loadAnyRun(runId);
+    return Boolean(run?.changedFiles?.length);
+  }
+
+  async getRunReview(runId: string): Promise<RunReviewFile[] | undefined> {
+    const run = await this.loadAnyRun(runId);
+    if (!run) {
+      return undefined;
+    }
+    if (this.diffManager.hasDiffContent(runId)) {
+      return this.diffManager.runFiles(runId).map((file) => ({
+        path: file.path,
+        status: file.status,
+        originalUri: (
+          file.status === 'added'
+            ? OriginalContentProvider.emptyUri(file.path)
+            : OriginalContentProvider.uriFor(file.path, runId)
+        ).toString(),
+      }));
+    }
+    const changed = run.changedFiles ?? [];
+    return changed.map((file) => ({
+      path: file.path,
+      status: file.status,
+      ...(run.checkpointId
+        ? {
+            originalUri: (
+              file.status === 'added'
+                ? OriginalContentProvider.emptyUri(file.path)
+                : OriginalContentProvider.checkpointUriFor(file.path, run.checkpointId)
+            ).toString(),
+          }
+        : {}),
+    }));
+  }
+
+  private async openRunReview(runId: string): Promise<void> {
+    const files = await this.getRunReview(runId);
+    if (!files) {
+      this.addNotice('That run review is no longer available.');
+      return;
+    }
+    this.post({ type: 'runReview', runId, files });
+  }
+
+  private async acceptRunReview(runId: string): Promise<void> {
+    const run = await this.loadAnyRun(runId);
+    if (!run) {
+      return;
+    }
+    run.changedFiles = undefined;
+    run.updatedAt = Date.now();
+    await this.saveRun(run);
+    this.post({ type: 'runReview', runId, files: [] });
+    this.pushState();
+  }
+
+  private async revertRunFile(filePath: string, runId?: string): Promise<void> {
+    const run = runId ? await this.loadAnyRun(runId) : this.recoveryRun ?? this.currentRun;
+    if (!run) {
+      this.addNotice('No recovered run to revert in.');
+      return;
+    }
+    const entry = run.changedFiles?.find((file) => file.path === filePath);
+    if (!entry) {
+      this.addNotice(`${filePath} is not part of this run review.`);
+      return;
+    }
+    const root = workspaceRoot() ?? process.cwd();
+    if (entry.status === 'added') {
+      await fs.rm(absoluteWorkspacePath(root, filePath), { force: true }).catch(() => undefined);
+    } else if (run.checkpointId) {
+      const restored = await this.checkpoints.restoreFile(run.checkpointId, filePath);
+      if (!restored) {
+        this.addNotice(`Could not restore ${filePath} from the run checkpoint.`);
+        return;
+      }
+    } else {
+      await this.diffManager.revertWholeFile(filePath);
+    }
+    run.changedFiles = (run.changedFiles ?? []).filter((file) => file.path !== filePath);
+    run.updatedAt = Date.now();
+    await this.saveRun(run);
+    this.post({
+      type: 'runReview',
+      runId: run.id,
+      files: (run.changedFiles ?? []).map((file) => ({ path: file.path, status: file.status })),
+    });
+    this.pushState();
+  }
+
+  private async resolveRecoveredDecision(runId: string, approved: boolean): Promise<void> {
+    const run = await this.loadAnyRun(runId);
+    if (!run || run.status !== 'interrupted') {
+      this.addNotice('That run decision is no longer available.');
+      return;
+    }
+    const pending = run.pending;
+    if (!pending) {
+      this.addNotice('That decision is no longer pending.');
+      return;
+    }
+    if (!approved) {
+      run.pending = undefined;
+      run.status = 'stopped';
+      run.updatedAt = Date.now();
+      await this.saveRun(run);
+      if (this.currentRun?.id === run.id) {
+        this.currentRun = undefined;
+      }
+      if (this.recoveryRun?.id === run.id) {
+        this.recoveryRun = undefined;
+        this.recoveryDrift = false;
+      }
+      this.pushState();
+      return;
+    }
+    if (pending.kind === 'terminal') {
+      const command = (pending.command ?? '').trim();
+      const cwd = pending.cwd ?? '';
+      const valid = validateRecoveredDecision(
+        { kind: 'terminal', command },
+        { cwdExists: Boolean(cwd) && existsSync(cwd) },
+      );
+      if (!valid) {
+        this.addNotice('That command decision is no longer valid. Resume the run to approve it again.');
+        return;
+      }
+      this.approvalMemory.remember(command);
+    }
+    for (const operation of run.operations) {
+      if (operation.status === 'started' && operation.startedAt <= pending.createdAt) {
+        operation.status = 'failed';
+        operation.finishedAt = Date.now();
+      }
+    }
+    run.activeTool = undefined;
+    run.pending = undefined;
+    run.updatedAt = Date.now();
+    await this.saveRun(run);
+    if (this.recoveryRun?.id === run.id) {
+      this.recoveryRun = undefined;
+      this.recoveryDrift = false;
+    }
+    this.pushState();
+    await this.resumeRun(run.id);
+  }
+
+  private async stopRunProcess(runId: string, pid: number): Promise<void> {
+    try {
+      if (process.platform !== 'win32') {
+        process.kill(-pid, 'SIGTERM');
+      } else {
+        process.kill(pid, 'SIGTERM');
+      }
+    } catch {
+      try {
+        process.kill(pid, 'SIGTERM');
+      } catch {}
+    }
+    await this.forgetRunProcess(runId, pid);
+  }
+
+  private async forgetRunProcess(runId: string, pid: number): Promise<void> {
+    const run = await this.loadAnyRun(runId);
+    if (!run) {
+      return;
+    }
+    const remaining = (run.processes ?? []).filter((entry) => entry.pid !== pid);
+    run.processes = remaining.length > 0 ? remaining : undefined;
+    await this.saveRun(run);
+    this.pushState();
+  }
+
+  private async forgetBrowser(runId: string): Promise<void> {
+    const run = await this.loadAnyRun(runId);
+    if (!run) {
+      return;
+    }
+    run.browser = undefined;
+    await this.saveRun(run);
+    this.pushState();
   }
 
   private markStreamingInterrupted(): void {

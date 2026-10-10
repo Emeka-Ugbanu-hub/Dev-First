@@ -105,4 +105,48 @@ export class CheckpointManager {
 
     return `Restored ${snapshotFiles.size} files from checkpoint ${id}.`;
   }
+
+  async originalContent(id: string, relPath: string): Promise<string | undefined> {
+    if (!(await this.isGitRepo())) {
+      return undefined;
+    }
+    const ref = `refs/dev-first/checkpoints/${id}`;
+    try {
+      const { stdout } = await exec('git', ['show', `${ref}:${relPath}`], {
+        cwd: this.root,
+        maxBuffer: 50 * 1024 * 1024,
+      });
+      return stdout;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async restoreFile(id: string, relPath: string): Promise<boolean> {
+    if (!(await this.isGitRepo())) {
+      return false;
+    }
+    const ref = `refs/dev-first/checkpoints/${id}`;
+    try {
+      await exec('git', ['rev-parse', '--verify', ref], { cwd: this.root });
+    } catch {
+      return false;
+    }
+    await fs.mkdir(this.storageDir, { recursive: true });
+    const indexPath = path.join(this.storageDir, `restore-file-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const env = { ...process.env, GIT_INDEX_FILE: indexPath };
+    try {
+      await exec('git', ['read-tree', ref], { cwd: this.root, env });
+      await exec('git', ['checkout-index', '-f', '--', relPath], {
+        cwd: this.root,
+        env,
+        maxBuffer: 50 * 1024 * 1024,
+      });
+      return true;
+    } catch {
+      return false;
+    } finally {
+      await fs.rm(indexPath, { force: true }).catch(() => undefined);
+    }
+  }
 }

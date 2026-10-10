@@ -1,5 +1,6 @@
 import { ChildProcess, spawn } from 'child_process';
 import * as net from 'net';
+import { RunProcessRecord } from '../shared/protocol';
 
 export interface BackgroundEntry {
   id: string;
@@ -18,8 +19,13 @@ const DEFAULT_READY_TIMEOUT_MS = 30_000;
 
 export class BackgroundProcesses {
   private readonly entries = new Map<string, BackgroundEntry & { child?: ChildProcess }>();
+  private changeListener?: () => void;
 
   constructor(private readonly root: string) {}
+
+  onChange(callback: () => void): void {
+    this.changeListener = callback;
+  }
 
   async start(
     name: string,
@@ -46,6 +52,7 @@ export class BackgroundProcesses {
     });
     entry.child = child;
     this.entries.set(id, entry);
+    this.notifyChanged();
 
     const append = (chunk: Buffer) => {
       entry.output += chunk.toString('utf8');
@@ -58,10 +65,12 @@ export class BackgroundProcesses {
     child.on('exit', (code) => {
       entry.exitCode = code;
       entry.status = 'exited';
+      this.notifyChanged();
     });
     child.on('error', (error) => {
       entry.status = 'error';
       entry.output += `\n${error.message}`;
+      this.notifyChanged();
     });
 
     const ready = await this.waitForReady(entry, options);
@@ -81,6 +90,7 @@ export class BackgroundProcesses {
     };
     entry.child = child;
     this.entries.set(id, entry);
+    this.notifyChanged();
 
     const append = (chunk: Buffer) => {
       entry.output += chunk.toString('utf8');
@@ -93,13 +103,33 @@ export class BackgroundProcesses {
     child.on('exit', (code) => {
       entry.exitCode = code;
       entry.status = 'exited';
+      this.notifyChanged();
     });
     child.on('error', (error) => {
       entry.status = 'error';
       entry.output += `\n${error.message}`;
+      this.notifyChanged();
     });
 
     return id;
+  }
+
+  records(): RunProcessRecord[] {
+    const records: RunProcessRecord[] = [];
+    for (const entry of this.entries.values()) {
+      const pid = entry.child?.pid;
+      if (!pid || entry.status === 'exited' || entry.status === 'error') {
+        continue;
+      }
+      records.push({
+        id: entry.id,
+        pid,
+        command: entry.command,
+        cwd: this.root,
+        startedAt: entry.startedAt,
+      });
+    }
+    return records;
   }
 
   list(): string {
@@ -151,6 +181,7 @@ export class BackgroundProcesses {
         entry.child.kill('SIGTERM');
       }
       entry.status = 'exited';
+      this.notifyChanged();
     }
     return `Stopped "${entry.name}" (${entry.id}).`;
   }
@@ -160,6 +191,13 @@ export class BackgroundProcesses {
       entry.child?.kill('SIGTERM');
     }
     this.entries.clear();
+    this.notifyChanged();
+  }
+
+  private notifyChanged(): void {
+    try {
+      this.changeListener?.();
+    } catch {}
   }
 
   private find(id: string): (BackgroundEntry & { child?: ChildProcess }) | undefined {

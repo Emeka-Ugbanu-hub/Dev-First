@@ -232,15 +232,15 @@ export function InputBox({
                     aria-label="Edit this queued prompt"
                     onClick={() => onEditQueued(message)}
                   >
-                    <span className="codicon codicon-edit" />
+                    <span className="codicon codicon-edit" /> Edit
                   </button>
                   <button
                     className="queued-prompt-action"
-                    title="Delete this queued prompt"
-                    aria-label="Delete this queued prompt"
+                    title="Discard this queued prompt"
+                    aria-label="Discard this queued prompt"
                     onClick={() => onCancelQueued(message.id)}
                   >
-                    <span className="codicon codicon-trash" />
+                    <span className="codicon codicon-trash" /> Discard
                   </button>
                 </div>
                 {recovered && (

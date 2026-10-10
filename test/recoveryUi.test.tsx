@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, createElement, type ReactElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import type { RunRecord, UiMessage } from '../src/shared/protocol';
+import type { RunRecord, RunReviewFile, UiMessage } from '../src/shared/protocol';
 
 const sent = vi.hoisted(() => [] as Array<Record<string, unknown>>);
 
@@ -14,6 +14,8 @@ vi.mock('../webview/src/vscode', () => ({
 }));
 
 import { RecoveryCard } from '../webview/src/components/RecoveryCard';
+import { RunReviewCard } from '../webview/src/components/RunReviewCard';
+import { InputBox } from '../webview/src/components/InputBox';
 import { MessageBubble } from '../webview/src/components/MessageBubble';
 import { queueStatusLabel } from '../webview/src/lib/queueStatus';
 
@@ -103,17 +105,107 @@ describe('RecoveryCard', () => {
     expect(element.textContent).not.toContain('Roll back');
   });
 
-  it('shows the pending decision with a re-approval note', () => {
+  it('renders the pending decision with approve and deny', () => {
     const element = mount(
       createElement(RecoveryCard, {
         run: runRecord({
-          pending: { id: 'p1', kind: 'terminal', prompt: 'npm test', createdAt: 3 },
+          pending: {
+            id: 'p1',
+            kind: 'terminal',
+            prompt: 'npm test',
+            command: 'npm test -- --run',
+            cwd: '/repo',
+            createdAt: 3,
+          },
         }),
         onDismiss: () => undefined,
       }),
     );
     expect(element.textContent).toContain('Waiting on: npm test');
-    expect(element.textContent).toContain('re-approval will be requested when you resume');
+    expect(element.textContent).toContain('npm test -- --run');
+    expect(element.textContent).toContain('/repo');
+    expect(element.textContent).toContain('Re-validated before running.');
+    click(button(element, 'Approve'));
+    click(button(element, 'Deny'));
+    expect(sent).toEqual([
+      { type: 'resolveRecoveredDecision', runId: 'run1', approved: true },
+      { type: 'resolveRecoveredDecision', runId: 'run1', approved: false },
+    ]);
+  });
+
+  it('shows reasoning in the meta line when present', () => {
+    const element = mount(
+      createElement(RecoveryCard, { run: runRecord({ reasoning: 'high' }), onDismiss: () => undefined }),
+    );
+    expect(element.textContent).toContain('reasoning high');
+  });
+
+  it('warns about workspace drift', () => {
+    const element = mount(
+      createElement(RecoveryCard, { run: runRecord(), runDrift: true, onDismiss: () => undefined }),
+    );
+    expect(element.textContent).toContain('Workspace changed since the last step');
+  });
+
+  it('posts openRunReview when recovered changes exist', () => {
+    const element = mount(
+      createElement(RecoveryCard, {
+        run: runRecord({ changedFiles: [{ path: 'src/a.ts', status: 'modified' }] }),
+        onDismiss: () => undefined,
+      }),
+    );
+    click(button(element, 'Review changes'));
+    expect(sent).toEqual([{ type: 'openRunReview', runId: 'run1' }]);
+  });
+
+  it('hides the review button without recovered changes', () => {
+    const element = mount(createElement(RecoveryCard, { run: runRecord(), onDismiss: () => undefined }));
+    expect(element.textContent).not.toContain('Review changes');
+  });
+
+  it('renders external processes with liveness and posts stop or forget', () => {
+    const element = mount(
+      createElement(RecoveryCard, {
+        run: runRecord({
+          processes: [
+            { id: 'bg1', pid: 111, command: 'npm run dev', startedAt: 1 },
+            { id: 'bg2', pid: 222, command: 'node server.js', startedAt: 2 },
+          ],
+        }),
+        processesAlive: [222],
+        onDismiss: () => undefined,
+      }),
+    );
+    expect(element.textContent).toContain('External processes');
+    expect(element.textContent).toContain('npm run dev (pid 111)');
+    expect(element.textContent).toContain('node server.js (pid 222)');
+    const dots = element.querySelectorAll('.recovery-process-dot');
+    expect(dots).toHaveLength(2);
+    expect(dots[0].className).toContain('gone');
+    expect(dots[1].className).toContain('alive');
+    click(button(element, 'Stop'));
+    click(button(element, 'Forget'));
+    expect(sent).toEqual([
+      { type: 'stopRunProcess', runId: 'run1', pid: 111 },
+      { type: 'forgetRunProcess', runId: 'run1', pid: 111 },
+    ]);
+  });
+
+  it('renders the browser session and posts forgetBrowser', () => {
+    const element = mount(
+      createElement(RecoveryCard, {
+        run: runRecord({ browser: { port: 9222 } }),
+        onDismiss: () => undefined,
+      }),
+    );
+    expect(element.textContent).toContain('Browser session on port 9222');
+    click(button(element, 'Forget'));
+    expect(sent).toEqual([{ type: 'forgetBrowser', runId: 'run1' }]);
+  });
+
+  it('notes uncertain MCP requests', () => {
+    const element = mount(createElement(RecoveryCard, { run: runRecord(), onDismiss: () => undefined }));
+    expect(element.textContent).toContain('Any in-flight MCP requests are marked uncertain');
   });
 
   it('calls onDismiss when dismissed', () => {
@@ -121,6 +213,101 @@ describe('RecoveryCard', () => {
     const element = mount(createElement(RecoveryCard, { run: runRecord(), onDismiss }));
     click(element.querySelector('.recovery-dismiss')!);
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('RunReviewCard', () => {
+  const files: RunReviewFile[] = [
+    { path: 'src/a.ts', status: 'modified' },
+    { path: 'src/b.ts', status: 'added' },
+    { path: 'src/c.ts', status: 'deleted' },
+  ];
+
+  it('renders files with status chips', () => {
+    const element = mount(createElement(RunReviewCard, { runId: 'run1', files }));
+    expect(element.textContent).toContain('src/a.ts');
+    expect(element.textContent).toContain('src/b.ts');
+    expect(element.textContent).toContain('src/c.ts');
+    expect(element.querySelector('.run-review-modified')?.textContent).toBe('modified');
+    expect(element.querySelector('.run-review-added')?.textContent).toBe('added');
+    expect(element.querySelector('.run-review-deleted')?.textContent).toBe('deleted');
+  });
+
+  it('posts openFileDiff, revertRunFile, and acceptRunReview', () => {
+    const element = mount(createElement(RunReviewCard, { runId: 'run1', files }));
+    click(button(element, 'src/a.ts'));
+    click(element.querySelector('button[aria-label="Revert src/a.ts"]')!);
+    click(button(element, 'Accept all'));
+    expect(sent).toEqual([
+      { type: 'openFileDiff', path: 'src/a.ts', runId: 'run1' },
+      { type: 'revertRunFile', path: 'src/a.ts', runId: 'run1' },
+      { type: 'acceptRunReview', runId: 'run1' },
+    ]);
+  });
+
+  it('renders nothing without files', () => {
+    const element = mount(createElement(RunReviewCard, { runId: 'run1', files: [] }));
+    expect(element.querySelector('.run-review-card')).toBeNull();
+  });
+});
+
+describe('queued prompt actions', () => {
+  function inputBox(overrides: Record<string, unknown> = {}) {
+    return createElement(InputBox, {
+      phase: 'executing',
+      hasPlan: true,
+      connected: true,
+      selection: null,
+      commands: [],
+      files: [],
+      quote: null,
+      images: [],
+      sessions: [],
+      autoApproveTerminal: false,
+      supportsVision: true,
+      visionSupportKnown: true,
+      reasoningEffort: 'off',
+      modelName: 'gpt-4o',
+      modelId: 'gpt-4o',
+      modelPreset: 'openai',
+      reasoningLevels: [],
+      queuedMessages: [{ id: 'q1', role: 'user', text: 'follow up', queued: true }],
+      queuedRecords: [{ id: 'q1', text: 'follow up', status: 'queued', createdAt: 1 }],
+      enhanced: null,
+      prefill: null,
+      pasteFileLines: 120,
+      onImagesChange: () => undefined,
+      onToggleAutoApprove: () => undefined,
+      onOpenModelPicker: () => undefined,
+      onSend: () => undefined,
+      onEditQueued: () => undefined,
+      onCancelQueued: () => undefined,
+      onStop: () => undefined,
+      onDismissSelection: () => undefined,
+      onDismissQuote: () => undefined,
+      onEnhance: () => undefined,
+      ...overrides,
+    } as never);
+  }
+
+  it('edits a queued prompt through the edit callback', () => {
+    const onEditQueued = vi.fn();
+    const element = mount(inputBox({ onEditQueued }));
+    click(button(element, 'Edit'));
+    expect(onEditQueued).toHaveBeenCalledTimes(1);
+    expect((onEditQueued.mock.calls[0][0] as UiMessage).id).toBe('q1');
+  });
+
+  it('discards a queued prompt through the cancel callback', () => {
+    const onCancelQueued = vi.fn();
+    const element = mount(inputBox({ onCancelQueued }));
+    click(button(element, 'Discard'));
+    expect(onCancelQueued).toHaveBeenCalledWith('q1');
+  });
+
+  it('prefills the composer with the queued prompt text', () => {
+    const element = mount(inputBox({ prefill: { text: 'follow up', nonce: 42 } }));
+    expect(element.querySelector('textarea')?.value).toBe('follow up');
   });
 });
 

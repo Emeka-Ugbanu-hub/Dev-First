@@ -4,6 +4,7 @@ import type {
   HostMessage,
   ModelMetadata,
   Phase,
+  RunReviewFile,
   SessionSummary,
   ToolActivity,
   UiState,
@@ -27,6 +28,7 @@ import { StatusRow } from './components/StatusRow';
 import { TranscriptSearch } from './components/TranscriptSearch';
 import { PromptRail } from './components/PromptRail';
 import { RecoveryCard } from './components/RecoveryCard';
+import { RunReviewCard } from './components/RunReviewCard';
 import { appendDelta } from '../../src/shared/stream';
 import { buildSearchPattern, collectSearchTexts } from './lib/search';
 import { shouldFollow } from './lib/scroll';
@@ -119,6 +121,7 @@ export default function App() {
   const [enhanced, setEnhanced] = useState<{ text: string; nonce: number } | null>(null);
   const [prefill, setPrefill] = useState<{ text: string; nonce: number } | null>(null);
   const [dismissedRecovery, setDismissedRecovery] = useState<string | null>(null);
+  const [runReview, setRunReview] = useState<{ runId: string; files: RunReviewFile[] } | null>(null);
   const [learnMoreOpen, setLearnMoreOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsValues, setSettingsValues] = useState<Record<string, unknown>>({});
@@ -255,6 +258,10 @@ export default function App() {
       if (message.type === 'redoState') {
         setCanRedo(message.canRedo);
         setRevertFiles(message.files ?? []);
+        return;
+      }
+      if (message.type === 'runReview') {
+        setRunReview(message.files.length > 0 ? { runId: message.runId, files: message.files } : null);
         return;
       }
       if (message.type === 'suggestion') {
@@ -470,6 +477,7 @@ export default function App() {
     setSearchOpen(false);
     setSearchQuery('');
     setInlinePlanAnchor(null);
+    setRunReview(null);
   }, [activeSessionId]);
 
   const searchTargets = useMemo(() => {
@@ -819,8 +827,14 @@ export default function App() {
             </button>
           )}
           {state.recovery && dismissedRecovery !== recoveryKey && (
-            <RecoveryCard run={state.recovery.run} onDismiss={() => setDismissedRecovery(recoveryKey)} />
+            <RecoveryCard
+              run={state.recovery.run}
+              runDrift={state.recovery.runDrift}
+              processesAlive={state.recovery.processesAlive}
+              onDismiss={() => setDismissedRecovery(recoveryKey)}
+            />
           )}
+          {runReview && <RunReviewCard runId={runReview.runId} files={runReview.files} />}
           <ChatRenderBoundary key={activeSessionId}>
             <ChatView
               messages={visibleMessages}
