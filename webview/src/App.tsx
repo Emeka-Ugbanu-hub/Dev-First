@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   CommandInfo,
   HostMessage,
@@ -26,6 +26,7 @@ import { SuggestionBar } from './components/SuggestionBar';
 import { StatusRow } from './components/StatusRow';
 import { TranscriptSearch } from './components/TranscriptSearch';
 import { PromptRail } from './components/PromptRail';
+import { RecoveryCard } from './components/RecoveryCard';
 import { appendDelta } from '../../src/shared/stream';
 import { buildSearchPattern, collectSearchTexts } from './lib/search';
 import { shouldFollow } from './lib/scroll';
@@ -112,10 +113,12 @@ export default function App() {
   const [showScrollTop, setShowScrollTop] = useState(false);
   const [announcement, setAnnouncement] = useState('');
   const streamingId = useRef<string | null>(null);
+  const sessionQueuedIds = useRef(new Set<string>());
   const pendingStreamDeltas = useRef(new Map<string, { text: string; reasoning: string }>());
   const streamFrame = useRef<number | null>(null);
   const [enhanced, setEnhanced] = useState<{ text: string; nonce: number } | null>(null);
   const [prefill, setPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  const [dismissedRecovery, setDismissedRecovery] = useState<string | null>(null);
   const [learnMoreOpen, setLearnMoreOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsValues, setSettingsValues] = useState<Record<string, unknown>>({});
@@ -130,6 +133,18 @@ export default function App() {
   const modelsByProviderRef = useRef<Record<string, string[]>>({});
   const transcriptMessages = useMemo(() => state.messages.filter((message) => !message.queued), [state.messages]);
   const queuedMessages = useMemo(() => state.messages.filter((message) => message.queued), [state.messages]);
+  const recoveredQueueIds = useMemo(
+    () =>
+      (state.queued ?? [])
+        .filter((record) => record.status === 'queued' && !sessionQueuedIds.current.has(record.id))
+        .map((record) => record.id),
+    [state.queued],
+  );
+  const recoveryKey = state.recovery ? `${state.recovery.run.id}:${state.recovery.run.updatedAt}` : null;
+  const continueInterrupted = useCallback(
+    () => setPrefill({ text: 'Continue from where you stopped.', nonce: Date.now() }),
+    [],
+  );
   const visibleStart = visibleRange?.start ?? Math.max(0, transcriptMessages.length - PAGE_SIZE);
   const visibleEnd = visibleRange?.end ?? transcriptMessages.length;
   const visibleMessages = useMemo(
@@ -267,6 +282,9 @@ export default function App() {
           setStatus({ id: message.id, text: message.text, tone: message.tone ?? 'progress' });
         }
         return;
+      }
+      if (message.type === 'addMessage' && message.message.queued) {
+        sessionQueuedIds.current.add(message.message.id);
       }
       setState((previous) => applyHostMessage(previous, message));
     };
@@ -800,6 +818,9 @@ export default function App() {
               <span className="codicon codicon-arrow-up" /> Load earlier ({hiddenCount} more)
             </button>
           )}
+          {state.recovery && dismissedRecovery !== recoveryKey && (
+            <RecoveryCard run={state.recovery.run} onDismiss={() => setDismissedRecovery(recoveryKey)} />
+          )}
           <ChatRenderBoundary key={activeSessionId}>
             <ChatView
               messages={visibleMessages}
@@ -811,6 +832,9 @@ export default function App() {
               planAnchor={inlinePlanAnchor}
               onApprove={() => post({ type: 'approvePlan' })}
               viewableRuns={state.viewableRuns}
+              queuedRecords={state.queued}
+              recoveredQueueIds={recoveredQueueIds}
+              onContinueInterrupted={continueInterrupted}
             />
           </ChatRenderBoundary>
           {status && <StatusRow text={status.text} tone={status.tone} />}
@@ -885,6 +909,8 @@ export default function App() {
             modelPreset={state.connection.preset}
             reasoningLevels={state.reasoningLevels ?? []}
             queuedMessages={queuedMessages}
+            queuedRecords={state.queued}
+            recoveredQueueIds={recoveredQueueIds}
             enhanced={enhanced}
             prefill={prefill}
             pasteFileLines={state.pasteFileLines}

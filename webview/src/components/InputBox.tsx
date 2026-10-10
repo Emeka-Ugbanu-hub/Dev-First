@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import type { CommandInfo, Phase, SelectionContext, SessionSummary, UiMessage } from '../../../src/shared/protocol';
+import type { CommandInfo, Phase, QueuedPromptRecord, SelectionContext, SessionSummary, UiMessage } from '../../../src/shared/protocol';
 import { slashQuery } from '../lib/commands';
 import { mentionQuery } from '../lib/mentions';
 import { PasteChip, createPasteChip, expandPastes, removeMarker, shouldCollapsePaste, shouldSavePasteFile } from '../lib/paste';
+import { queueStatusLabel } from '../lib/queueStatus';
 import { randomId } from '../lib/random';
 import { isEscapeKey, useOverlayDismiss } from '../lib/overlays';
 import { SlashMenu } from './SlashMenu';
@@ -29,6 +30,8 @@ export function InputBox({
   modelPreset,
   reasoningLevels,
   queuedMessages,
+  queuedRecords,
+  recoveredQueueIds,
   enhanced,
   prefill,
   pasteFileLines,
@@ -61,6 +64,8 @@ export function InputBox({
   modelPreset: string;
   reasoningLevels: string[];
   queuedMessages: UiMessage[];
+  queuedRecords?: QueuedPromptRecord[];
+  recoveredQueueIds?: string[];
   enhanced: { text: string; nonce: number } | null;
   prefill: { text: string; nonce: number } | null;
   pasteFileLines: number;
@@ -206,30 +211,46 @@ export function InputBox({
     <div className="input-area" ref={areaRef}>
       {queuedMessages.length > 0 && (
         <div className="queued-prompts" aria-label="Queued prompts">
-          {queuedMessages.map((message) => (
-            <div className="queued-prompt" key={message.id}>
-              <span className="codicon codicon-reply queued-prompt-mark" aria-hidden="true" />
-              <span className="queued-prompt-text" title={message.text}>{message.text}</span>
-              <div className="queued-prompt-actions">
-                <button
-                  className="queued-prompt-action"
-                  title="Edit this queued prompt"
-                  aria-label="Edit this queued prompt"
-                  onClick={() => onEditQueued(message)}
-                >
-                  <span className="codicon codicon-edit" />
-                </button>
-                <button
-                  className="queued-prompt-action"
-                  title="Delete this queued prompt"
-                  aria-label="Delete this queued prompt"
-                  onClick={() => onCancelQueued(message.id)}
-                >
-                  <span className="codicon codicon-trash" />
-                </button>
+          {queuedMessages.map((message) => {
+            const record = queuedRecords?.find((candidate) => candidate.id === message.id);
+            const status = record?.status ?? 'queued';
+            const label = queueStatusLabel(status);
+            const recovered = (recoveredQueueIds?.includes(message.id) ?? false) && status === 'queued';
+            return (
+              <div className="queued-prompt" key={message.id}>
+                <span className="codicon codicon-reply queued-prompt-mark" aria-hidden="true" />
+                <span className="queued-prompt-text" title={message.text}>{message.text}</span>
+                {label !== null && (
+                  <span className={`queue-status-chip queue-status-${status}`}>
+                    <span className="codicon codicon-clock" /> {label}
+                  </span>
+                )}
+                <div className="queued-prompt-actions">
+                  <button
+                    className="queued-prompt-action"
+                    title="Edit this queued prompt"
+                    aria-label="Edit this queued prompt"
+                    onClick={() => onEditQueued(message)}
+                  >
+                    <span className="codicon codicon-edit" />
+                  </button>
+                  <button
+                    className="queued-prompt-action"
+                    title="Delete this queued prompt"
+                    aria-label="Delete this queued prompt"
+                    onClick={() => onCancelQueued(message.id)}
+                  >
+                    <span className="codicon codicon-trash" />
+                  </button>
+                </div>
+                {recovered && (
+                  <div className="queue-recovered-hint queued-prompt-recovered">
+                    Recovered — won't run automatically.
+                  </div>
+                )}
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
       {quote && (

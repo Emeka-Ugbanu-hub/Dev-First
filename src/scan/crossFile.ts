@@ -11,7 +11,6 @@ import type {
   HttpClientRecord,
   ListenerRecord,
   ModuleCacheRecord,
-  StorageKeyRecord,
   TypeRecord,
 } from './duplication';
 
@@ -33,6 +32,8 @@ export interface CrossFileFinding {
   file: string;
   line: number;
   related: CrossFileRelated[];
+  confidence?: 'high' | 'medium' | 'low';
+  evidence?: Array<{ path: string; line: number }>;
 }
 
 interface GraphEdge {
@@ -62,9 +63,52 @@ const ENTRY_NAMES = new Set([
   'module',
   'd',
 ]);
-const FEATURE_FLAG = /^(is[A-Z]|enable|FF_|FEATURE_)/;
 const HIGH_FANOUT = 8;
 const LOW_FANOUT = 2;
+
+// These names are commonly scoped to a component/module. Matching them across
+// files is not evidence that the declarations describe one shared contract.
+const GENERIC_TYPE_NAMES = new Set([
+  'Props',
+  'Options',
+  'Config',
+  'Settings',
+  'State',
+  'Context',
+  'Result',
+  'Response',
+  'Request',
+  'Params',
+  'Payload',
+  'Data',
+  'Error',
+]);
+
+const GENERIC_FUNCTION_NAMES = new Set([
+  'get',
+  'fetch',
+  'load',
+  'create',
+  'build',
+  'add',
+  'remove',
+  'update',
+  'handle',
+  'render',
+  'run',
+  'init',
+]);
+
+function sameDirectory(left: string, right: string): boolean {
+  const clean = (file: string): string => file.replace(/\/[^/]*$/, '');
+  return clean(left) === clean(right);
+}
+
+function likelyNonProductionFile(file: string): boolean {
+  return /(?:^|\/)(?:test|tests|__tests__|spec|specs|fixtures?|mocks?|samples?|examples?|docs?)(?:\/|\.|$)/i.test(
+    file,
+  );
+}
 
 export function shortName(file: string): string {
   const clean = file.replace(/^file:\/\//, '').replace(/\/+$/, '');
@@ -1046,60 +1090,12 @@ export function findCoverageAsymmetry(index: CrossFileIndex): CrossFileFinding[]
   return findings.sort((a, b) => a.file.localeCompare(b.file));
 }
 
-function flagName(constant: ConstantRecord): string | undefined {
-  if (FEATURE_FLAG.test(constant.name)) {
-    return constant.name;
-  }
-  if (FEATURE_FLAG.test(constant.value)) {
-    return constant.value;
-  }
-  return undefined;
-}
-
 export function findStaleFeatureFlags(index: CrossFileIndex): CrossFileFinding[] {
-  if (index.files.length < 20) {
-    return [];
-  }
-  const counts = new Map<string, Set<string>>();
-  const candidates: Array<{ file: string; constant: ConstantRecord }> = [];
-  for (const file of index.files) {
-    for (const constant of file.constants) {
-      const flag = flagName(constant);
-      if (!flag) {
-        continue;
-      }
-      let set = counts.get(flag);
-      if (!set) {
-        set = new Set();
-        counts.set(flag, set);
-      }
-      set.add(file.file);
-      candidates.push({ file: file.file, constant });
-    }
-  }
-  const findings: CrossFileFinding[] = [];
-  const emitted = new Set<string>();
-  for (const { file, constant } of candidates) {
-    const flag = flagName(constant);
-    if (!flag || (counts.get(flag)?.size ?? 0) > 1) {
-      continue;
-    }
-    const key = `${file}\u0000${flag}`;
-    if (emitted.has(key)) {
-      continue;
-    }
-    emitted.add(key);
-    findings.push({
-      ruleId: 'xf-stale-feature-flags',
-      category: 'smell',
-      severity: 'info',
-      message: `Feature flag "${flag}" is referenced in only one file`,
-      file,
-      line: constant.line,
-      related: [],
-    });
-  }
-  return findings;
+  // A flag used in one file is not evidence that it is stale. It may be a
+  // deliberately local rollout, an entry-point switch, or a flag consumed by
+  // configuration outside the indexed workspace. Until we track references
+  // and lifecycle metadata, stay silent rather than guess.
+  return [];
 }
 
 function signatureParam(param: string): string {
@@ -1125,6 +1121,9 @@ export function findSignatureDrift(index: CrossFileIndex): CrossFileFinding[] {
       if (!fn.exported || !fn.name) {
         continue;
       }
+      if (GENERIC_FUNCTION_NAMES.has(fn.name.toLowerCase())) {
+        continue;
+      }
       const list = byName.get(fn.name);
       if (list) {
         list.push({ file: file.file, fn });
@@ -1140,7 +1139,10 @@ export function findSignatureDrift(index: CrossFileIndex): CrossFileFinding[] {
     }
     for (const entry of entries) {
       const sibling = entries.find(
-        (other) => other.file !== entry.file && signatureDrift(entry.fn, other.fn),
+        (other) =>
+          other.file !== entry.file &&
+          sameDirectory(entry.file, other.file) &&
+          signatureDrift(entry.fn, other.fn),
       );
       if (!sibling) {
         continue;
@@ -1172,7 +1174,11 @@ export function findDuplicateTypeDefinitions(index: CrossFileIndex): CrossFileFi
   const byName = new Map<string, Array<{ file: string; type: TypeRecord }>>();
   for (const file of index.files) {
     for (const type of file.types ?? []) {
-      if (type.name.length < 4 || /^[A-Z]$/.test(type.name)) {
+      if (
+        type.name.length < 4 ||
+        /^[A-Z]$/.test(type.name) ||
+        GENERIC_TYPE_NAMES.has(type.name)
+      ) {
         continue;
       }
       const list = byName.get(type.name);
@@ -1194,8 +1200,19 @@ export function findDuplicateTypeDefinitions(index: CrossFileIndex): CrossFileFi
     if (byFile.size < 2) {
       continue;
     }
+    // A private type with no cross-file contract is normally component-local.
+    // Keep this rule for exported declarations, where a shared contract is
+    // observable and worth reviewing.
+    if (![...byFile.values()].some((type) => type.exported)) {
+      continue;
+    }
     for (const [file, type] of byFile) {
-      const others = [...byFile.entries()].filter(([other]) => other !== file);
+      const others = [...byFile.entries()].filter(
+        ([other]) => other !== file && sameDirectory(other, file),
+      );
+      if (others.length === 0) {
+        continue;
+      }
       findings.push({
         ruleId: 'xf-duplicate-types',
         category: 'smell',
@@ -1233,6 +1250,14 @@ export function findInterfaceImplementationDrift(index: CrossFileIndex): CrossFi
   }
   const findings: CrossFileFinding[] = [];
   for (const [name, declarations] of interfaces) {
+    // If the same interface name is declared in multiple modules, we cannot
+    // resolve which declaration a class implements from facts alone. Reporting
+    // the union of all methods would create a false positive, so require one
+    // unambiguous declaration until symbol resolution is available.
+    const declarationFiles = new Set(declarations.map((entry) => entry.file));
+    if (declarationFiles.size !== 1) {
+      continue;
+    }
     const implementations = classes.filter((entry) => entry.type.implements.includes(name));
     if (implementations.length === 0) {
       continue;
@@ -1294,7 +1319,10 @@ export function findDivergentConstants(index: CrossFileIndex): CrossFileFinding[
       }
       emitted.add(key);
       const others = entries.filter(
-        (other) => other.file !== entry.file && other.constant.value !== entry.constant.value,
+        (other) =>
+          other.file !== entry.file &&
+          sameDirectory(other.file, entry.file) &&
+          other.constant.value !== entry.constant.value,
       );
       if (others.length === 0) {
         continue;
@@ -1375,7 +1403,15 @@ export function findDuplicateHttpClients(index: CrossFileIndex): CrossFileFindin
       continue;
     }
     for (const [file, client] of byFile) {
-      const others = [...byFile.entries()].filter(([other]) => other !== file);
+      const others = [...byFile.entries()].filter(
+        ([other, otherClient]) =>
+          other !== file &&
+          otherClient.name === client.name &&
+          sameDirectory(other, file),
+      );
+      if (others.length === 0) {
+        continue;
+      }
       findings.push({
         ruleId: 'xf-duplicate-http-clients',
         category: 'smell',
@@ -1507,14 +1543,16 @@ function findMissingSiblingFlag(
   }
   const findings: CrossFileFinding[] = [];
   for (const entries of groups.values()) {
-    const flagged = entries.filter((entry) => entry.handler[flag]);
-    const flaggedFiles = new Set(flagged.map((entry) => entry.file));
-    if (flaggedFiles.size < minSiblings) {
-      continue;
-    }
     const emitted = new Set<string>();
     for (const entry of entries) {
       if (entry.handler[flag] || emitted.has(entry.file)) {
+        continue;
+      }
+      const flagged = entries.filter(
+        (other) => other.handler[flag] && sameDirectory(other.file, entry.file),
+      );
+      const flaggedFiles = new Set(flagged.map((other) => other.file));
+      if (flaggedFiles.size < minSiblings) {
         continue;
       }
       emitted.add(entry.file);
@@ -1631,8 +1669,17 @@ export function findDuplicatedSecretsAcrossFiles(index: CrossFileIndex): CrossFi
     if (byFile.size < 2) {
       continue;
     }
+    const productionFiles = [...byFile.keys()].filter((file) => !likelyNonProductionFile(file));
+    if (productionFiles.length < 2) {
+      continue;
+    }
     for (const [file, line] of byFile) {
-      const others = [...byFile.entries()].filter(([other]) => other !== file);
+      if (likelyNonProductionFile(file)) {
+        continue;
+      }
+      const others = [...byFile.entries()].filter(
+        ([other]) => other !== file && productionFiles.includes(other),
+      );
       findings.push({
         ruleId: 'xf-duplicated-secrets',
         category: 'vulnerability',
@@ -1711,46 +1758,6 @@ export function findDuplicateStateStores(index: CrossFileIndex): CrossFileFindin
             file: other,
             line: otherCache.line,
             message: `Also stores "${otherCache.name}"`,
-          })),
-        ),
-      );
-    }
-  }
-  const keys = new Map<string, Array<{ file: string; key: StorageKeyRecord }>>();
-  for (const file of index.files) {
-    for (const key of file.storageKeys ?? []) {
-      const list = keys.get(key.key);
-      if (list) {
-        list.push({ file: file.file, key });
-      } else {
-        keys.set(key.key, [{ file: file.file, key }]);
-      }
-    }
-  }
-  for (const [name, entries] of keys) {
-    const byFile = new Map<string, StorageKeyRecord>();
-    for (const entry of entries) {
-      if (!byFile.has(entry.file)) {
-        byFile.set(entry.file, entry.key);
-      }
-    }
-    if (byFile.size < 2) {
-      continue;
-    }
-    for (const [file, key] of byFile) {
-      const others = [...byFile.entries()].filter(([other]) => other !== file);
-      findings.push(
-        stateFinding(
-          'xf-duplicate-state-stores',
-          'smell',
-          'info',
-          `Storage key "${name}" is used in ${byFile.size} files`,
-          file,
-          key.line,
-          others.slice(0, 5).map(([other, otherKey]) => ({
-            file: other,
-            line: otherKey.line,
-            message: `Also uses "${name}"`,
           })),
         ),
       );
@@ -2151,7 +2158,10 @@ export function findTtlDrift(index: CrossFileIndex): CrossFileFinding[] {
     }
     for (const [file, constant] of byFile) {
       const others = [...byFile.entries()].filter(
-        ([other, otherConstant]) => other !== file && otherConstant.value !== constant.value,
+        ([other, otherConstant]) =>
+          other !== file &&
+          sameDirectory(other, file) &&
+          otherConstant.value !== constant.value,
       );
       if (others.length === 0) {
         continue;

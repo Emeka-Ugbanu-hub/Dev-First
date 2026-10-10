@@ -175,14 +175,6 @@
         "title": "Dev-First: Explain This Codebase"
       },
       {
-        "command": "devFirst.resetScanBaseline",
-        "title": "Dev-First: Reset Scan Baseline"
-      },
-      {
-        "command": "devFirst.scanWholeFile",
-        "title": "Dev-First: Scan Whole File with AI"
-      },
-      {
         "command": "devFirst.openArchitecture",
         "title": "Dev-First: Open Architecture",
         "icon": "$(type-hierarchy)"
@@ -191,6 +183,11 @@
         "command": "devFirst.refreshArchitecture",
         "title": "Dev-First: Refresh Architecture",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "devFirst.scanFile",
+        "title": "Dev-First: Scan File",
+        "icon": "$(eye)"
       }
     ],
     "menus": {
@@ -209,6 +206,13 @@
           "command": "devFirst.exportTranscript",
           "when": "view == devFirst.chatView",
           "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "devFirst.scanFile",
+          "when": "resourceScheme == file",
+          "group": "navigation@90"
         }
       ],
       "editor/context": [
@@ -558,49 +562,6 @@
           "default": 9222,
           "description": "Chrome DevTools Protocol port used by the browser tools (start Chrome with --remote-debugging-port=9222)."
         },
-        "devFirst.scanEnabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show problems in files you open (squiggles + hover explanations)."
-        },
-        "devFirst.scanAst": {
-          "type": "boolean",
-          "default": true,
-          "description": "Parse JavaScript, TypeScript, Python, Java, Go, and PHP to catch structural bugs such as unreachable code."
-        },
-        "devFirst.scanHotspots": {
-          "type": "boolean",
-          "default": true,
-          "description": "Include non-blocking hotspot hints such as weak randomness or plain http URLs."
-        },
-        "devFirst.scanDuplication": {
-          "type": "boolean",
-          "default": true,
-          "description": "Index workspace functions and flag near-identical bodies in other files."
-        },
-        "devFirst.scanCrossFile": {
-          "type": "boolean",
-          "default": true,
-          "description": "Flag circular imports, god modules, dead exports, orphaned files, and other cross-file structure issues."
-        },
-        "devFirst.scanConventions": {
-          "type": "boolean",
-          "default": true,
-          "description": "Mine auth, validation, naming, and layering conventions from the cross-file index and use them when planning."
-        },
-        "devFirst.scanDuplicationThreshold": {
-          "type": "number",
-          "default": 0.8,
-          "minimum": 0.5,
-          "maximum": 1,
-          "description": "Minimum token similarity (0.5-1) before a function is reported as a duplicate."
-        },
-        "devFirst.scanMaxFileKb": {
-          "type": "number",
-          "default": 1024,
-          "minimum": 16,
-          "description": "Skip scanning files larger than this (KB)."
-        },
         "devFirst.scanMaxFiles": {
           "type": "number",
           "default": 2000,
@@ -613,36 +574,10 @@
           "default": "**/node_modules/**,**/dist/**,**/out/**,**/.next/**,**/vendor/**,**/target/**,**/build/**,**/coverage/**,**/*.min.*,**/*.pb.go,**/*.generated.*,**/generated/**,**/package-lock.json,**/yarn.lock,**/pnpm-lock.yaml",
           "markdownDescription": "Comma-separated glob patterns for files to skip when scanning."
         },
-        "devFirst.scanNewOnly": {
-          "type": "boolean",
-          "default": false,
-          "description": "Show only findings that are not in the scan baseline yet. While this is off, every finding is recorded into the baseline."
-        },
-        "devFirst.scanDisabledCategories": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Comma-separated finding categories to hide: `bug`, `vulnerability`, `smell`, `hotspot`, `secret`, `architecture`."
-        },
-        "devFirst.scanAi": {
-          "type": "boolean",
-          "default": true,
-          "description": "After the deterministic pass, ask the connected model for high-confidence findings linters cannot catch (logic bugs, smells, security, architecture)."
-        },
         "devFirst.scanAiModel": {
           "type": "string",
           "default": "",
           "markdownDescription": "Model used for the AI scan. Empty uses `#devFirst.model#`."
-        },
-        "devFirst.scanAiCrossFile": {
-          "type": "boolean",
-          "default": true,
-          "description": "Compare same-concept implementations across files with the model and flag same/drifted twins."
-        },
-        "devFirst.scanAiCrossFileMaxPairs": {
-          "type": "number",
-          "default": 3,
-          "minimum": 0,
-          "description": "Maximum candidate pairs the AI reviews for the opened file per scan."
         },
         "devFirst.architecture": {
           "type": "boolean",

@@ -550,32 +550,46 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: () => diffManager.dispose() },
   );
 
-  const scanRunner = new ScanRunner(context);
+  const readOnlyToolExecutor = session.readOnlyToolExecutor();
+  const scanRunner = new ScanRunner(context, readOnlyToolExecutor
+    ? {
+        getTools: async () =>
+          (await session.plannerToolDefs()).filter(
+            (tool) =>
+              new Set([
+                'read_file',
+                'list_files',
+                'search_text',
+                'find_symbol',
+                'document_symbols',
+                'find_references',
+                'go_to_definition',
+                'go_to_implementation',
+                'incoming_calls',
+                'outgoing_calls',
+                'hover',
+                'semantic_search',
+                'memory_recall',
+              ]).has(tool.name),
+          ),
+        executeTool: readOnlyToolExecutor,
+      }
+    : undefined);
   session.setKnowledgeSource({ refreshKnowledge: () => scanRunner.refreshKnowledge() });
   context.subscriptions.push(
     vscode.languages.registerHoverProvider({ scheme: 'file' }, createHoverProvider(scanRunner)),
     vscode.commands.registerCommand('devFirst.explainCodebase', async () => {
       await session.explainCodebase();
     }),
-    vscode.commands.registerCommand('devFirst.resetScanBaseline', async () => {
-      const confirmed = await vscode.window.showWarningMessage(
-        'Dev-First: reset the scan baseline? Previously seen findings will be reported again.',
-        { modal: true },
-        'Reset Baseline',
-      );
-      if (confirmed !== 'Reset Baseline') {
-        return;
-      }
-      await scanRunner.resetBaseline();
-      void vscode.window.showInformationMessage('Dev-First: scan baseline reset.');
-    }),
-    vscode.commands.registerCommand('devFirst.scanWholeFile', () => {
+    vscode.commands.registerCommand('devFirst.scanFile', async (uri?: vscode.Uri) => {
       const editor = vscode.window.activeTextEditor;
-      if (!editor || editor.document.uri.scheme !== 'file') {
+      const target = uri ?? editor?.document.uri;
+      if (!target || target.scheme !== 'file') {
         void vscode.window.showWarningMessage('Dev-First: open a file to scan with AI.');
         return;
       }
-      void scanRunner.scanWholeFile(editor.document);
+      const document = await vscode.workspace.openTextDocument(target);
+      void scanRunner.scanFile(document);
     }),
     vscode.commands.registerCommand('devFirst.openArchitecture', async () => {
       const executeTool = session.readOnlyToolExecutor();
@@ -584,6 +598,7 @@ export function activate(context: vscode.ExtensionContext): void {
         root: workspaceRoot() ?? '',
         state: context.globalState,
         getFacts: () => scanRunner.getArchitectureFacts(),
+        getCoverage: () => scanRunner.getArchitectureCoverage(),
         getActive: () => activeProvider(context),
         getTools: () => session.plannerToolDefs(),
         executeTool:

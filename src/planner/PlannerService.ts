@@ -1,4 +1,6 @@
 import { ChatMessage, LLMProvider, ReasoningOptions, ToolCall, ToolDef, UsageTotals } from '../llm/types';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Plan } from '../shared/protocol';
 import {
   ActivityMeta,
@@ -51,6 +53,7 @@ export interface PlannerOptions {
   reasoning?: ReasoningOptions;
   resolveReasoning?: () => ReasoningOptions | undefined;
   reasoningSwitch?: boolean;
+  workspaceRoot?: string;
 }
 
 export class PlannerService {
@@ -110,7 +113,8 @@ export class PlannerService {
 
       for (const call of normalizedCalls) {
         if (call.name === 'submit_plan') {
-          const plan = planFromToolCall(call.arguments, version);
+          const rawPlan = planFromToolCall(call.arguments, version);
+          const plan = rawPlan ? this.validateExpectedFiles(rawPlan) : undefined;
           if (plan) {
             submitted = plan;
           }
@@ -208,6 +212,20 @@ export class PlannerService {
     }
 
     return { text: lastText, exhausted: true };
+  }
+
+  private validateExpectedFiles(plan: Plan): Plan {
+    const root = this.options.workspaceRoot;
+    if (!root || !plan.expectedFiles?.length) return plan;
+    const expectedFiles = plan.expectedFiles.filter((entry) => {
+      if (entry.action === 'add') return true;
+      try {
+        return fs.existsSync(path.join(root, entry.path));
+      } catch {
+        return false;
+      }
+    });
+    return { ...plan, expectedFiles: expectedFiles.length > 0 ? expectedFiles : undefined };
   }
 
   private async runTurn(

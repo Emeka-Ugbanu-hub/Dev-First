@@ -282,7 +282,7 @@ describe('CrossFileAi.judge', () => {
     expect(result.findings).toHaveLength(2);
     expect(result.notice?.ruleId).toBe('xf-pair-cap');
     expect(result.notice?.severity).toBe('info');
-    expect(result.notice?.message).toContain('2 more candidate pairs were not AI-judged');
+    expect(result.notice?.message).toContain('2 more related-file candidates were not reviewed');
   });
 
   it('returns only the notice when the budget is zero', async () => {
@@ -291,7 +291,7 @@ describe('CrossFileAi.judge', () => {
     const result = await ai.judge('file:///a.ts', [candidate()]);
     expect(provider.calls).toBe(0);
     expect(result.findings).toEqual([]);
-    expect(result.notice?.message).toContain('1 more candidate pairs were not AI-judged');
+    expect(result.notice?.message).toContain('1 more related-file candidates were not reviewed');
   });
 
   it('swallows provider failures and malformed output', async () => {

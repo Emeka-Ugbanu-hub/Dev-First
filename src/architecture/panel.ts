@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
-import { existsSync, statSync } from 'fs';
+import { existsSync, readFileSync, statSync } from 'fs';
 import * as path from 'path';
 import type { FileFacts } from '../scan/duplication';
+import type { ArchitectureScanCoverage } from '../scan/duplication';
 import type { LLMProvider, ToolCall, ToolDef } from '../llm/types';
 import { buildMapDigest } from './mapDigest';
 import { buildMermaidMap, mapPathsOf, parseStructuredMap } from './mapValidate';
@@ -13,6 +14,7 @@ import {
   isStale,
   readStoredMap,
   writeStoredMap,
+  ArchitectureMapCoverage,
 } from './mapStore';
 import { generateArchitectureMap } from './mapGenerate';
 
@@ -21,6 +23,7 @@ export interface ArchitecturePanelDeps {
   root: string;
   state: vscode.Memento;
   getFacts: () => Promise<FileFacts[]>;
+  getCoverage: () => Promise<ArchitectureScanCoverage>;
   getActive: () => Promise<{ provider: LLMProvider; model: string } | undefined>;
   getTools: () => Promise<ToolDef[]>;
   executeTool: (call: ToolCall) => Promise<string>;
@@ -32,6 +35,22 @@ interface ArchitectureMessage {
   path?: string;
   svg?: string;
   crumbs?: string[];
+}
+
+function relativeFile(root: string, value: string): string {
+  let candidate = value.trim();
+  if (/^file:/i.test(candidate)) {
+    try {
+      candidate = decodeURIComponent(new URL(candidate).pathname);
+    } catch {
+      candidate = candidate.replace(/^file:\/\//i, '');
+    }
+  }
+  const absolute = path.resolve(candidate);
+  const relative = path.relative(path.resolve(root), absolute);
+  return relative && !relative.startsWith('..') && !path.isAbsolute(relative)
+    ? relative.replace(/\\/g, '/')
+    : value.replace(/\\/g, '/').replace(/^\.\//, '');
 }
 
 export const EMPTY_NO_MODEL = 'no-model';
@@ -191,11 +210,20 @@ export class ArchitecturePanel {
     });
     try {
       let facts: FileFacts[] = [];
+      let scanCoverage: ArchitectureScanCoverage = {
+        unsupportedSourceFiles: 0,
+        parseFailures: 0,
+        oversizedSourceFiles: 0,
+        scanLimitReached: false,
+      };
       try {
         facts = await this.deps.getFacts();
       } catch {
         facts = [];
       }
+      try {
+        scanCoverage = await this.deps.getCoverage();
+      } catch {}
       if (this.disposed || controller.signal.aborted) {
         return;
       }
@@ -257,14 +285,56 @@ export class ArchitecturePanel {
         });
         return;
       }
+      const indexedFiles = new Set(facts.map((fact) => relativeFile(this.deps.root, fact.file)));
+      const validated = {
+        ...parsed,
+        nodes: parsed.nodes.map((node) => {
+          if (!node.path) {
+            return node;
+          }
+          const candidate = node.path.replace(/\\/g, '/').replace(/^\.\//, '');
+          return existsSync(path.join(this.deps.root, candidate))
+            ? { ...node, path: candidate }
+            : { ...node, path: undefined };
+        }),
+        edges: parsed.edges.filter((edge) => {
+          edge.evidence = edge.evidence?.filter((item) => {
+            const relative = relativeFile(this.deps.root, item.path);
+            if (!indexedFiles.has(relative) || item.line <= 0) {
+              return false;
+            }
+            try {
+              const source = readFileSync(path.join(this.deps.root, relative), 'utf8');
+              return item.line <= source.split(/\r?\n/).length;
+            } catch {
+              return false;
+            }
+          });
+          return Boolean(edge.evidence?.length);
+        }),
+      };
+      const representedFiles = facts.filter((fact) => {
+        const file = relativeFile(this.deps.root, fact.file);
+        return validated.nodes.some((node) => {
+          const nodePath = node.path && node.path.replace(/\\/g, '/').replace(/^\.\//, '');
+          return nodePath && (nodePath === file || file.startsWith(`${nodePath}/`));
+        });
+      }).length;
+      const coverage: ArchitectureMapCoverage = {
+        ...scanCoverage,
+        indexedFiles: facts.length,
+        representedFiles,
+        unresolvedRelationships: 0,
+      };
       const map: StoredArchitectureMap = {
-        version: 2,
+        version: 3,
         filesHash: architectureFilesHash(facts.map((fact) => fact.file)),
-        mermaid: buildMermaidMap(parsed),
-        paths: mapPathsOf(parsed, (relative) => existsSync(path.join(this.deps.root, relative))),
-        structured: parsed,
+        mermaid: buildMermaidMap(validated),
+        paths: mapPathsOf(validated, (relative) => existsSync(path.join(this.deps.root, relative))),
+        structured: validated,
         model: active.model,
         generatedAt: Date.now(),
+        coverage,
       };
       this.stored = map;
       try {
@@ -308,6 +378,7 @@ export class ArchitecturePanel {
       stale,
       generatedAt: map.generatedAt,
       model: map.model,
+      coverage: map.coverage,
     });
   }
 

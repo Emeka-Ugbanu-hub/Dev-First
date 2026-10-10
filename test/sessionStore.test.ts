@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import * as path from 'path';
 import { SessionStore, StoredSession } from '../src/session/SessionStore';
@@ -51,6 +51,20 @@ describe('SessionStore', () => {
       const store = new SessionStore(dir);
       expect(await store.list()).toEqual([]);
       expect(await store.load('missing')).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the backup when the primary session file is corrupted', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'df-sessions-'));
+    try {
+      const store = new SessionStore(dir);
+      await store.save(session('a', 'First', 10));
+      await store.save(session('a', 'Second', 20));
+      await writeFile(path.join(dir, 'a.json'), '{ corrupted', 'utf-8');
+      const loaded = await store.load('a');
+      expect(loaded?.title).toBe('First');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

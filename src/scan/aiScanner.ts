@@ -2,7 +2,9 @@ import { createHash } from 'crypto';
 import type { Tree } from '@vscode/tree-sitter-wasm/wasm/web-tree-sitter';
 import { repairJson } from '../agent/jsonRepair';
 import { chatWithRetry } from '../llm/retry';
-import type { ChatMessage, LLMProvider } from '../llm/types';
+import type { ChatMessage, ChatOptions, LLMProvider } from '../llm/types';
+import type { ToolCall, ToolDef } from '../llm/types';
+import { normalizeToolArguments } from '../util/toolArgs';
 import { extractBalanced, parseJsonLoose, tryParseJson } from '../util/json';
 import type { Chunk, ChunkOptions } from './chunker';
 import { chunkFile, signaturesOf } from './chunker';
@@ -11,8 +13,21 @@ import type { ScanFinding, ScanRule } from './ruleTypes';
 import type { StrippedText } from './strip';
 import { stripForAi } from './strip';
 
-export type AiCategory = 'bug' | 'vulnerability' | 'smell' | 'hotspot' | 'architecture';
+export type AiCategory =
+  | 'bug'
+  | 'vulnerability'
+  | 'smell'
+  | 'secret'
+  | 'architecture'
+  | 'maintainability'
+  | 'scalability';
 export type AiSeverity = 'error' | 'warning' | 'info';
+export type AiConfidence = 'high' | 'medium' | 'low';
+
+export interface AiEvidence {
+  path: string;
+  line: number;
+}
 
 export interface AiFinding {
   line: number;
@@ -21,6 +36,8 @@ export interface AiFinding {
   message: string;
   why: string;
   fix: string;
+  confidence?: AiConfidence;
+  evidence?: AiEvidence[];
   concept?: string;
 }
 
@@ -40,11 +57,14 @@ export interface AiScannerConfig {
   scanAi: boolean;
   scanAiModel: string;
   model: string;
+  reasoning?: ChatOptions['reasoning'];
 }
 
 export interface AiScannerDeps {
   getConfig: () => AiScannerConfig;
   buildProvider: () => Promise<LLMProvider | undefined>;
+  getTools?: () => Promise<ToolDef[]>;
+  executeTool?: (call: ToolCall) => Promise<string>;
 }
 
 export interface AiScanOptions {
@@ -53,6 +73,8 @@ export interface AiScanOptions {
   chunkOptions?: ChunkOptions;
   onProgress?: (done: number, total: number) => void;
   onPartial?: (findings: ScanFinding[]) => void;
+  onCoverage?: (reviewed: number, total: number, mode: 'targeted' | 'full') => void;
+  onStage?: (stage: string) => void;
 }
 
 export interface ChunkPromptContext {
@@ -75,11 +97,14 @@ export const AI_CATEGORIES: AiCategory[] = [
   'bug',
   'vulnerability',
   'smell',
-  'hotspot',
+  'secret',
   'architecture',
+  'maintainability',
+  'scalability',
 ];
 export const AI_SEVERITIES: AiSeverity[] = ['error', 'warning', 'info'];
 export const AI_MAX_FINDINGS = 5;
+const TARGETED_CHUNK_LIMIT = 8;
 
 const CATEGORY_SET = new Set<string>(AI_CATEGORIES);
 const SEVERITY_SET = new Set<string>(AI_SEVERITIES);
@@ -88,27 +113,33 @@ const COMMENT_LINE = /^\s*(?:\/\/|#|\/\*|\*)/;
 
 export const CHUNK_SYSTEM_PROMPT = [
   'You are a senior code reviewer analyzing one chunk of a file.',
-  'Report ONLY high-confidence findings a deterministic linter cannot catch. Never invent code that is not shown. Skip style nitpicks, formatting, and linter-class noise. Maximum 5 findings.',
+  'Report only evidence-backed findings. Never invent code that is not shown. Skip formatting and trivial style preferences. Maximum 5 findings.',
+  'Deterministic signals are candidate evidence, not the final answer and not a whitelist. Independently review the shown code for every category, keep a candidate only when it is valid, and add new findings when the code supports them even if no signal was supplied.',
   'Walk this checklist and report only what applies:',
   '- bug: null safety, logic errors, error handling, async races and unawaited work.',
   '- vulnerability: injection, secrets/crypto misuse, web/session issues, unsafe config.',
-  '- smell: complexity, naming, dead weight, redundancy, exception handling.',
-  '- architecture: responsibilities that should be split, layering violations, tangled dependencies, missing abstraction, duplicated logic across layers.',
+  '- secret: committed credentials, tokens, private keys, or sensitive values.',
+  '- smell: naming, duplication, unnecessary complexity, and style problems that affect the code.',
+  '- architecture: incorrect layering, misplaced responsibilities, or tangled dependencies.',
+  '- maintainability: code that is difficult to change, test, or understand.',
+  '- scalability: behavior that degrades as data, traffic, files, or users grow.',
+  'When duplication, an unused export, dead code, or a cross-file contract is suspected, use the provided read-only search, symbol, reference, or file tools before reporting it. Do not infer that code is dead from its name or from one file alone.',
+  'For a duplicate candidate, inspect the related implementation and compare behavior, inputs, outputs, errors, and side effects. Report a finding only when the evidence supports same behavior or meaningful drift.',
   'Respond with strict JSON only. No markdown, no prose, no code fences.',
-  '{"findings":[{"line":1,"category":"bug|vulnerability|smell|hotspot|architecture","severity":"error|warning|info","message":"","why":"","fix":"","concept":""}]}',
-  'Rules: line is 1-based and relative to the first code line shown; message, why, and fix are non-empty and specific; concept is one short line naming the engineering concept behind a smell, architecture, or bug finding (e.g. "TOCTOU race", "single responsibility"), or empty when none; empty result is {"findings":[]}.',
+  '{"findings":[{"line":1,"category":"bug|vulnerability|smell|secret|architecture|maintainability|scalability","severity":"error|warning|info","confidence":"high|medium|low","message":"","why":"","fix":"","evidence":[{"path":"file","line":1}],"concept":""}]}',
+  'Rules: line is 1-based and relative to the first code line shown; message, why, fix, confidence, and evidence are required; evidence lines must be in reviewed code or a related file actually inspected; use low confidence only when more context is needed; low confidence is informational and triggers expansion; concept is optional; empty result is {"findings":[]}.',
 ].join('\n');
 
+// Kept as a reusable prompt primitive for architecture consumers; file review
+// itself now uses the same bounded, evidence-backed chunk review as every category.
 export const ARCHITECTURE_SYSTEM_PROMPT = [
   'You are a software architect reviewing one file.',
   'Make architecture judgments ONLY. Do not report bugs, style, performance, or security issues.',
   'Recommend splitting the file ONLY when responsibilities are clearly separable, and name each responsibility.',
-  'When the right call is to leave the structure as-is, say so in "fix" (e.g. "leave as-is: splitting would add indirection without a clear win") instead of inventing a change.',
   'Never flag a file merely for being long: length alone is not a finding.',
   'Anchor every finding at line 1. The category must be "architecture".',
   'Respond with strict JSON only. No markdown, no prose, no code fences.',
-  '{"findings":[{"line":1,"category":"architecture","severity":"info","message":"","why":"","fix":"","concept":""}]}',
-  'Rules: message, why, and fix are non-empty and specific; concept is one short line naming the engineering concept behind the finding (e.g. "single responsibility", "dependency inversion"), or empty when none; empty result is {"findings":[]}.',
+  '{"findings":[{"line":1,"category":"architecture","severity":"info","confidence":"high|medium|low","message":"","why":"","fix":"","evidence":[{"path":"file","line":1}],"concept":""}]}',
 ].join('\n');
 
 export function buildChunkPrompt(context: ChunkPromptContext): AiPrompt {
@@ -116,6 +147,7 @@ export function buildChunkPrompt(context: ChunkPromptContext): AiPrompt {
   const reported =
     context.reported.length > 0
       ? context.reported
+          .slice(0, 24)
           .map(
             (finding) =>
               `- line ${finding.line + 1} [${finding.rule.id}]: ${finding.rule.message}`,
@@ -129,7 +161,7 @@ export function buildChunkPrompt(context: ChunkPromptContext): AiPrompt {
       `Chunk covers file lines ${context.chunk.startLine + 1}-${context.chunk.endLine + 1}.`,
       'File signatures (context only; do not report on code that is not shown):',
       signatures,
-      'Already reported by deterministic checks in this chunk (do not repeat these):',
+      'Local index signals in this chunk (verify them before reporting; do not repeat confirmed findings):',
       reported,
       'Code for review (line numbers are 1-based and relative to this chunk; line 1 is the first code line shown below; blank lines and comments were removed):',
       '```',
@@ -198,10 +230,10 @@ export function orderChunks(chunks: Chunk[], visibleLine: number | undefined): C
 }
 
 export function parseAiFindings(raw: string, lineCount = Number.MAX_SAFE_INTEGER): AiFinding[] {
-  return parseAiFindingsResult(raw, lineCount) ?? [];
+  return parseAiFindingsResult(raw, lineCount, false) ?? [];
 }
 
-function parseAiFindingsResult(raw: string, lineCount: number): AiFinding[] | undefined {
+function parseAiFindingsResult(raw: string, lineCount: number, requireEvidence: boolean): AiFinding[] | undefined {
   const parsed = parseJsonLoose(raw) ?? repairAndParse(raw);
   if (parsed === undefined) {
     return undefined;
@@ -216,7 +248,7 @@ function parseAiFindingsResult(raw: string, lineCount: number): AiFinding[] | un
   }
   const findings: AiFinding[] = [];
   for (const entry of entries.slice(0, AI_MAX_FINDINGS)) {
-    const finding = parseAiFinding(entry, lineCount);
+    const finding = parseAiFinding(entry, lineCount, requireEvidence);
     if (finding) {
       findings.push(finding);
     }
@@ -234,18 +266,36 @@ function repairAndParse(raw: string): unknown {
   return extracted ? tryParseJson(extracted) : undefined;
 }
 
-function parseAiFinding(entry: unknown, lineCount: number): AiFinding | undefined {
+function parseAiFinding(entry: unknown, lineCount: number, requireEvidence: boolean): AiFinding | undefined {
   if (!entry || typeof entry !== 'object') {
     return undefined;
   }
   const record = entry as Record<string, unknown>;
   const category = typeof record.category === 'string' ? record.category : '';
-  const severity = typeof record.severity === 'string' ? record.severity : '';
-  if (!CATEGORY_SET.has(category) || !SEVERITY_SET.has(severity)) {
+  const requestedSeverity = typeof record.severity === 'string' ? record.severity : '';
+  const confidence = record.confidence === 'high' || record.confidence === 'medium' || record.confidence === 'low'
+    ? record.confidence
+    : undefined;
+  if (!CATEGORY_SET.has(category) || !SEVERITY_SET.has(requestedSeverity) || (requireEvidence && !confidence)) {
     return undefined;
   }
   const message = typeof record.message === 'string' ? record.message.trim() : '';
-  if (!message) {
+  const why = typeof record.why === 'string' ? record.why.trim() : '';
+  const fix = typeof record.fix === 'string' ? record.fix.trim() : '';
+  if (!message || !why || !fix) {
+    return undefined;
+  }
+  const evidence = Array.isArray(record.evidence)
+    ? record.evidence
+        .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+        .map((item) => ({
+          path: typeof item.path === 'string' ? item.path.trim() : '',
+          line: typeof item.line === 'number' && Number.isFinite(item.line) ? Math.trunc(item.line) : 0,
+        }))
+        .filter((item) => item.path && item.line > 0)
+        .slice(0, 4)
+    : [];
+  if (requireEvidence && evidence.length === 0) {
     return undefined;
   }
   const rawLine =
@@ -253,13 +303,20 @@ function parseAiFinding(entry: unknown, lineCount: number): AiFinding | undefine
   const limit = Math.max(1, lineCount);
   const line = Math.max(0, Math.min(rawLine - 1, limit - 1));
   const concept = typeof record.concept === 'string' ? record.concept.trim() : '';
+  const severity: AiSeverity = confidence === 'low'
+    ? 'info'
+    : confidence === 'medium' && requestedSeverity === 'error'
+      ? 'warning'
+      : requestedSeverity as AiSeverity;
   return {
     line,
     category: category as AiCategory,
-    severity: severity as AiSeverity,
+    severity,
     message,
-    why: typeof record.why === 'string' ? record.why.trim() : '',
-    fix: typeof record.fix === 'string' ? record.fix.trim() : '',
+    why,
+    fix,
+    ...(confidence ? { confidence } : {}),
+    ...(evidence.length > 0 ? { evidence } : {}),
     ...(concept ? { concept } : {}),
   };
 }
@@ -308,13 +365,15 @@ function aiRule(finding: AiFinding): ScanRule {
     why: finding.why,
     fix: finding.fix,
     concept: finding.concept,
+    confidence: finding.confidence,
+    evidence: finding.evidence,
   };
 }
 
 export class AiScanner {
   private readonly chunkCache = new Map<string, AiFinding[]>();
   private readonly chunkHashes = new Map<string, Set<string>>();
-  private readonly archCache = new Map<string, { key: string; findings: AiFinding[] }>();
+  private readonly selectionCache = new Map<string, { key: string; indexes: number[]; full: boolean }>();
   private readonly controllers = new Map<string, AbortController>();
 
   constructor(private readonly deps: AiScannerDeps) {}
@@ -338,47 +397,23 @@ export class AiScanner {
     const controller = new AbortController();
     this.controllers.set(target.uri, controller);
     const model = config.scanAiModel.trim() || config.model;
+    const tools = this.deps.getTools ? await this.deps.getTools() : [];
+    options.onStage?.('Building file structure');
     const profile = profileFor(target.languageId);
     const signatures = signaturesOf(target.text, profile);
     const logicChunks = chunkFile(target.text, tree, profile, options.chunkOptions).filter(
       (chunk) => !chunk.structural,
     );
     const ordered = orderChunks(logicChunks, options.visibleLine);
+    options.onStage?.('Selecting review regions');
+    const selected = ordered.length > TARGETED_CHUNK_LIMIT
+      ? await this.selectChunks(target, ordered, provider, model, signatures, controller, tools, config.reasoning)
+      : ordered;
     const collected: AiFinding[] = [];
     let done = 0;
     try {
-      const first = ordered[0];
-      if (first) {
-        const findings = await this.scanChunk(
-          target,
-          first,
-          provider,
-          model,
-          signatures,
-          deterministic,
-          controller,
-        );
-        if (!this.isCurrent(target.uri, controller)) {
-          return undefined;
-        }
-        collected.push(...findings);
-        done += 1;
-        options.onProgress?.(done, ordered.length);
-        this.emit(collected, target, deterministic, options);
-      }
-      const architecture = await this.runArchitecturePass(
-        target,
-        provider,
-        model,
-        signatures,
-        controller,
-      );
-      if (!this.isCurrent(target.uri, controller)) {
-        return undefined;
-      }
-      collected.push(...architecture);
-      this.emit(collected, target, deterministic, options);
-      for (const chunk of ordered.slice(1)) {
+      for (const chunk of selected) {
+        options.onStage?.(`Reviewing region ${done + 1}/${selected.length}`);
         const findings = await this.scanChunk(
           target,
           chunk,
@@ -387,14 +422,41 @@ export class AiScanner {
           signatures,
           deterministic,
           controller,
+          tools,
+          config.reasoning,
         );
         if (!this.isCurrent(target.uri, controller)) {
           return undefined;
         }
         collected.push(...findings);
         done += 1;
-        options.onProgress?.(done, ordered.length);
+        options.onProgress?.(done, selected.length);
+        options.onCoverage?.(done, ordered.length, selected.length >= ordered.length ? 'full' : 'targeted');
         this.emit(collected, target, deterministic, options);
+      }
+      if (selected.length < ordered.length && collected.some((finding) => finding.confidence === 'low')) {
+        const reviewed = new Set(selected);
+        const expansion = ordered.filter((chunk) => !reviewed.has(chunk)).slice(0, TARGETED_CHUNK_LIMIT);
+        for (const chunk of expansion) {
+          const findings = await this.scanChunk(
+            target,
+            chunk,
+            provider,
+            model,
+            signatures,
+            deterministic,
+            controller,
+            tools,
+          );
+          if (!this.isCurrent(target.uri, controller)) {
+            return undefined;
+          }
+          collected.push(...findings);
+          done += 1;
+          options.onProgress?.(done, selected.length + expansion.length);
+          options.onCoverage?.(done, ordered.length, done >= ordered.length ? 'full' : 'targeted');
+          this.emit(collected, target, deterministic, options);
+        }
       }
       return this.materialize(collected, target, deterministic);
     } catch {
@@ -423,7 +485,7 @@ export class AiScanner {
 
   clear(uri: string): void {
     this.cancel(uri);
-    this.archCache.delete(uri);
+    this.selectionCache.delete(uri);
     const hashes = this.chunkHashes.get(uri);
     if (hashes) {
       for (const hash of hashes) {
@@ -437,7 +499,7 @@ export class AiScanner {
     this.cancelAll();
     this.chunkCache.clear();
     this.chunkHashes.clear();
-    this.archCache.clear();
+    this.selectionCache.clear();
   }
 
   private isCurrent(uri: string, controller: AbortController): boolean {
@@ -461,6 +523,8 @@ export class AiScanner {
     signatures: string[],
     deterministic: ScanFinding[],
     controller: AbortController,
+    tools: ToolDef[],
+    reasoning?: ChatOptions['reasoning'],
   ): Promise<AiFinding[]> {
     const hash = chunkCacheKey(target.languageId, chunk.text);
     const cached = this.chunkCache.get(hash);
@@ -478,11 +542,11 @@ export class AiScanner {
       reported,
       stripped,
     });
-    const raw = await collectCompletion(provider, model, prompt, controller.signal);
+    const raw = await collectCompletion(provider, model, prompt, controller.signal, 1200, tools, this.deps.executeTool, reasoning);
     if (controller.signal.aborted) {
       return [];
     }
-    const parsed = parseAiFindingsResult(raw, Math.max(1, stripped.lineMap.length)) ?? [];
+    const parsed = parseAiFindingsResult(raw, Math.max(1, stripped.lineMap.length), true) ?? [];
     const mapped = parsed.map((finding) => ({
       ...finding,
       line: stripped.lineMap[Math.min(finding.line, stripped.lineMap.length - 1)] ?? 0,
@@ -492,31 +556,65 @@ export class AiScanner {
     return mapped.map((finding) => ({ ...finding, line: finding.line + chunk.startLine }));
   }
 
-  private async runArchitecturePass(
+  private async selectChunks(
     target: AiScanTarget,
+    chunks: Chunk[],
     provider: LLMProvider,
     model: string,
     signatures: string[],
     controller: AbortController,
-  ): Promise<AiFinding[]> {
-    const key = aiCacheKey(target.uri, `${target.languageId}\u0000${target.text}`);
-    const cached = this.archCache.get(target.uri);
-    if (cached && cached.key === key) {
-      return cached.findings;
+    tools: ToolDef[],
+    reasoning?: ChatOptions['reasoning'],
+  ): Promise<Chunk[]> {
+    if (chunks.length <= 1) {
+      return chunks;
     }
-    const prompt = buildArchitecturePrompt(target.languageId, signatures, fileMetrics(target.text));
-    const raw = await collectCompletion(provider, model, prompt, controller.signal);
-    if (controller.signal.aborted) {
-      return [];
+    const selectionKey = aiCacheKey(target.uri, `${target.languageId}\u0000${target.text}`);
+    const cached = this.selectionCache.get(target.uri);
+    if (cached?.key === selectionKey) {
+      return cached.full ? chunks : cached.indexes.map((index) => chunks[index]).filter(Boolean);
     }
-    const parsed = parseAiFindingsResult(raw, target.lineCount) ?? [];
-    const findings = parsed.map((finding) => ({
-      ...finding,
-      line: 0,
-      category: 'architecture' as const,
-    }));
-    this.archCache.set(target.uri, { key, findings });
-    return findings;
+    const summary = [
+      `File: ${target.uri}`,
+      `Language: ${target.languageId}`,
+      `Lines: ${target.lineCount}`,
+      `Metrics: ${JSON.stringify(fileMetrics(target.text))}`,
+      'Signatures:',
+      signatures.slice(0, 120).join('\n') || '(none)',
+      'Regions:',
+      chunks.map((chunk, index) => `${index}: lines ${chunk.startLine + 1}-${chunk.endLine + 1}`).join('\n'),
+    ].join('\n');
+    const prompt: AiPrompt = {
+      system: 'Select code regions for an accurate review. Return JSON only: {"regions":[{"index":0,"reason":"..."}],"full":false}. Select regions with risky control flow, boundaries, state, I/O, security, duplication, architecture, maintainability, or scalability concerns. Select all regions only when needed for confidence. Never invent indexes.',
+      user: summary,
+    };
+    try {
+      const raw = await collectCompletion(provider, model, prompt, controller.signal, 700, tools, this.deps.executeTool, reasoning);
+      const parsed = parseJsonLoose(raw) as { regions?: unknown; full?: unknown } | undefined;
+      const indexes = Array.isArray(parsed?.regions)
+        ? parsed.regions
+            .map((region) => (region && typeof region === 'object' && typeof (region as { index?: unknown }).index === 'number' ? Math.trunc((region as { index: number }).index) : -1))
+            .filter((index) => index >= 0 && index < chunks.length)
+        : [];
+      if (parsed?.full === true) {
+        this.selectionCache.set(target.uri, { key: selectionKey, indexes: [], full: true });
+        return chunks;
+      }
+      const unique = [...new Set(indexes)].slice(0, TARGETED_CHUNK_LIMIT);
+      if (unique.length > 0) {
+        this.selectionCache.set(target.uri, { key: selectionKey, indexes: unique, full: false });
+        return unique.map((index) => chunks[index]);
+      }
+    } catch {
+      // Fall back to a bounded targeted review when selection fails.
+    }
+    const fallback = chunks.slice(0, Math.min(TARGETED_CHUNK_LIMIT, chunks.length <= 4 ? chunks.length : 1));
+    this.selectionCache.set(target.uri, {
+      key: selectionKey,
+      indexes: fallback.map((chunk) => chunks.indexOf(chunk)),
+      full: false,
+    });
+    return fallback;
   }
 
   private remember(uri: string, hash: string): void {
@@ -544,7 +642,11 @@ export class AiScanner {
         endChar: (lines[line] ?? '').length,
       };
     });
-    return dedupeAiFindings(dedupeWithin(findings), deterministic);
+    // Deterministic results are candidates for the model to validate. They
+    // must not suppress an AI finding: the model may confirm the candidate,
+    // reject it, or report a better finding on the same line.
+    void deterministic;
+    return dedupeWithin(findings);
   }
 }
 
@@ -554,21 +656,58 @@ export async function collectCompletion(
   prompt: AiPrompt,
   signal: AbortSignal,
   maxTokens = 1200,
+  tools: ToolDef[] = [],
+  executeTool?: (call: ToolCall) => Promise<string>,
+  reasoning?: ChatOptions['reasoning'],
 ): Promise<string> {
   const messages: ChatMessage[] = [
     { role: 'system', content: prompt.system },
     { role: 'user', content: prompt.user },
   ];
-  let text = '';
-  for await (const event of chatWithRetry(
-    provider,
-    messages,
-    { model, temperature: 0.1, maxTokens, signal },
-    { retryOnEmpty: true },
-  )) {
-    if (event.type === 'text') {
-      text += event.text;
+  for (let round = 0; round < 4; round++) {
+    let text = '';
+    const toolCalls: ToolCall[] = [];
+    for await (const event of chatWithRetry(
+      provider,
+      messages,
+      { model, temperature: 0.1, maxTokens, signal, tools: tools.length > 0 ? tools : undefined, reasoning },
+      { retryOnEmpty: true },
+    )) {
+      if (event.type === 'text') {
+        text += event.text;
+      } else if (event.type === 'toolCall') {
+        toolCalls.push(event.toolCall);
+      }
+    }
+    if (toolCalls.length === 0 || !executeTool || tools.length === 0) {
+      return text;
+    }
+    messages.push({ role: 'assistant', content: text, toolCalls });
+    for (const call of toolCalls.slice(0, 4)) {
+      const definition = tools.find((tool) => tool.name === call.name);
+      if (!definition) {
+        messages.push({
+          role: 'tool',
+          toolCallId: call.id,
+          toolName: call.name,
+          content: 'Error: this tool is not available during file scanning.',
+        });
+        continue;
+      }
+      const normalized = { ...call, arguments: normalizeToolArguments(call.arguments, definition.parameters) };
+      let result: string;
+      try {
+        result = await executeTool(normalized);
+      } catch (error) {
+        result = `Error: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      messages.push({
+        role: 'tool',
+        toolCallId: normalized.id,
+        toolName: normalized.name,
+        content: result,
+      });
     }
   }
-  return text;
+  return '';
 }

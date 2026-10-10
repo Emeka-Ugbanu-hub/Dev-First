@@ -27,7 +27,7 @@ describe('buildLevelView', () => {
     expect(view.mermaid).toContain('grp0(["Frontend"])');
     expect(view.mermaid).toContain('grp1(["Backend"])');
     expect(view.mermaid).toContain('grp2(["Database"])');
-    expect(view.mermaid).toContain('grp0 -->|calls ×2| grp1');
+    expect(view.mermaid).toContain('grp0 -->|calls| grp1');
     expect(view.mermaid).toContain('grp1 -->|writes| grp2');
     expect(Object.values(view.groups)).toEqual([['Frontend'], ['Backend'], ['Database']]);
     expect(view.breadcrumbs).toEqual([{ label: 'Project', path: [] }]);
@@ -44,7 +44,7 @@ describe('buildLevelView', () => {
 
   it('hides nodes and edges outside the current subtree', () => {
     const project = buildLevelView(map, [], {});
-    expect(project.mermaid).toContain('grp0 -->|calls ×2| grp1');
+    expect(project.mermaid).toContain('grp0 -->|calls| grp1');
     const backend = buildLevelView(map, ['Backend'], {});
     expect(backend.mermaid).not.toMatch(/out\d+/);
     expect(backend.mermaid).not.toContain('Frontend');
@@ -71,7 +71,8 @@ describe('buildLevelView', () => {
       ],
     };
     const view = buildLevelView(parenMap, [], {});
-    expect(view.mermaid).toContain('invoke command ×2');
+    expect(view.mermaid).toContain('invoke command');
+    expect(view.mermaid).not.toContain('×2');
     expect(view.mermaid).not.toContain('(command)');
   });
 

@@ -124,7 +124,7 @@ describe('buildMapDigest', () => {
     expect(digest).toContain('- Database: src/orm.ts (0 queries)');
     expect(digest).toContain('- External clients: src/api.rs');
     expect(digest).toContain('- External clients: src/client.ts');
-    expect(digest).toContain('- Workers/queues: none detected');
+    expect(digest).not.toContain('- Workers/queues: none detected');
   });
 
   it('caps each signal list', () => {

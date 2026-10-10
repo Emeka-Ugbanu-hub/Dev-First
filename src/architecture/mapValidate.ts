@@ -9,10 +9,16 @@ export interface StructuredNode {
   path?: string;
 }
 
+export interface MapEvidence {
+  path: string;
+  line: number;
+}
+
 export interface StructuredEdge {
   from: string;
   to: string;
   label?: string;
+  evidence?: MapEvidence[];
 }
 
 export interface StructuredMap {
@@ -25,8 +31,6 @@ export interface ValidatedMap {
   paths: MapPaths;
 }
 
-const MAX_NODES = 60;
-const MAX_EDGES = 120;
 const MAX_LABEL = 40;
 const MAX_GROUP = 28;
 
@@ -78,9 +82,6 @@ export function parseStructuredMap(raw: string): StructuredMap | undefined {
   const nodes: StructuredNode[] = [];
   const idMap = new Map<string, string>();
   for (const item of data.nodes) {
-    if (nodes.length >= MAX_NODES) {
-      break;
-    }
     if (!item || typeof item !== 'object') {
       continue;
     }
@@ -111,9 +112,6 @@ export function parseStructuredMap(raw: string): StructuredMap | undefined {
   const edges: StructuredEdge[] = [];
   const edgeKeys = new Set<string>();
   for (const item of Array.isArray(data.edges) ? data.edges : []) {
-    if (edges.length >= MAX_EDGES) {
-      break;
-    }
     if (!item || typeof item !== 'object') {
       continue;
     }
@@ -124,12 +122,22 @@ export function parseStructuredMap(raw: string): StructuredMap | undefined {
       continue;
     }
     const label = typeof record.label === 'string' ? record.label.trim().slice(0, MAX_LABEL) : '';
+    const evidence = Array.isArray(record.evidence)
+      ? record.evidence
+          .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+          .map((item) => ({
+            path: typeof item.path === 'string' ? normalizePath(item.path) : '',
+            line: typeof item.line === 'number' && Number.isFinite(item.line) && item.line > 0 ? Math.trunc(item.line) : 0,
+          }))
+          .filter((item) => item.path && item.line > 0)
+          .slice(0, 4)
+      : [];
     const key = `${from}\u0000${to}\u0000${label}`;
     if (edgeKeys.has(key)) {
       continue;
     }
     edgeKeys.add(key);
-    edges.push(label ? { from, to, label } : { from, to });
+    edges.push(label ? { from, to, label, ...(evidence.length > 0 ? { evidence } : {}) } : { from, to, ...(evidence.length > 0 ? { evidence } : {}) });
   }
   return { nodes, edges };
 }

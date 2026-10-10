@@ -9,6 +9,8 @@ const CATEGORY_ICONS: Record<ScanCategory, string> = {
   hotspot: 'flame',
   secret: 'key',
   architecture: 'layers',
+  maintainability: 'tools',
+  scalability: 'graph-line',
 };
 
 export function createHoverProvider(runner: ScanRunner): vscode.HoverProvider {
@@ -32,12 +34,15 @@ export function createHoverProvider(runner: ScanRunner): vscode.HoverProvider {
       const markdown = new vscode.MarkdownString();
       markdown.supportThemeIcons = true;
       markdown.appendMarkdown(
-        `**$(${CATEGORY_ICONS[finding.rule.category]}) ${finding.rule.id} — ${finding.rule.message}**\n\n`,
+        `**$(${CATEGORY_ICONS[finding.rule.category]}) ${finding.rule.category} · ${finding.rule.severity} — ${finding.rule.message}**\n\n`,
       );
       markdown.appendMarkdown(`*Why:* ${finding.rule.why}\n\n`);
       markdown.appendMarkdown(`*Fix:* ${finding.rule.fix}\n\n`);
       if (finding.rule.concept) {
         markdown.appendMarkdown(`_Concept: ${finding.rule.concept}_\n\n`);
+      }
+      if (finding.rule.confidence) {
+        markdown.appendMarkdown(`_Confidence: ${finding.rule.confidence}_\n\n`);
       }
       markdown.appendMarkdown(`_Dev-First · ${finding.rule.category}_`);
       return new vscode.Hover(markdown);

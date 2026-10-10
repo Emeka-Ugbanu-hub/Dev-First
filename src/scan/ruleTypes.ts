@@ -7,7 +7,9 @@ export type ScanCategory =
   | 'smell'
   | 'hotspot'
   | 'secret'
-  | 'architecture';
+  | 'architecture'
+  | 'maintainability'
+  | 'scalability';
 export type ScanSeverity = 'error' | 'warning' | 'info' | 'hint';
 
 export interface ScanRange {
@@ -25,6 +27,8 @@ interface BaseScanRule {
   why: string;
   fix: string;
   concept?: string;
+  confidence?: 'high' | 'medium' | 'low';
+  evidence?: Array<{ path: string; line: number }>;
 }
 
 export interface RegexScanRule extends BaseScanRule {

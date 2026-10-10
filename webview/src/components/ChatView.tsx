@@ -1,5 +1,5 @@
-import { Fragment, useRef } from 'react';
-import type { Phase, Plan, TodoItem, UiMessage } from '../../../src/shared/protocol';
+import { Fragment, useMemo, useRef } from 'react';
+import type { Phase, Plan, QueuedPromptRecord, TodoItem, UiMessage } from '../../../src/shared/protocol';
 import { MessageBubble, isLiveMessage } from './MessageBubble';
 import { PlanCard } from './PlanCard';
 
@@ -31,6 +31,9 @@ export function ChatView({
   planAnchor,
   onApprove,
   viewableRuns,
+  queuedRecords,
+  recoveredQueueIds,
+  onContinueInterrupted,
 }: {
   messages: UiMessage[];
   onExample: (text: string) => void;
@@ -41,6 +44,9 @@ export function ChatView({
   planAnchor?: string | null;
   onApprove?: () => void;
   viewableRuns?: string[];
+  queuedRecords?: QueuedPromptRecord[];
+  recoveredQueueIds?: string[];
+  onContinueInterrupted?: () => void;
 }) {
   const seen = useRef<Set<string> | null>(null);
   if (seen.current === null) {
@@ -50,6 +56,11 @@ export function ChatView({
   for (const id of freshIds) {
     seen.current.add(id);
   }
+  const queueById = useMemo(
+    () => new Map((queuedRecords ?? []).map((record) => [record.id, record])),
+    [queuedRecords],
+  );
+  const recoveredIds = useMemo(() => new Set(recoveredQueueIds ?? []), [recoveredQueueIds]);
 
   if (messages.length === 0) {
     return (
@@ -83,7 +94,14 @@ export function ChatView({
             data-live={isLiveMessage(message) ? 'true' : undefined}
             data-fresh={freshIds.includes(message.id) ? 'true' : undefined}
           >
-            <MessageBubble message={message} mcpDisplay={mcpDisplay} viewableRuns={viewableRuns} />
+            <MessageBubble
+              message={message}
+              mcpDisplay={mcpDisplay}
+              viewableRuns={viewableRuns}
+              queueStatus={queueById.get(message.id)?.status}
+              queueRecovered={recoveredIds.has(message.id)}
+              onContinueInterrupted={onContinueInterrupted}
+            />
           </div>
           {planCard && message.id === planAnchor && (
             <PlanCard plan={planCard.plan} phase={planCard.phase} todos={planCard.todos} onApprove={planCard.onApprove} />

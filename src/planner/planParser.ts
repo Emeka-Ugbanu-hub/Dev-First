@@ -1,4 +1,4 @@
-import { Plan, PlanContextEntry } from '../shared/protocol';
+import { Plan, PlanContextEntry, PlanExpectedFile, PlanExpectedFileAction } from '../shared/protocol';
 
 import { parseJsonLoose } from '../util/json';
 
@@ -32,6 +32,7 @@ export function planFromObject(input: unknown, version: number): Plan | undefine
   const whyNot = firstString(get('whynot', 'whynotalternative'));
   const steps = normalizeSteps(get('steps', 'plan', 'actions'));
   const context = normalizeContext(get('context', 'files'));
+  const expectedFiles = normalizeExpectedFiles(get('expectedfiles', 'filestochange', 'affectedfiles'), steps);
   const title = firstString(get('title'));
   const intentValue = firstString(get('intent'));
   const intent = intentValue === 'explanation' || intentValue === 'plan' ? intentValue : undefined;
@@ -57,9 +58,44 @@ export function planFromObject(input: unknown, version: number): Plan | undefine
     risks,
     whyNot,
     context,
+    expectedFiles,
     steps,
     trivial: trivial || undefined,
   };
+}
+
+function normalizeExpectedFiles(value: unknown, steps?: string[]): PlanExpectedFile[] | undefined {
+  const entries: PlanExpectedFile[] = [];
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (!item || typeof item !== 'object') continue;
+      const record = item as Record<string, unknown>;
+      const path = firstString(record.path, record.file, record.name);
+      const action = record.action === 'add' || record.action === 'delete' || record.action === 'modify'
+        ? record.action
+        : 'modify';
+      if (path && validPlanPath(path)) {
+        entries.push({ path: path.replace(/^\.\//, ''), action, reason: firstString(record.reason, record.role, record.description) ?? 'Expected change' });
+      }
+    }
+  }
+  for (const step of steps ?? []) {
+    for (const path of extractPaths(step)) {
+      if (!entries.some((entry) => entry.path === path)) {
+        entries.push({ path, action: 'modify', reason: 'Named in the implementation step' });
+      }
+    }
+  }
+  return entries.length > 0 ? entries.slice(0, 24) : undefined;
+}
+
+function extractPaths(text: string): string[] {
+  const matches = text.match(/(?:^|[`\s("'])(\.\/)?([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\.[A-Za-z0-9_-]+)/g) ?? [];
+  return [...new Set(matches.map((value) => value.trim().replace(/^[`\s("']/, '').replace(/^\.\//, '')))].filter(validPlanPath);
+}
+
+function validPlanPath(value: string): boolean {
+  return value.length > 0 && value.length <= 240 && !value.includes('..') && !value.startsWith('/') && !/[<>|]/.test(value);
 }
 
 function normalizeRisks(value: unknown): string[] | undefined {
@@ -146,6 +182,7 @@ export function planFromToolCall(argumentsJson: string, version: number): Plan |
   return planFromObject(json, version);
 }
 
+
 export function deriveTitle(what: string | undefined, steps: string[] | undefined): string {
   const source = what ?? steps?.[0];
   if (!source) {
@@ -159,12 +196,13 @@ export function planFromText(markdown: string, version: number): Plan | undefine
   const lines = markdown.replace(/\r\n/g, '\n').split('\n');
   const buffers: Record<string, string[]> = {};
   const context: PlanContextEntry[] = [];
+  const expectedFiles: PlanExpectedFile[] = [];
   const steps: string[] = [];
   const risks: string[] = [];
   let section: string | null = null;
 
   for (const line of lines) {
-    const header = /^(WHAT|HOW|FLOW|WHY NOT|WHYNOT|WHY|TRADEOFF|LEAVE AS IS|LEAVEASIS|CONCEPT|CONVENTION|RISKS|CONTEXT|PLAN):\s*(.*)$/i.exec(line.trim());
+    const header = /^(WHAT|HOW|FLOW|WHY NOT|WHYNOT|WHY|TRADEOFF|LEAVE AS IS|LEAVEASIS|CONCEPT|CONVENTION|RISKS|CONTEXT|EXPECTED FILES|EXPECTEDFILES|PLAN):\s*(.*)$/i.exec(line.trim());
     if (header) {
       section = header[1].toUpperCase().replace(/\s+/g, '');
       buffers[section] = header[2] ? [header[2]] : [];
@@ -177,6 +215,13 @@ export function planFromText(markdown: string, version: number): Plan | undefine
       const match = /^[-*]\s*(.+?)(?:\s+—\s+|\s+-\s+)(.*)$/.exec(line.trim());
       if (match) {
         context.push({ ...parseContextSource(match[1].trim()), role: match[2].trim() });
+      }
+      continue;
+    }
+    if (section === 'EXPECTEDFILES') {
+      const match = /^[-*]\s*(?:(modify|add|delete)\s+)?([^—-]+?)(?:\s+—\s+|-\s+)(.+)$/i.exec(line.trim());
+      if (match && validPlanPath(match[2].trim())) {
+        expectedFiles.push({ path: match[2].trim().replace(/^\.\//, ''), action: (match[1]?.toLowerCase() as PlanExpectedFileAction) || 'modify', reason: match[3].trim() });
       }
       continue;
     }
@@ -218,6 +263,7 @@ export function planFromText(markdown: string, version: number): Plan | undefine
     risks: risks.length > 0 ? risks.slice(0, 2) : undefined,
     whyNot: get('WHYNOT'),
     context: context.length > 0 ? context : undefined,
+    expectedFiles: expectedFiles.length > 0 ? expectedFiles : undefined,
     steps: steps.length > 0 ? steps : undefined,
   };
 
@@ -233,6 +279,7 @@ export function planFromText(markdown: string, version: number): Plan | undefine
     !plan.risks?.length &&
     !plan.whyNot &&
     !plan.context?.length &&
+    !plan.expectedFiles?.length &&
     !plan.steps?.length
   ) {
     return undefined;
@@ -289,6 +336,10 @@ export function planToText(plan: Plan): string {
       const range = entry.startLine ? `:${entry.startLine}${entry.endLine && entry.endLine !== entry.startLine ? `-${entry.endLine}` : ''}` : '';
       lines.push(`- ${entry.path}${range} — ${entry.role}`);
     });
+  }
+  if (plan.expectedFiles?.length) {
+    lines.push('EXPECTED FILES:');
+    plan.expectedFiles.forEach((entry) => lines.push(`- ${entry.action} ${entry.path} — ${entry.reason}`));
   }
   if (plan.steps?.length) {
     lines.push('PLAN:');

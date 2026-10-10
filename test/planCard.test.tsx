@@ -74,6 +74,22 @@ describe('PlanCard', () => {
     expect(html).not.toContain('ANSWER');
   });
 
+  it('shows expected files separately from evidence checked', () => {
+    const html = render({
+      version: 1,
+      status: 'draft',
+      what: 'Update the API client',
+      expectedFiles: [{ path: 'src/api/client.ts', action: 'modify', reason: 'Add the request' }],
+      context: [{ path: 'README.md', role: 'Existing API contract' }],
+      steps: ['Update the client'],
+    });
+    expect(html).toContain('EXPECTED FILES');
+    expect(html).toContain('src/api/client.ts');
+    expect(html).toContain('Add the request');
+    expect(html).toContain('EVIDENCE CHECKED');
+    expect(html).toContain('README.md');
+  });
+
   it('shows the version badge only from v2 on', () => {
     const first = render({ version: 1, status: 'draft', what: 'Add the endpoint', steps: ['Add it'] });
     expect(first).not.toContain('plan-version');

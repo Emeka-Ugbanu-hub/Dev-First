@@ -113,11 +113,8 @@ export function buildLevelView(
   }
   const ranked = [...edgeAgg.values()].sort((a, b) => b.count - a.count);
   for (const edge of ranked.slice(0, MAX_LEVEL_EDGES)) {
-    const label = edge.label
-      ? `${edge.label}${edge.count > 1 ? ` ×${edge.count}` : ''}`
-      : edge.count > 1
-        ? `×${edge.count}`
-        : '';
+    // Aggregation keeps the overview readable; it must not imply a source count.
+    const label = edge.label ?? '';
     const safe = clipEdgeLabel(label);
     if (safe) {
       lines.push(`  ${edge.from} -->|${safe}| ${edge.to}`);

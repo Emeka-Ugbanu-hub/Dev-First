@@ -18,29 +18,26 @@ export interface MapGenerateDeps {
   onProgress?: (text: string, done?: boolean) => void;
 }
 
-export const MAP_SYSTEM_PROMPT = `You are a software architect. The digest below is supporting context, not the whole picture.
-Explore this codebase however you think is best to understand how it actually works.
-Base every label and arrow on what you read. Trust files over the digest.
+export const MAP_SYSTEM_PROMPT = `You are generating an architecture graph for a software project. The digest is supporting context, not the whole picture.
+Use the read-only tools to inspect the important entry points and boundaries when the digest is incomplete. Base every node, path, and arrow on code you actually read or on explicit indexed evidence. Never guess.
 
-Your diagram exists so a developer who has never seen this codebase can look at it
-and understand how it works. Preserve the structural understanding: the layers,
-the components, their responsibilities, and how data moves between them. The result
-should read like a clear explanation of the architecture, not a list of files.
+Return only graph data. Do not return explanations, descriptions, prose, diagrams, or markdown.
 
-Then respond with a single JSON object only (no prose, no code fences, no markdown):
-{"nodes":[{"id":"ui","label":"Components","group":"Frontend","path":"src/components"}],"edges":[{"from":"ui","to":"api","label":"calls"}]}
+Then respond with a single JSON object only:
+{"nodes":[{"id":"ui","label":"Components","group":"Frontend","path":"src/components"}],"edges":[{"from":"ui","to":"api","label":"invokes","evidence":[{"path":"src/App.tsx","line":48}]}]}
 
 Rules:
 - Build the hierarchy with groups for the main areas (Frontend, Backend, Services, Database, External Services...). A group name is 1-3 words. Groups may nest with "/" (for example "Backend/Services") when it makes the architecture clearer.
 - Every node must belong to a group. Keep each group to at most 7 nodes; when a group grows bigger, split it into nested subgroups ("Frontend/Screens", "Frontend/Shell", "Frontend/Components"). Aim for a Project -> area -> sub-area -> component hierarchy of 2-3 levels.
 - One root node named after the project, connected to the main areas.
-- Real components of THIS codebase as nodes; label every node yourself, 1-3 words; labels only, no descriptions.
-- Edge labels describe behavior: reads, writes, calls, sends, emits, queries, returns. Show data movement between UI, backend, database, external APIs.
+- Real components of THIS codebase as nodes; label every node yourself, 1-3 words; labels only, no descriptions. Every node path must be a real file or folder you saw.
+- Edge labels describe only verified behavior: imports, invokes, emits, listens, reads, writes, calls, queries, returns. Every edge must include at least one supporting file path and line in evidence.
 - Mark entry points, database/storage, and external services explicitly through their labels or groups.
-- Never invent files, components, or services not supported by what you read. Omit rather than guess.
+- Never invent files, components, services, edges, directions, or counts not supported by what you read. Omit rather than guess.
 - Each node may include a "path": a real folder or file relative to the project root that represents that node. Only include paths you actually saw. Omit the field when unsure.
-- Keep it readable: at most 40 nodes and 60 edges.
+- Keep the overview readable by grouping related files; do not omit a project area just because the repository is large.
 - ids are short lowercase identifiers; every edge must reference existing node ids.
+- Evidence entries use this shape: {"path":"relative/file","line":12}. Keep evidence concise.
 - Output the JSON object only — nothing before or after it.`;
 
 const DEFAULT_MAX_STEPS = 30;

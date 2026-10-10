@@ -152,6 +152,27 @@ export function PlanCard({
 
               {sections.filter((section) => section.key !== 'tradeoff').map(renderSection)}
 
+              {plan.expectedFiles && plan.expectedFiles.length > 0 && (
+                <div className="plan-section">
+                  <div className="plan-section-label">EXPECTED FILES</div>
+                  <ul className="plan-context">
+                    {plan.expectedFiles.map((entry, index) => (
+                      <li key={`${entry.path}-${index}`}>
+                        <button
+                          className="plan-context-link"
+                          title={`Open ${entry.path}`}
+                          onClick={() => post({ type: 'openFile', path: entry.path })}
+                        >
+                          <span className="codicon codicon-go-to-file" /> {entry.path}
+                        </button>
+                        <span className={`plan-file-action plan-file-${entry.action}`}>{entry.action}</span>
+                        <span className="plan-context-role"> — {entry.reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               {plan.context && plan.context.length > 0 && (
                 <div className="plan-section">
                   <div className="plan-section-label">EVIDENCE CHECKED</div>

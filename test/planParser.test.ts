@@ -9,6 +9,17 @@ import {
 import { buildPlannerSystemPrompt } from '../src/planner/prompts';
 
 describe('planFromObject', () => {
+  it('parses expected files and fills missing files from steps', () => {
+    const plan = planFromObject({
+      steps: ['Update src/api/client.ts and add src/api/types.ts'],
+      expectedFiles: [{ path: 'src/api/client.ts', action: 'modify', reason: 'Use the new endpoint' }],
+    }, 1);
+    expect(plan?.expectedFiles).toEqual([
+      { path: 'src/api/client.ts', action: 'modify', reason: 'Use the new endpoint' },
+      { path: 'src/api/types.ts', action: 'modify', reason: 'Named in the implementation step' },
+    ]);
+  });
+
   it('parses a full plan', () => {
     const plan = planFromObject(
       {

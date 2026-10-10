@@ -1,14 +1,22 @@
 import { createHash } from 'node:crypto';
 import type { MapPaths, StructuredMap } from './mapValidate';
+import type { ArchitectureScanCoverage } from '../scan/duplication';
+
+export interface ArchitectureMapCoverage extends ArchitectureScanCoverage {
+  indexedFiles: number;
+  representedFiles: number;
+  unresolvedRelationships: number;
+}
 
 export interface StoredArchitectureMap {
-  version: 2;
+  version: 3;
   filesHash: string;
   mermaid: string;
   paths: MapPaths;
   structured: StructuredMap;
   model: string;
   generatedAt: number;
+  coverage: ArchitectureMapCoverage;
 }
 
 export const ARCHITECTURE_MAP_KEY = 'devFirst.architectureMap';
@@ -26,7 +34,7 @@ export function readStoredMap(state: {
     return undefined;
   }
   const candidate = stored as Partial<StoredArchitectureMap> & { paths?: unknown };
-  if (candidate.version !== 2) {
+  if (candidate.version !== 3) {
     return undefined;
   }
   if (
@@ -50,6 +58,17 @@ export function readStoredMap(state: {
     clean[nodeId] = value;
   }
   const structured = candidate.structured as unknown;
+  const coverage = candidate.coverage as Partial<ArchitectureMapCoverage> | undefined;
+  if (!coverage || typeof coverage !== 'object') {
+    return undefined;
+  }
+  const coverageNumbers = ['indexedFiles', 'representedFiles', 'unsupportedSourceFiles', 'parseFailures', 'oversizedSourceFiles', 'unresolvedRelationships'] as const;
+  if (coverageNumbers.some((key) => typeof coverage[key] !== 'number' || !Number.isFinite(coverage[key]))) {
+    return undefined;
+  }
+  if (typeof coverage.scanLimitReached !== 'boolean') {
+    return undefined;
+  }
   if (!structured || typeof structured !== 'object') {
     return undefined;
   }
@@ -59,13 +78,22 @@ export function readStoredMap(state: {
     return undefined;
   }
   return {
-    version: 2,
+    version: 3,
     filesHash: candidate.filesHash,
     mermaid: candidate.mermaid,
     paths: clean,
     structured: structured as StructuredMap,
     model: candidate.model,
     generatedAt: candidate.generatedAt,
+    coverage: {
+      indexedFiles: coverage.indexedFiles as number,
+      representedFiles: coverage.representedFiles as number,
+      unsupportedSourceFiles: coverage.unsupportedSourceFiles as number,
+      parseFailures: coverage.parseFailures as number,
+      oversizedSourceFiles: coverage.oversizedSourceFiles as number,
+      scanLimitReached: coverage.scanLimitReached,
+      unresolvedRelationships: coverage.unresolvedRelationships as number,
+    },
   };
 }
 

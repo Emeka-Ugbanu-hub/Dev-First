@@ -1439,6 +1439,41 @@ button:active:not(:disabled) {
   line-height: 1.6;
 }
 
+.interrupted-badge {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--df-space-3);
+  margin-top: var(--df-space-3);
+  padding: var(--df-space-2) var(--df-space-4);
+  border: 1px solid var(--df-border);
+  border-radius: var(--df-radius-lg);
+  background: var(--df-surface);
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--df-font-small);
+}
+
+.interrupted-badge .codicon {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.interrupted-badge-text {
+  color: var(--vscode-descriptionForeground);
+}
+
+.interrupted-action {
+  padding: var(--df-space-1) var(--df-space-4);
+  border: 1px solid var(--df-border);
+  border-radius: var(--df-radius-md);
+  color: var(--vscode-foreground);
+  background: var(--df-hover);
+  font-size: var(--df-font-small);
+}
+
+.interrupted-action:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.14));
+}
+
 .notice-row {
   display: flex;
   align-items: center;
@@ -2586,6 +2621,44 @@ body.vscode-light .hljs-meta {
   color: inherit;
 }
 
+.queue-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  align-self: flex-end;
+  padding: 1px 6px;
+  border: 1px solid var(--df-border);
+  border-radius: var(--df-radius-lg);
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--df-font-micro);
+}
+
+.queue-status-chip button {
+  display: inline-flex;
+  color: inherit;
+}
+
+.queue-status-running {
+  color: var(--vscode-progressBar-background, #0e70c0);
+  border-color: var(--vscode-progressBar-background, #0e70c0);
+}
+
+.queue-status-paused {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+  border-color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.queue-status-cancelled {
+  color: var(--vscode-errorForeground);
+  border-color: var(--vscode-errorForeground);
+}
+
+.queue-recovered-hint {
+  align-self: flex-end;
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--df-font-micro);
+}
+
 .user-actions {
   display: flex;
   gap: 6px;
@@ -2717,6 +2790,86 @@ body.vscode-light .hljs-meta {
   color: var(--vscode-foreground);
   border-color: var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
   background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.15));
+}
+
+/* ---------- Recovery card ---------- */
+
+.recovery-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--df-space-3);
+  margin: var(--df-space-4) 0;
+  padding: var(--df-space-4) var(--df-space-5);
+  border: 1px solid var(--vscode-inputValidation-warningBorder, var(--df-border));
+  border-radius: var(--df-radius-lg);
+  background: var(--df-surface);
+  flex-shrink: 0;
+  animation: df-fade-slide var(--df-transition-slow) var(--df-ease) both;
+}
+
+.recovery-header {
+  display: flex;
+  align-items: center;
+  gap: var(--df-space-3);
+  font-size: var(--df-font-label);
+  font-weight: 600;
+}
+
+.recovery-header .codicon {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+.recovery-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--df-radius-md);
+  color: var(--vscode-descriptionForeground);
+}
+
+.recovery-dismiss:hover {
+  color: var(--vscode-foreground);
+  background: var(--df-hover);
+}
+
+.recovery-request {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: var(--df-font-body);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.recovery-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--df-space-2);
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--df-font-small);
+}
+
+.recovery-pending {
+  font-size: var(--df-font-small);
+  color: var(--vscode-foreground);
+}
+
+.recovery-pending-note {
+  color: var(--vscode-descriptionForeground);
+}
+
+.recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--df-space-3);
+}
+
+.recovery-note {
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--df-font-small);
 }
 
 /* ---------- Plan task list (the plan card is the single task card) ---------- */
@@ -3337,6 +3490,16 @@ body.vscode-light .hljs-meta {
   color: var(--vscode-descriptionForeground);
 }
 
+.plan-file-action {
+  margin-left: 5px;
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--vscode-descriptionForeground);
+}
+
+.plan-file-add { color: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); }
+.plan-file-delete { color: var(--vscode-errorForeground); }
+
 .plan-steps {
   margin: 0;
   padding-left: 20px;
@@ -3681,10 +3844,22 @@ body.vscode-light .hljs-meta {
 .queued-prompt {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   min-height: 36px;
   padding: 4px 9px;
   color: var(--vscode-foreground);
+}
+
+.queued-prompt .queue-status-chip {
+  align-self: center;
+  flex-shrink: 0;
+}
+
+.queued-prompt-recovered {
+  flex-basis: 100%;
+  padding-left: 19px;
+  align-self: flex-start;
 }
 
 .queued-prompt + .queued-prompt {

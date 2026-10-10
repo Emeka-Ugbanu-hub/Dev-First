@@ -1,6 +1,7 @@
 import { memo, useEffect, useState } from 'react';
-import type { ToolActivity, UiMessage } from '../../../src/shared/protocol';
+import type { QueuedPromptRecord, ToolActivity, UiMessage } from '../../../src/shared/protocol';
 import { Markdown, InlineMarkdown } from '../lib/markdown';
+import { queueStatusLabel } from '../lib/queueStatus';
 import { post } from '../vscode';
 import { ThinkingRow } from './ThinkingRow';
 import { Collapsible } from './Collapsible';
@@ -10,11 +11,18 @@ function MessageBubbleComponent({
   message,
   mcpDisplay,
   viewableRuns,
+  queueStatus,
+  queueRecovered,
+  onContinueInterrupted,
 }: {
   message: UiMessage;
   mcpDisplay: 'plain' | 'markdown';
   viewableRuns?: string[];
+  queueStatus?: QueuedPromptRecord['status'];
+  queueRecovered?: boolean;
+  onContinueInterrupted?: () => void;
 }) {
+  const [interruptedDismissed, setInterruptedDismissed] = useState(false);
   if (message.role === 'notice' && message.kind === 'error') {
     return (
       <div className="error-row">
@@ -112,7 +120,7 @@ function MessageBubbleComponent({
   }
 
   if (message.role === 'user') {
-    return <UserMessage message={message} />;
+    return <UserMessage message={message} queueStatus={queueStatus} queueRecovered={queueRecovered} />;
   }
 
   return (
@@ -121,6 +129,26 @@ function MessageBubbleComponent({
         {message.reasoning && <ThinkingRow text={message.reasoning} streaming={Boolean(message.streaming)} />}
         {message.text && <Markdown text={message.text} streaming={Boolean(message.streaming)} />}
         {message.streaming && <span className="cursor-blink" />}
+        {message.interrupted && !interruptedDismissed && (
+          <div className="interrupted-badge">
+            <span className="codicon codicon-warning" />
+            <span className="interrupted-badge-text">Response interrupted</span>
+            <button
+              className="interrupted-action"
+              title="Prefill the composer to continue this response"
+              onClick={() => onContinueInterrupted?.()}
+            >
+              Continue
+            </button>
+            <button
+              className="interrupted-action"
+              title="Keep the partial text and hide this notice"
+              onClick={() => setInterruptedDismissed(true)}
+            >
+              Discard
+            </button>
+          </div>
+        )}
         {message.activities && message.activities.length > 0 && (
           <ActivityGroup activities={message.activities} mcpDisplay={mcpDisplay} />
         )}
@@ -212,10 +240,19 @@ function CompletionFiles({
   );
 }
 
-function UserMessage({ message }: { message: UiMessage }) {
+function UserMessage({
+  message,
+  queueStatus,
+  queueRecovered,
+}: {
+  message: UiMessage;
+  queueStatus?: QueuedPromptRecord['status'];
+  queueRecovered?: boolean;
+}) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.text);
   const [preview, setPreview] = useState<string | null>(null);
+  const queueLabel = queueStatus ? queueStatusLabel(queueStatus) : null;
 
   useEffect(() => {
     if (!preview) {
@@ -290,17 +327,38 @@ function UserMessage({ message }: { message: UiMessage }) {
           <div className="bubble user-bubble">{message.text}</div>
         )}
 
-        {message.queued && (
-          <div className="queued-badge">
-            <span className="codicon codicon-clock" /> queued
-            <button
-              onClick={() => post({ type: 'cancelQueued', id: message.id })}
-              title="Cancel queued message"
-              aria-label="Cancel queued message"
-            >
-              <span className="codicon codicon-close" />
-            </button>
-          </div>
+        {queueStatus !== undefined ? (
+          queueLabel !== null && (
+            <div className={`queue-status-chip queue-status-${queueStatus}`}>
+              <span className="codicon codicon-clock" /> {queueLabel}
+              {queueStatus === 'queued' && (
+                <button
+                  onClick={() => post({ type: 'cancelQueued', id: message.id })}
+                  title="Cancel queued message"
+                  aria-label="Cancel queued message"
+                >
+                  <span className="codicon codicon-close" />
+                </button>
+              )}
+            </div>
+          )
+        ) : (
+          message.queued && (
+            <div className="queued-badge">
+              <span className="codicon codicon-clock" /> queued
+              <button
+                onClick={() => post({ type: 'cancelQueued', id: message.id })}
+                title="Cancel queued message"
+                aria-label="Cancel queued message"
+              >
+                <span className="codicon codicon-close" />
+              </button>
+            </div>
+          )
+        )}
+
+        {queueRecovered && queueStatus === 'queued' && (
+          <div className="queue-recovered-hint">Recovered — won't run automatically.</div>
         )}
 
         {preview && (
@@ -455,6 +513,11 @@ export const MessageBubble = memo(
     previous.mcpDisplay === next.mcpDisplay &&
     previous.message === next.message &&
     sameRuns(previous.viewableRuns, next.viewableRuns) &&
+    previous.queueStatus === next.queueStatus &&
+    previous.queueRecovered === next.queueRecovered &&
+    previous.onContinueInterrupted === next.onContinueInterrupted &&
     !isLiveMessage(previous.message) &&
     !isLiveMessage(next.message),
 );
+
+export { queueStatusLabel };

@@ -21,7 +21,7 @@ class FakeMemento {
 }
 
 const stored: StoredArchitectureMap = {
-  version: 2,
+  version: 3,
   filesHash: architectureFilesHash(['src/a.ts', 'src/b.ts']),
   mermaid: 'flowchart TD\n  n1["App"]',
   paths: { n1: 'src/a.ts' },
@@ -34,6 +34,15 @@ const stored: StoredArchitectureMap = {
   },
   model: 'test-model',
   generatedAt: 1700000000000,
+  coverage: {
+    indexedFiles: 2,
+    representedFiles: 2,
+    unsupportedSourceFiles: 0,
+    parseFailures: 0,
+    oversizedSourceFiles: 0,
+    scanLimitReached: false,
+    unresolvedRelationships: 0,
+  },
 };
 
 describe('architectureFilesHash', () => {
@@ -71,7 +80,7 @@ describe('map store', () => {
     await state.update(ARCHITECTURE_MAP_KEY, 'nope');
     expect(readStoredMap(state)).toBeUndefined();
 
-    await state.update(ARCHITECTURE_MAP_KEY, { ...stored, version: 1 });
+    await state.update(ARCHITECTURE_MAP_KEY, { ...stored, version: 2 });
     expect(readStoredMap(state)).toBeUndefined();
 
     await state.update(ARCHITECTURE_MAP_KEY, { ...stored, structured: undefined });

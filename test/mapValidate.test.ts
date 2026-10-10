@@ -36,15 +36,31 @@ describe('parseStructuredMap', () => {
     expect(map?.edges).toEqual([{ from: 'auth_service', to: 'db', label: 'writes' }]);
   });
 
-  it('caps nodes and rejects unusable payloads', () => {
+  it('keeps large payloads and rejects unusable payloads', () => {
     const nodes = Array.from({ length: 70 }, (_value, index) => ({
       id: `n${index}`,
       label: `Node ${index}`,
     }));
-    expect(parseStructuredMap(JSON.stringify({ nodes }))?.nodes).toHaveLength(60);
+    expect(parseStructuredMap(JSON.stringify({ nodes }))?.nodes).toHaveLength(70);
     expect(parseStructuredMap('not json')).toBeUndefined();
     expect(parseStructuredMap(JSON.stringify({ edges: [] }))).toBeUndefined();
     expect(parseStructuredMap(JSON.stringify({ nodes: [{ id: '', label: '' }] }))).toBeUndefined();
+  });
+
+  it('preserves bounded edge evidence for later inspection', () => {
+    const map = parseStructuredMap(JSON.stringify({
+      nodes: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }],
+      edges: [{
+        from: 'a',
+        to: 'b',
+        label: 'calls',
+        evidence: [
+          { path: './src/a.ts', line: 12 },
+          { path: 'src/b.ts', line: 0 },
+        ],
+      }],
+    }));
+    expect(map?.edges[0].evidence).toEqual([{ path: 'src/a.ts', line: 12 }]);
   });
 });
 

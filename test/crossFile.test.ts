@@ -671,7 +671,7 @@ describe('findCoverageAsymmetry', () => {
 });
 
 describe('findStaleFeatureFlags', () => {
-  it('reports a flag referenced in a single file', () => {
+  it('does not call a single-file flag stale without lifecycle evidence', () => {
     const files: FileFacts[] = [
       facts('file:///workspace/f0.ts', {
         constants: [
@@ -687,8 +687,7 @@ describe('findStaleFeatureFlags', () => {
       files.push(facts(`file:///workspace/f${index}.ts`));
     }
     const findings = findStaleFeatureFlags({ files });
-    expect(findings).toHaveLength(1);
-    expect(findings[0].message).toContain('FEATURE_NEW_UI');
+    expect(findings).toEqual([]);
   });
 
   it('stays quiet with fewer than twenty indexed files', () => {
@@ -765,6 +764,34 @@ describe('findDuplicateTypeDefinitions', () => {
       files: [
         facts('file:///workspace/a.ts', { types: [typeDecl('T', 'type', 1), typeDecl('Box', 'class', 2)] }),
         facts('file:///workspace/b.ts', { types: [typeDecl('T', 'type', 1), typeDecl('Box', 'class', 2)] }),
+      ],
+    };
+    expect(findDuplicateTypeDefinitions(index)).toEqual([]);
+  });
+
+  it('ignores component-local generic Props declarations', () => {
+    const index = {
+      files: [
+        facts('file:///workspace/Avatar.tsx', {
+          types: [typeDecl('Props', 'interface', 1, { exported: false })],
+        }),
+        facts('file:///workspace/Footer.tsx', {
+          types: [typeDecl('Props', 'interface', 2, { exported: false })],
+        }),
+      ],
+    };
+    expect(findDuplicateTypeDefinitions(index)).toEqual([]);
+  });
+
+  it('does not join same-named contracts from unrelated directories', () => {
+    const index = {
+      files: [
+        facts('file:///workspace/ui/UserProfile.ts', {
+          types: [typeDecl('UserProfile', 'interface', 1)],
+        }),
+        facts('file:///workspace/api/UserProfile.ts', {
+          types: [typeDecl('UserProfile', 'interface', 2)],
+        }),
       ],
     };
     expect(findDuplicateTypeDefinitions(index)).toEqual([]);
@@ -1333,7 +1360,7 @@ describe('findDuplicateStateStores', () => {
     });
   });
 
-  it('reports the same storage key in multiple files', () => {
+  it('does not treat repeated storage keys as duplicated state', () => {
     const index = {
       files: [
         facts('file:///workspace/a.ts', {
@@ -1348,8 +1375,7 @@ describe('findDuplicateStateStores', () => {
       ],
     };
     const findings = findDuplicateStateStores(index);
-    expect(findings).toHaveLength(2);
-    expect(findings.every((finding) => finding.message.includes('theme'))).toBe(true);
+    expect(findings).toEqual([]);
   });
 });
 

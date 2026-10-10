@@ -258,6 +258,11 @@ export function pairFinding(candidate: PairCandidate, verdict: PairVerdict): Cro
         message: `AI twin "${candidate.right.name}"`,
       },
     ],
+    confidence: 'high',
+    evidence: [
+      { path: candidate.left.file, line: candidate.left.line + 1 },
+      { path: candidate.right.file, line: candidate.right.line + 1 },
+    ],
   };
 }
 
@@ -266,7 +271,7 @@ function capNotice(file: string, skipped: number): CrossFileFinding {
     ruleId: 'xf-pair-cap',
     category: 'smell',
     severity: 'info',
-    message: `${skipped} more candidate pairs were not AI-judged — raise scanAiCrossFileMaxPairs or run Scan Whole File.`,
+    message: `${skipped} more related-file candidates were not reviewed in this pass.`,
     file,
     line: 0,
     related: [],

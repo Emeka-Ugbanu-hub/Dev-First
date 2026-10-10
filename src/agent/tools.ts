@@ -577,6 +577,20 @@ export const submitPlanTool: ToolDef = {
           required: ['path', 'role'],
         },
       },
+      expectedFiles: {
+        type: 'array',
+        description:
+          'Expected files execution will modify, add, or delete. Keep this concise and separate it from context files that were only read. Existing paths must be workspace-relative; new files may be listed with action add.',
+        items: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Workspace-relative file path.' },
+            action: { type: 'string', enum: ['modify', 'add', 'delete'] },
+            reason: { type: 'string', description: 'Short reason this file is expected to change.' },
+          },
+          required: ['path', 'action', 'reason'],
+        },
+      },
       trivial: {
         type: 'boolean',
         description:

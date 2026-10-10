@@ -41,19 +41,12 @@ describe('SETTINGS_SCHEMA', () => {
     expect(properties).not.toHaveProperty('devFirst.autoRunSimple');
   });
 
-  it('ships the cross-file AI pair settings with safe defaults', () => {
+  it('does not expose obsolete scanner controls', () => {
     const properties = packageJson.contributes.configuration.properties;
-    expect(properties['devFirst.scanAiCrossFile']).toMatchObject({
-      type: 'boolean',
-      default: true,
-    });
-    expect(properties['devFirst.scanAiCrossFileMaxPairs']).toMatchObject({
-      type: 'number',
-      default: 3,
-      minimum: 0,
-    });
-    expect(SETTING_KEYS.has('scanAiCrossFile')).toBe(true);
-    expect(SETTING_KEYS.has('scanAiCrossFileMaxPairs')).toBe(true);
+    expect(properties).not.toHaveProperty('devFirst.scanAiCrossFile');
+    expect(properties).not.toHaveProperty('devFirst.scanAiCrossFileMaxPairs');
+    expect(SETTING_KEYS.has('scanAiCrossFile')).toBe(false);
+    expect(SETTING_KEYS.has('scanAiCrossFileMaxPairs')).toBe(false);
   });
 
   it('ships the request timeout settings with safe defaults', () => {

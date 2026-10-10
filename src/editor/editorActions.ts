@@ -50,10 +50,10 @@ export function registerEditorIntegration(session: SessionController): vscode.Di
       { scheme: 'file' },
       {
         provideCodeActions(document, range) {
+          const actions: vscode.CodeAction[] = [];
           if (range.isEmpty) {
             return [];
           }
-          const actions: vscode.CodeAction[] = [];
           if (diagnosticsInRange(document, range).length > 0) {
             const diagnosticAction = new vscode.CodeAction(
               'Dev-First: Fix (diagnostic)',

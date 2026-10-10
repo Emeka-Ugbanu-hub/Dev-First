@@ -180,7 +180,6 @@ function signalLines(facts: FileFacts[], root: string): string[] {
   for (const line of externals.slice(0, MAX_EXTERNAL_LINES)) {
     lines.push(line);
   }
-  lines.push('- Workers/queues: none detected');
   return lines;
 }
 

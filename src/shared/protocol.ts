@@ -8,6 +8,14 @@ export interface PlanContextEntry {
   endLine?: number;
 }
 
+export type PlanExpectedFileAction = 'modify' | 'add' | 'delete';
+
+export interface PlanExpectedFile {
+  path: string;
+  action: PlanExpectedFileAction;
+  reason: string;
+}
+
 export interface Plan {
   version: number;
   status: 'draft' | 'approved' | 'completed';
@@ -24,6 +32,7 @@ export interface Plan {
   risks?: string[];
   whyNot?: string;
   context?: PlanContextEntry[];
+  expectedFiles?: PlanExpectedFile[];
   steps?: string[];
   skippedSteps?: number[];
   filePath?: string;
@@ -53,6 +62,56 @@ export interface TodoItem {
   checkpointId?: string;
 }
 
+export type RunStatus = 'planned' | 'approved' | 'executing' | 'waiting' | 'interrupted' | 'stopped' | 'failed' | 'completed';
+export type RunOperationStatus = 'started' | 'succeeded' | 'failed';
+
+export interface RunOperation {
+  id: string;
+  tool: string;
+  target?: string;
+  status: RunOperationStatus;
+  startedAt: number;
+  finishedAt?: number;
+}
+
+export type PendingDecisionKind = 'terminal' | 'question';
+
+export interface PendingDecisionRecord {
+  id: string;
+  kind: PendingDecisionKind;
+  prompt: string;
+  command?: string;
+  cwd?: string;
+  step?: string;
+  createdAt: number;
+}
+
+export interface QueuedPromptRecord {
+  id: string;
+  text: string;
+  status: 'queued' | 'running' | 'paused' | 'completed' | 'cancelled';
+  createdAt: number;
+}
+
+export interface RunRecord {
+  id: string;
+  sessionId: string;
+  request: string;
+  provider: string;
+  model: string;
+  status: RunStatus;
+  planVersion: number;
+  stepIndex: number;
+  completedSteps: number[];
+  activeTool?: string;
+  checkpointId?: string;
+  workspaceHash: string;
+  operations: RunOperation[];
+  pending?: PendingDecisionRecord;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface UiMessage {
   id: string;
   role: 'user' | 'assistant' | 'notice';
@@ -79,6 +138,7 @@ export interface UiMessage {
   planSnapshot?: { title: string; steps?: string[] };
   changedFiles?: ChangedFile[];
   runId?: string;
+  interrupted?: boolean;
 }
 
 export interface ChangedFile {
@@ -228,6 +288,8 @@ export interface UiState {
   provider: string;
   model: string;
   pasteFileLines: number;
+  queued?: QueuedPromptRecord[];
+  recovery?: { run: RunRecord };
 }
 
 export type WebviewMessage =
@@ -260,6 +322,9 @@ export type WebviewMessage =
   | { type: 'approvePlan' }
   | { type: 'discardPlan' }
   | { type: 'stop' }
+  | { type: 'resumeRun'; id: string }
+  | { type: 'discardRun'; id: string }
+  | { type: 'rollbackRun'; id: string }
   | { type: 'newSession' }
   | { type: 'switchSession'; id: string }
   | { type: 'deleteSession'; id: string }

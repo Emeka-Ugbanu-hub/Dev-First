@@ -22,6 +22,14 @@ const fakeVscode = {
     visibleTextEditors: [],
     activeTextEditor: undefined,
     createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {}, text: '', tooltip: '', command: '' }),
+    createOutputChannel: () => ({
+      append() {},
+      appendLine() {},
+      show() {},
+      hide() {},
+      clear() {},
+      dispose() {},
+    }),
   },
   StatusBarAlignment: { Left: 1, Right: 2 },
   env: { clipboard: { readText: async () => '' } },
@@ -48,6 +56,7 @@ const fakeVscode = {
     registerCodeLensProvider: () => disposable(),
     registerCodeActionsProvider: () => disposable(),
     registerHoverProvider: () => disposable(),
+    getDiagnostics: () => [],
   },
   CodeAction: class {
     constructor(title, kind) {

@@ -9,6 +9,15 @@ interface MapMessage {
   stale: boolean;
   generatedAt: number;
   model: string;
+  coverage?: {
+    indexedFiles: number;
+    representedFiles: number;
+    unsupportedSourceFiles: number;
+    parseFailures: number;
+    oversizedSourceFiles: number;
+    scanLimitReached: boolean;
+    unresolvedRelationships: number;
+  };
 }
 
 interface EmptyMessage {
@@ -275,7 +284,20 @@ async function renderMap(message: MapMessage): Promise<void> {
   progressLines = [];
   hideBanner();
   setRefreshing(false);
-  setHint(message.stale ? 'code changed — reload to update' : '');
+  const missing = message.coverage
+    ? Math.max(0, message.coverage.indexedFiles - message.coverage.representedFiles)
+    : 0;
+  const coverageNotes: string[] = [];
+  if (missing > 0) coverageNotes.push(`${missing} indexed files not shown`);
+  if (message.coverage && message.coverage.unsupportedSourceFiles > 0) {
+    coverageNotes.push(`${message.coverage.unsupportedSourceFiles} unsupported`);
+  }
+  if (message.coverage && message.coverage.parseFailures > 0) {
+    coverageNotes.push(`${message.coverage.parseFailures} parse failures`);
+  }
+  if (message.coverage?.scanLimitReached) coverageNotes.push('scan limit reached');
+  const coverageHint = coverageNotes.join(' · ');
+  setHint(message.stale ? 'code changed — reload to update' : coverageHint);
   if (!diagram) {
     return;
   }

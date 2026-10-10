@@ -3,7 +3,7 @@ import * as path from 'path';
 import { promises as fs } from 'fs';
 import { DiffManager } from '../diff/DiffManager';
 import { AgentService } from '../agent/AgentService';
-import { ToolBox } from '../agent/ToolBox';
+import { ToolBox, ToolExecutionContext } from '../agent/ToolBox';
 import { PlannerService } from '../planner/PlannerService';
 import { ChatMessage, LLMProvider, ToolCall, ToolDef, UsageTotals } from '../llm/types';
 import {
@@ -13,10 +13,15 @@ import {
   MessageAttachment,
   ModelMetadata,
   PastedContent,
+  PendingDecisionRecord,
   Phase,
   Plan,
   ProviderConnection,
+  QueuedPromptRecord,
   QuestionRequest,
+  RunOperation,
+  RunRecord,
+  RunStatus,
   SelectionContext,
   TerminalApprovalDecision,
   TerminalApprovalRequest,
@@ -41,6 +46,7 @@ import {
 import { HttpError } from '../llm/errors';
 import { adaptiveKind } from '../llm/adaptive';
 import { SessionStore, StoredSession } from './SessionStore';
+import { RunJournalStore } from './RunJournalStore';
 import { PromptFamily, promptFamilyFor } from '../planner/prompts';
 import { ReasoningOptions } from '../llm/types';
 import {
@@ -84,6 +90,7 @@ import { LocalEmbedder } from '../indexing/LocalEmbedder';
 import { McpManager } from '../mcp/McpManager';
 import { BrowserSession } from '../browser/BrowserSession';
 import { CheckpointManager } from '../checkpoints/CheckpointManager';
+import { architectureFilesHash } from '../architecture/mapStore';
 import { chatWithRetry } from '../llm/retry';
 import { appendDelta } from '../shared/stream';
 import { ReviewFileDiff } from '../review/changeset';
@@ -175,6 +182,7 @@ function normalizeStoredMessage(value: unknown, index: number): UiMessage | unde
     ...(typeof raw.reasoning === 'string' ? { reasoning: raw.reasoning } : {}),
     ...(typeof raw.quote === 'string' ? { quote: raw.quote } : {}),
     ...(raw.queued === true ? { queued: true } : {}),
+    ...(raw.interrupted === true ? { interrupted: true } : {}),
     ...(raw.action === 'openSettings' ? { action: raw.action } : {}),
     ...(planSnapshot ? { planSnapshot } : {}),
     ...(typeof raw.runId === 'string' && raw.runId ? { runId: raw.runId } : {}),
@@ -252,7 +260,13 @@ export class SessionController {
     quote?: string;
     images?: string[];
     pastes?: PastedContent[];
+    createdAt: number;
   }> = [];
+  private readonly runJournal: RunJournalStore;
+  private currentRun: RunRecord | undefined;
+  private recoveryRun: RunRecord | undefined;
+  private runningQueued: { id: string; text: string; createdAt: number } | undefined;
+  private disposed = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -268,6 +282,7 @@ export class SessionController {
     this.memory = new MemoryStore(workspaceRoot() ?? process.cwd(), context.globalStorageUri.fsPath);
     this.background = new BackgroundProcesses(workspaceRoot() ?? process.cwd());
     this.store = new SessionStore(path.join(context.globalStorageUri.fsPath, 'sessions'));
+    this.runJournal = new RunJournalStore(path.join(context.globalStorageUri.fsPath, 'runs'));
     void this.initializeSession();
     void this.cleanupPasteFiles();
     this.disposables.push(diffManager.onDidChangePendingChanges(() => this.pushChanges()));
@@ -321,6 +336,8 @@ export class SessionController {
       provider: config.provider,
       model: config.model,
       pasteFileLines: config.pasteFileLines,
+      queued: this.queuedRecords(),
+      ...(this.recoveryRun ? { recovery: { run: this.recoveryRun } } : {}),
     };
   }
 
@@ -332,12 +349,14 @@ export class SessionController {
       const stored = await this.store.load(target.id);
       if (stored) {
         this.applySession(stored);
+        await this.recoverRuns();
         await this.cleanupStaleConnectionNotice();
         this.postSessions(await this.store.list());
         return;
       }
     }
     await this.migrateLegacySession();
+    await this.recoverRuns();
     await this.cleanupStaleConnectionNotice();
     this.postSessions(await this.store.list());
   }
@@ -412,7 +431,22 @@ export class SessionController {
     this.lastUserMessageId = [...this.uiMessages].reverse().find((message) => message.role === 'user')?.id;
     this.lastCheckpointId = undefined;
     this.streamingMessageId = null;
-    this.queuedMessages = [];
+    this.queuedMessages = (Array.isArray(stored.queued) ? stored.queued : [])
+      .filter(
+        (record) =>
+          record &&
+          typeof record.id === 'string' &&
+          typeof record.text === 'string' &&
+          record.status !== 'completed' &&
+          record.status !== 'cancelled',
+      )
+      .map((record) => ({
+        id: record.id,
+        text: record.text,
+        createdAt: typeof record.createdAt === 'number' ? record.createdAt : Date.now(),
+      }));
+    this.runningQueued = undefined;
+    this.currentRun = undefined;
     void this.context.workspaceState.update(ACTIVE_SESSION_KEY, this.sessionId);
   }
 
@@ -439,6 +473,7 @@ export class SessionController {
       planVersion: this.planVersion,
       lastRequest: this.lastRequest,
       contextTokens: this.contextTokens,
+      queued: this.queuedRecords(),
     };
   }
 
@@ -465,6 +500,7 @@ export class SessionController {
       return;
     }
     this.applySession(stored);
+    await this.loadRecoveryRun();
     this.pushState();
     this.postSessions();
   }
@@ -514,6 +550,9 @@ export class SessionController {
     this.compressionsThisTurn = 0;
     this.streamingMessageId = null;
     this.queuedMessages = [];
+    this.runningQueued = undefined;
+    this.currentRun = undefined;
+    this.recoveryRun = undefined;
     this.approvalMemory.clear();
     this.externalDirectories.clear();
     void this.context.workspaceState.update(ACTIVE_SESSION_KEY, this.sessionId);
@@ -930,6 +969,15 @@ export class SessionController {
       case 'stop':
         this.stop();
         break;
+      case 'resumeRun':
+        await this.resumeRun(message.id);
+        break;
+      case 'discardRun':
+        await this.discardRun(message.id);
+        break;
+      case 'rollbackRun':
+        await this.rollbackRun(message.id);
+        break;
       case 'newSession':
         this.newSession();
         break;
@@ -1060,10 +1108,21 @@ export class SessionController {
     this.cancelPendingApprovals();
     this.cancelPendingQuestion();
     this.abortController?.abort();
+    if (this.currentRun && (this.currentRun.status === 'executing' || this.currentRun.status === 'waiting')) {
+      this.currentRun.pending = undefined;
+      this.markRun('stopped');
+    }
   }
 
   private requestUserAnswer(request: QuestionRequest): Promise<string> {
     this.currentQuestion = request;
+    this.setRunPending({
+      id: request.id,
+      kind: 'question',
+      prompt: request.question,
+      createdAt: Date.now(),
+      ...(this.activeStepLabel() ? { step: this.activeStepLabel() as string } : {}),
+    });
     this.needsInputListener?.('the agent asked you a question');
     this.post({ type: 'question', request });
     return new Promise<string>((resolve) => {
@@ -1078,6 +1137,7 @@ export class SessionController {
     }
     this.pendingQuestions.delete(id);
     this.currentQuestion = null;
+    this.clearRunPending();
     this.post({ type: 'question', request: null });
     resolve(answer);
   }
@@ -1089,6 +1149,7 @@ export class SessionController {
     this.pendingQuestions.clear();
     if (this.currentQuestion) {
       this.currentQuestion = null;
+      this.clearRunPending();
       this.post({ type: 'question', request: null });
     }
   }
@@ -1096,6 +1157,9 @@ export class SessionController {
   private cancelQueued(id: string): void {
     this.queuedMessages = this.queuedMessages.filter((message) => message.id !== id);
     this.uiMessages = this.uiMessages.filter((message) => message.id !== id);
+    if (this.runningQueued?.id === id) {
+      this.runningQueued = undefined;
+    }
     this.post({ type: 'removeMessage', id });
     this.persist();
   }
@@ -1105,6 +1169,7 @@ export class SessionController {
     if (!next) {
       return undefined;
     }
+    this.runningQueued = { id: next.id, text: next.text, createdAt: next.createdAt };
     const uiMessage = this.uiMessages.find((message) => message.id === next.id);
     if (uiMessage) {
       uiMessage.queued = false;
@@ -1246,8 +1311,13 @@ export class SessionController {
   }
 
   dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
     this.stop();
     clearTimeout(this.persistTimer);
+    void this.store.save(this.snapshotSession()).catch(() => undefined);
     this.browser?.dispose();
     this.mcp.dispose();
     this.background.dispose();
@@ -1605,6 +1675,7 @@ export class SessionController {
         quote,
         images: cappedImages,
         pastes,
+        createdAt: Date.now(),
       });
       this.uiMessages.push(queued);
       this.post({ type: 'addMessage', message: queued });
@@ -1679,6 +1750,7 @@ export class SessionController {
       reasoning: this.reasoningOptions(plannerReasoningSupported, preset.id),
       resolveReasoning: () => this.reasoningOptions(plannerReasoningSupported, preset.id),
       reasoningSwitch: this.reasoningSwitchEnabled(),
+      workspaceRoot: root,
     });
     this.abortController = new AbortController();
 
@@ -1749,8 +1821,10 @@ export class SessionController {
       }
     } catch (error) {
       if (isAbortError(error)) {
+        this.markStreamingInterrupted();
         this.addNotice('Stopped.');
       } else {
+        this.markStreamingInterrupted();
         this.addError(errorMessage(error));
       }
     } finally {
@@ -1759,6 +1833,7 @@ export class SessionController {
       this.abortController = null;
       this.reasoningOverride = undefined;
       this.reasoningChanges = 0;
+      this.runningQueued = undefined;
       this.processNextQueued();
     }
   }
@@ -1881,6 +1956,7 @@ export class SessionController {
     if (!next) {
       return;
     }
+    this.runningQueued = { id: next.id, text: next.text, createdAt: next.createdAt };
     const uiMessage = this.uiMessages.find((message) => message.id === next.id);
     if (uiMessage) {
       uiMessage.queued = false;
@@ -1926,12 +2002,38 @@ export class SessionController {
       id: this.lastUserMessageId ?? randomId('run'),
       label: this.lastRequest.replace(/\s+/g, ' ').trim().slice(0, 60) || 'Task',
     });
+    const now = Date.now();
+    if (!this.currentRun) {
+      this.currentRun = {
+        id: randomId('run'),
+        sessionId: this.sessionId,
+        request: this.lastRequest,
+        provider: preset.provider,
+        model: config.model,
+        status: 'approved',
+        planVersion: this.planVersion,
+        stepIndex: 0,
+        completedSteps: [],
+        operations: [],
+        ...(this.lastCheckpointId ? { checkpointId: this.lastCheckpointId } : {}),
+        workspaceHash: this.lastCheckpointId ?? (await this.hashWorkspaceFiles()),
+        createdAt: now,
+        updatedAt: now,
+      };
+    } else {
+      if (!this.currentRun.checkpointId && this.lastCheckpointId) {
+        this.currentRun.checkpointId = this.lastCheckpointId;
+      }
+      this.currentRun.updatedAt = now;
+    }
+    await this.saveRunNow();
     if (approve) {
       plan.status = 'approved';
       this.post({ type: 'plan', plan });
       this.persist();
     }
     this.setPhase('executing');
+    this.markRun('executing');
     this.abortController = new AbortController();
 
     const executorReasoningSupported =
@@ -1980,10 +2082,23 @@ export class SessionController {
           `Reached the step limit (${config.maxSteps}). Review the changes, then send a message to continue.`,
         );
       }
+      this.markRun('completed');
     } catch (error) {
       if (isAbortError(error)) {
+        this.markStreamingInterrupted();
+        if (this.currentRun) {
+          this.currentRun.pending = undefined;
+        }
+        if (this.currentRun && (this.currentRun.status === 'executing' || this.currentRun.status === 'waiting')) {
+          this.markRun('interrupted');
+        }
         this.addNotice('Stopped.');
       } else {
+        this.markStreamingInterrupted();
+        if (this.currentRun) {
+          this.currentRun.pending = undefined;
+        }
+        this.markRun('failed');
         this.addError(errorMessage(error));
       }
     } finally {
@@ -2192,6 +2307,9 @@ export class SessionController {
     try {
       const checkpointId = await this.checkpoints.snapshot(title);
       this.lastCheckpointId = checkpointId;
+      if (this.currentRun && checkpointId && !this.currentRun.checkpointId) {
+        this.currentRun.checkpointId = checkpointId;
+      }
       if (!checkpointId || !this.lastUserMessageId) {
         return;
       }
@@ -2303,7 +2421,21 @@ export class SessionController {
 
   private buildToolbox(allowTask = true): ToolBox {
     const config = getConfig();
-    return new ToolBox({
+    const controller = this;
+    class JournalToolBox extends ToolBox {
+      async execute(name: string, argsJson: string, context: ToolExecutionContext): Promise<string> {
+        const operationId = controller.beginRunOperation(name, argsJson);
+        try {
+          const result = await super.execute(name, argsJson, context);
+          controller.finishRunOperation(operationId, !result.startsWith('Error:'));
+          return result;
+        } catch (error) {
+          controller.finishRunOperation(operationId, false);
+          throw error;
+        }
+      }
+    }
+    return new JournalToolBox({
       root: workspaceRoot() ?? process.cwd(),
       diffManager: this.diffManager,
       terminalTimeoutSeconds: config.terminalTimeout,
@@ -2375,6 +2507,15 @@ export class SessionController {
   private requestApproval(command: string, cwd: string): Promise<TerminalApprovalDecision> {
     const id = randomId('term');
     this.currentApproval = { id, command, cwd };
+    this.setRunPending({
+      id,
+      kind: 'terminal',
+      prompt: command,
+      command,
+      cwd,
+      createdAt: Date.now(),
+      ...(this.activeStepLabel() ? { step: this.activeStepLabel() as string } : {}),
+    });
     this.needsInputListener?.('a command is waiting for Allow or Deny');
     this.post({ type: 'terminalApproval', request: this.currentApproval });
     return new Promise<TerminalApprovalDecision>((resolve) => {
@@ -2389,6 +2530,7 @@ export class SessionController {
     }
     this.pendingApprovals.delete(id);
     this.currentApproval = null;
+    this.clearRunPending();
     this.post({ type: 'terminalApproval', request: null });
     resolve(decision);
   }
@@ -2400,6 +2542,7 @@ export class SessionController {
     this.pendingApprovals.clear();
     if (this.currentApproval) {
       this.currentApproval = null;
+      this.clearRunPending();
       this.post({ type: 'terminalApproval', request: null });
     }
   }
@@ -2609,6 +2752,7 @@ export class SessionController {
     this.todos = mergeTodoCheckpoints(previous, todos);
     this.post({ type: 'todos', todos: this.todos });
     this.persist();
+    this.recordRunProgress();
     for (const index of findNewlyStartedTodos(previous, this.todos)) {
       void this.snapshotTodoStep(index);
     }
@@ -2977,6 +3121,279 @@ export class SessionController {
     this.persist();
   }
 
+  private queuedRecords(): QueuedPromptRecord[] {
+    const records: QueuedPromptRecord[] = [];
+    if (this.runningQueued) {
+      records.push({
+        id: this.runningQueued.id,
+        text: this.runningQueued.text,
+        status: 'running',
+        createdAt: this.runningQueued.createdAt,
+      });
+    }
+    for (const message of this.queuedMessages) {
+      records.push({ id: message.id, text: message.text, status: 'queued', createdAt: message.createdAt });
+    }
+    return records;
+  }
+
+  private async saveRunNow(): Promise<void> {
+    const run = this.currentRun;
+    if (!run) {
+      return;
+    }
+    await this.saveRun(run);
+  }
+
+  private async saveRun(run: RunRecord): Promise<void> {
+    run.updatedAt = Date.now();
+    try {
+      await this.runJournal.save(run);
+    } catch {}
+  }
+
+  private markRun(status: RunStatus): void {
+    const run = this.currentRun;
+    if (!run) {
+      return;
+    }
+    run.status = status;
+    run.updatedAt = Date.now();
+    void this.saveRun(run);
+    if (status === 'interrupted') {
+      this.recoveryRun = run;
+    } else if (this.recoveryRun?.id === run.id) {
+      this.recoveryRun = undefined;
+    }
+    if (status === 'completed' || status === 'stopped' || status === 'failed' || status === 'interrupted') {
+      this.currentRun = undefined;
+    }
+  }
+
+  private beginRunOperation(tool: string, argsJson: string): string | undefined {
+    const run = this.currentRun;
+    if (!run || (run.status !== 'executing' && run.status !== 'waiting')) {
+      return undefined;
+    }
+    const target = this.operationTarget(argsJson);
+    const operation: RunOperation = {
+      id: randomId('op'),
+      tool,
+      status: 'started',
+      startedAt: Date.now(),
+      ...(target ? { target } : {}),
+    };
+    run.operations = [...run.operations, operation].slice(-500);
+    run.activeTool = tool;
+    run.updatedAt = Date.now();
+    void this.saveRunNow();
+    return operation.id;
+  }
+
+  private finishRunOperation(id: string | undefined, ok: boolean): void {
+    if (!id) {
+      return;
+    }
+    const run = this.currentRun;
+    if (!run) {
+      return;
+    }
+    const operation = run.operations.find((candidate) => candidate.id === id);
+    if (operation) {
+      operation.status = ok ? 'succeeded' : 'failed';
+      operation.finishedAt = Date.now();
+    }
+    run.activeTool = undefined;
+    run.updatedAt = Date.now();
+    void this.saveRunNow();
+  }
+
+  private operationTarget(argsJson: string): string | undefined {
+    try {
+      const args = JSON.parse(argsJson) as Record<string, unknown>;
+      if (typeof args.path === 'string') return args.path;
+      if (typeof args.command === 'string') return args.command;
+      if (typeof args.directory === 'string') return args.directory;
+    } catch {}
+    return undefined;
+  }
+
+  private setRunPending(pending: PendingDecisionRecord): void {
+    const run = this.currentRun;
+    if (!run) {
+      return;
+    }
+    run.pending = pending;
+    if (run.status === 'executing') {
+      run.status = 'waiting';
+    }
+    run.updatedAt = Date.now();
+    void this.saveRunNow();
+  }
+
+  private clearRunPending(): void {
+    const run = this.currentRun;
+    if (!run || !run.pending) {
+      return;
+    }
+    run.pending = undefined;
+    if (run.status === 'waiting') {
+      run.status = 'executing';
+    }
+    run.updatedAt = Date.now();
+    void this.saveRunNow();
+  }
+
+  private activeStepLabel(): string | undefined {
+    const inProgress = this.todos.find((todo) => todo.status === 'in_progress');
+    if (inProgress) {
+      return inProgress.text;
+    }
+    const index = this.currentRun?.stepIndex ?? 0;
+    return this.plan?.steps?.[index];
+  }
+
+  private recordRunProgress(): void {
+    const run = this.currentRun;
+    if (!run) {
+      return;
+    }
+    const done = this.todos
+      .map((todo, index) => (todo.status === 'done' ? index : -1))
+      .filter((index) => index >= 0);
+    run.completedSteps = [...new Set([...run.completedSteps, ...done])].sort((a, b) => a - b);
+    const active = this.todos.findIndex((todo) => todo.status === 'in_progress' || todo.status === 'pending');
+    run.stepIndex = active >= 0 ? active : this.todos.length;
+    run.updatedAt = Date.now();
+    void this.saveRunNow();
+  }
+
+  private async hashWorkspaceFiles(): Promise<string> {
+    try {
+      const root = workspaceRoot() ?? process.cwd();
+      return architectureFilesHash(await listWorkspaceFiles(root, { maxEntries: 5000 }));
+    } catch {
+      return '';
+    }
+  }
+
+  private async currentWorkspaceHash(run: RunRecord): Promise<string> {
+    if (run.checkpointId) {
+      return run.checkpointId;
+    }
+    return this.hashWorkspaceFiles();
+  }
+
+  private async recoverRuns(): Promise<void> {
+    let runs: RunRecord[] = [];
+    try {
+      runs = await this.runJournal.list();
+    } catch {
+      runs = [];
+    }
+    for (const run of runs) {
+      if (run.status === 'executing' || run.status === 'waiting') {
+        run.status = 'interrupted';
+        run.updatedAt = Date.now();
+        try {
+          await this.runJournal.save(run);
+        } catch {}
+      }
+    }
+    this.selectRecoveryRun(runs);
+  }
+
+  private async loadRecoveryRun(): Promise<void> {
+    let runs: RunRecord[] = [];
+    try {
+      runs = await this.runJournal.list();
+    } catch {
+      runs = [];
+    }
+    this.selectRecoveryRun(runs);
+  }
+
+  private selectRecoveryRun(runs: RunRecord[]): void {
+    this.recoveryRun = runs
+      .filter((run) => run.sessionId === this.sessionId && run.status === 'interrupted')
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  }
+
+  private async resumeRun(id: string): Promise<void> {
+    const run = await this.runJournal.load(id);
+    if (!run || run.status !== 'interrupted') {
+      this.addNotice('That run cannot be resumed.');
+      return;
+    }
+    if (run.activeTool) {
+      this.addNotice('That run was interrupted during a tool call. Review the workspace changes before continuing.');
+      return;
+    }
+    if (run.workspaceHash !== (await this.currentWorkspaceHash(run))) {
+      this.addNotice('The workspace changed since that run was interrupted. Start a new request instead.');
+      return;
+    }
+    if (run.sessionId !== this.sessionId) {
+      const stored = await this.store.load(run.sessionId);
+      if (!stored) {
+        this.addNotice('The session for that run no longer exists.');
+        return;
+      }
+      this.applySession(stored);
+      if (stored.plan) {
+        this.plan = stored.plan;
+      }
+    }
+    if (!this.plan || this.plan.status === 'completed') {
+      this.addNotice('The plan for that run is no longer available.');
+      return;
+    }
+    const provider = await this.buildProvider();
+    if (!provider) {
+      return;
+    }
+    run.status = 'approved';
+    run.activeTool = undefined;
+    run.pending = undefined;
+    run.updatedAt = Date.now();
+    this.currentRun = run;
+    this.recoveryRun = undefined;
+    await this.saveRunNow();
+    this.pushState();
+    await this.startExecution(this.plan, provider, true);
+  }
+
+  private async discardRun(id: string): Promise<void> {
+    await this.runJournal.remove(id);
+    if (this.currentRun?.id === id) {
+      this.currentRun = undefined;
+    }
+    if (this.recoveryRun?.id === id) {
+      this.recoveryRun = undefined;
+    }
+    this.pushState();
+  }
+
+  private async rollbackRun(id: string): Promise<void> {
+    const run = this.recoveryRun?.id === id ? this.recoveryRun : await this.runJournal.load(id);
+    if (run?.checkpointId) {
+      await this.revertToCheckpoint(run.checkpointId);
+    }
+    await this.discardRun(id);
+  }
+
+  private markStreamingInterrupted(): void {
+    if (!this.streamingMessageId) {
+      return;
+    }
+    const message = this.uiMessages.find((candidate) => candidate.id === this.streamingMessageId);
+    if (!message || (!message.text.trim() && !message.reasoning?.trim())) {
+      return;
+    }
+    message.interrupted = true;
+    void this.persistNow();
+  }
+
   private persist(): void {
     clearTimeout(this.persistTimer);
     this.persistTimer = setTimeout(() => {
@@ -2984,7 +3401,7 @@ export class SessionController {
     }, 300);
   }
 
-  private async persistNow(): Promise<void> {
+  async persistNow(): Promise<void> {
     try {
       await this.store.save(this.snapshotSession());
     } catch {
