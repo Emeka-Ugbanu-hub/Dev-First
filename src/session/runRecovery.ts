@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { parsePatch } from '../agent/patch';
-import { PendingDecisionRecord, RunChangedFile, RunOperation } from '../shared/protocol';
+import { PendingDecisionRecord, RunChangedFile, RunOperation, RunRecord } from '../shared/protocol';
 import { randomId } from '../util/id';
 
 export const MAX_STEP_HASHES = 200;
@@ -57,7 +57,7 @@ export function upsertRunChangedFile(
   const next = files ? [...files] : [];
   const index = next.findIndex((file) => file.path === entry.path);
   if (index < 0) {
-    next.push({ path: entry.path, status: entry.status });
+    next.push({ ...entry });
     return next;
   }
   const merged = mergeRunFileStatus(next[index].status, entry.status);
@@ -65,7 +65,7 @@ export function upsertRunChangedFile(
     next.splice(index, 1);
     return next;
   }
-  next[index] = { path: entry.path, status: merged };
+  next[index] = { ...next[index], ...entry, status: merged };
   return next;
 }
 
@@ -210,4 +210,41 @@ export async function buildRunOperation(
     }
   }
   return operation;
+}
+
+export function mutationTargets(tool: string, argsJson: string): string[] {
+  let args: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(argsJson) as unknown;
+    if (parsed && typeof parsed === 'object') {
+      args = parsed as Record<string, unknown>;
+    }
+  } catch {}
+  if (tool === 'write_file' || tool === 'edit_file' || tool === 'str_replace') {
+    return typeof args.path === 'string' && args.path.trim() ? [args.path.trim()] : [];
+  }
+  if (tool === 'apply_patch') {
+    const patch = typeof args.patch === 'string' ? args.patch : '';
+    return parsePatch(patch).map((entry) => entry.path);
+  }
+  return [];
+}
+
+export function operationAfterHash(run: Pick<RunRecord, 'operations'>, filePath: string): string | undefined {
+  for (let index = run.operations.length - 1; index >= 0; index--) {
+    const operation = run.operations[index];
+    if (operation.tool === 'write_file' || operation.tool === 'edit_file') {
+      if (operation.target === filePath && operation.afterHash) {
+        return operation.afterHash;
+      }
+      continue;
+    }
+    if (operation.tool === 'apply_patch') {
+      const entry = parseOperationExpectations(operation).find((candidate) => candidate.path === filePath);
+      if (entry?.captured && entry.after) {
+        return entry.after;
+      }
+    }
+  }
+  return undefined;
 }

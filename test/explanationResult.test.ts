@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { rm } from 'fs/promises';
 
 const env = vi.hoisted(() => ({
   config: {} as Record<string, unknown>,
@@ -91,10 +92,12 @@ function stubFetch(responses: string[]): void {
   });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   env.config = { preset: 'openai', model: 'gpt-4o' };
   env.secret = 'sk-test';
   vi.stubEnv('HOME', '/tmp/dev-first-explanation-test-home');
+  await rm('/tmp/dev-first-explanation-test-global', { recursive: true, force: true });
+  await rm('/tmp/dev-first-explanation-test', { recursive: true, force: true });
 });
 
 afterEach(() => {

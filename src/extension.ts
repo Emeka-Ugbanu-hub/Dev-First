@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { DiffManager } from './diff/DiffManager';
 import { DiffCodeLensProvider } from './diff/DiffCodeLensProvider';
 import { ORIGINAL_SCHEME, OriginalContentProvider } from './diff/OriginalContentProvider';
@@ -16,6 +17,7 @@ import { ChatViewProvider } from './webview/ChatViewProvider';
 import { getConfig, promptForApiKey, workspaceRoot } from './config';
 import { activeProvider } from './llm/activeProvider';
 import { PRESETS, findPreset } from './llm/presets';
+import { cleanupStaleTemps } from './util/atomicWrite';
 import { WorktreeManager } from './worktree/WorktreeManager';
 import { worktreeMergeConflictPrompt } from './worktree/prompts';
 import { ScanRunner } from './scan/scanner';
@@ -33,6 +35,8 @@ import {
 
 export function activate(context: vscode.ExtensionContext): void {
   const diffManager = DiffManager.getInstance();
+  void cleanupStaleTemps(workspaceRoot() ?? process.cwd(), 24 * 60 * 60 * 1000);
+  void cleanupStaleTemps(path.join(context.globalStorageUri.fsPath, 'file-snapshots'), 24 * 60 * 60 * 1000);
   const codeLensProvider = new DiffCodeLensProvider(diffManager);
   context.subscriptions.push(
     vscode.languages.registerCodeLensProvider({ scheme: 'file' }, codeLensProvider),

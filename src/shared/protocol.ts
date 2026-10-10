@@ -80,6 +80,9 @@ export interface RunOperation {
 export interface RunChangedFile {
   path: string;
   status: 'modified' | 'added' | 'deleted';
+  originalHash?: string;
+  captured?: boolean;
+  absent?: boolean;
 }
 
 export interface RunProcessRecord {
@@ -365,6 +368,7 @@ export type WebviewMessage =
   | { type: 'openFileDiff'; path: string; runId: string }
   | { type: 'openRunReview'; runId: string }
   | { type: 'revertRunFile'; path: string; runId?: string }
+  | { type: 'revertRunFileForce'; path: string; runId?: string }
   | { type: 'acceptRunReview'; runId: string }
   | { type: 'stopRunProcess'; runId: string; pid: number }
   | { type: 'forgetRunProcess'; runId: string; pid: number }
@@ -400,6 +404,7 @@ export type HostMessage =
   | { type: 'activity'; messageId: string; activity: ToolActivity }
   | { type: 'changes'; changes: ChangeSummary[]; currentRunId?: string }
   | { type: 'runReview'; runId: string; files: RunReviewFile[] }
+  | { type: 'runReviewConflict'; runId: string; path: string }
   | { type: 'rejectConflict'; path: string }
   | {
       type: 'redoState';

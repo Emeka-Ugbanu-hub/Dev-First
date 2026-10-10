@@ -56,6 +56,8 @@ import {
   buildRunOperation,
   classifyOperationRetry,
   filterAlivePids,
+  mutationTargets,
+  operationAfterHash,
   parseOperationExpectations,
   serializeOperationExpectations,
   sha1File,
@@ -105,6 +107,8 @@ import { LocalEmbedder } from '../indexing/LocalEmbedder';
 import { McpManager } from '../mcp/McpManager';
 import { BrowserSession } from '../browser/BrowserSession';
 import { CheckpointManager } from '../checkpoints/CheckpointManager';
+import { FileSnapshotEntry, FileSnapshotStore, SnapshotCaptureResult } from '../checkpoints/FileSnapshotStore';
+import { writeFileAtomic } from '../util/atomicWrite';
 import { architectureFilesHash } from '../architecture/mapStore';
 import { chatWithRetry } from '../llm/retry';
 import { appendDelta } from '../shared/stream';
@@ -236,6 +240,7 @@ export class SessionController {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly mcp = new McpManager();
   private readonly checkpoints: CheckpointManager;
+  private readonly fileSnapshots: FileSnapshotStore;
   private semanticIndex: SemanticIndex | undefined;
   private localEmbedder: LocalEmbedder | undefined;
   private browser: BrowserSession | undefined;
@@ -294,6 +299,7 @@ export class SessionController {
       workspaceRoot() ?? process.cwd(),
       path.join(context.globalStorageUri.fsPath, 'checkpoints'),
     );
+    this.fileSnapshots = new FileSnapshotStore(path.join(context.globalStorageUri.fsPath, 'file-snapshots'));
     this.registry = new ModelRegistry(path.join(context.globalStorageUri.fsPath, 'models-cache.json'));
     this.connections = new ConnectionsStore(context.globalState);
     this.memory = new MemoryStore(workspaceRoot() ?? process.cwd(), context.globalStorageUri.fsPath);
@@ -1067,6 +1073,9 @@ export class SessionController {
         break;
       case 'revertRunFile':
         await this.revertRunFile(message.path, message.runId);
+        break;
+      case 'revertRunFileForce':
+        await this.revertRunFileForce(message.path, message.runId);
         break;
       case 'rejectRun':
         for (const conflictPath of await this.diffManager.rejectRun(message.runId)) {
@@ -2072,7 +2081,6 @@ export class SessionController {
       ? executorReasoning.effort ?? (executorReasoning.enabled ? 'on' : 'off')
       : undefined;
 
-    await this.createCheckpoint(plan.title ?? 'run');
     this.diffManager.setRunContext({
       id: this.lastUserMessageId ?? randomId('run'),
       label: this.lastRequest.replace(/\s+/g, ' ').trim().slice(0, 60) || 'Task',
@@ -2377,27 +2385,6 @@ export class SessionController {
     const message = this.ensureStreamingMessage();
     message.reasoning = appendDelta(message.reasoning ?? '', delta);
     this.post({ type: 'reasoningDelta', id: message.id, text: delta });
-  }
-
-  private async createCheckpoint(title: string): Promise<void> {
-    try {
-      const checkpointId = await this.checkpoints.snapshot(title);
-      this.lastCheckpointId = checkpointId;
-      if (this.currentRun && checkpointId && !this.currentRun.checkpointId) {
-        this.currentRun.checkpointId = checkpointId;
-      }
-      if (!checkpointId || !this.lastUserMessageId) {
-        return;
-      }
-      const message = this.uiMessages.find((candidate) => candidate.id === this.lastUserMessageId);
-      if (message) {
-        message.checkpointId = checkpointId;
-        this.post({ type: 'checkpoint', messageId: message.id, checkpointId });
-        this.persist();
-      }
-    } catch {
-      // checkpoints are best effort
-    }
   }
 
   private async revertToCheckpoint(checkpointId: string): Promise<void> {
@@ -3282,15 +3269,47 @@ export class SessionController {
     if (!run || (run.status !== 'executing' && run.status !== 'waiting')) {
       return undefined;
     }
-    const operation = await buildRunOperation(tool, argsJson, workspaceRoot() ?? process.cwd());
+    const root = workspaceRoot() ?? process.cwd();
+    const operation = await buildRunOperation(tool, argsJson, root);
     if (!operation) {
       return undefined;
     }
     run.operations = [...run.operations, operation].slice(-500);
     run.activeTool = tool;
     run.updatedAt = Date.now();
+    await this.captureRunTargets(run, tool, argsJson, root);
     void this.saveRunNow();
     return operation.id;
+  }
+
+  private async captureRunTargets(run: RunRecord, tool: string, argsJson: string, root: string): Promise<void> {
+    const targets = mutationTargets(tool, argsJson);
+    if (targets.length === 0) {
+      return;
+    }
+    let result: SnapshotCaptureResult;
+    try {
+      result = await this.fileSnapshots.capture(run.id, root, targets);
+    } catch {
+      return;
+    }
+    const entries = new Map<string, FileSnapshotEntry>(
+      (await this.fileSnapshots.index(run.id)).map((entry) => [entry.path, entry]),
+    );
+    for (const capturedPath of result.captured) {
+      const entry = entries.get(capturedPath);
+      run.changedFiles = upsertRunChangedFile(run.changedFiles, {
+        path: capturedPath,
+        status: entry?.absent ? 'added' : 'modified',
+        ...(entry ? { originalHash: entry.hash, captured: true, absent: entry.absent === true } : {}),
+      });
+    }
+    if (result.skipped.length > 0) {
+      const listed = result.skipped.slice(0, 5).join(', ');
+      const extra = result.skipped.length > 5 ? ` and ${result.skipped.length - 5} more` : '';
+      const reason = result.limited ? 'too large/binary/limit' : 'too large/binary';
+      this.addNotice(`Snapshot skipped for ${listed}${extra} (${reason}) — revert may be incomplete.`);
+    }
   }
 
   private finishRunOperation(id: string | undefined, ok: boolean): void {
@@ -3442,6 +3461,7 @@ export class SessionController {
     } catch {
       runs = [];
     }
+    await this.fileSnapshots.prune(runs.map((run) => run.id));
     for (const run of runs) {
       if (run.status === 'executing' || run.status === 'waiting') {
         run.status = 'interrupted';
@@ -3461,6 +3481,7 @@ export class SessionController {
     } catch {
       runs = [];
     }
+    await this.fileSnapshots.prune(runs.map((run) => run.id));
     await this.selectRecoveryRun(runs);
   }
 
@@ -3590,6 +3611,7 @@ export class SessionController {
 
   private async discardRun(id: string): Promise<void> {
     await this.runJournal.remove(id);
+    await this.fileSnapshots.remove(id);
     if (this.currentRun?.id === id) {
       this.currentRun = undefined;
     }
@@ -3602,8 +3624,36 @@ export class SessionController {
 
   private async rollbackRun(id: string): Promise<void> {
     const run = this.recoveryRun?.id === id ? this.recoveryRun : await this.runJournal.load(id);
-    if (run?.checkpointId) {
+    if (!run) {
+      await this.discardRun(id);
+      return;
+    }
+    if (run.checkpointId) {
       await this.revertToCheckpoint(run.checkpointId);
+      await this.discardRun(id);
+      return;
+    }
+    const conflicts: RunChangedFile[] = [];
+    for (const entry of run.changedFiles ?? []) {
+      const outcome = await this.restoreRunFile(run, entry.path, entry, false);
+      if (outcome === 'conflict') {
+        conflicts.push(entry);
+      }
+    }
+    if (conflicts.length > 0) {
+      run.changedFiles = conflicts;
+      run.updatedAt = Date.now();
+      await this.saveRun(run);
+      this.post({
+        type: 'runReview',
+        runId: run.id,
+        files: conflicts.map((file) => ({ path: file.path, status: file.status })),
+      });
+      this.addNotice(
+        `Rolled back the other files — ${conflicts.map((file) => file.path).join(', ')} changed since the run and were skipped.`,
+      );
+      this.pushState();
+      return;
     }
     await this.discardRun(id);
   }
@@ -3693,18 +3743,38 @@ export class SessionController {
       this.addNotice(`${filePath} is not part of this run review.`);
       return;
     }
-    const root = workspaceRoot() ?? process.cwd();
-    if (entry.status === 'added') {
-      await fs.rm(absoluteWorkspacePath(root, filePath), { force: true }).catch(() => undefined);
-    } else if (run.checkpointId) {
-      const restored = await this.checkpoints.restoreFile(run.checkpointId, filePath);
-      if (!restored) {
-        this.addNotice(`Could not restore ${filePath} from the run checkpoint.`);
-        return;
-      }
-    } else {
-      await this.diffManager.revertWholeFile(filePath);
+    const outcome = await this.restoreRunFile(run, filePath, entry, false);
+    if (outcome === 'conflict') {
+      this.post({ type: 'runReviewConflict', runId: run.id, path: filePath });
+      return;
     }
+    if (outcome === 'unavailable') {
+      this.addNotice(`Could not restore ${filePath} from the run checkpoint.`);
+      return;
+    }
+    await this.completeRunFileRevert(run, filePath);
+  }
+
+  private async revertRunFileForce(filePath: string, runId?: string): Promise<void> {
+    const run = runId ? await this.loadAnyRun(runId) : this.recoveryRun ?? this.currentRun;
+    if (!run) {
+      this.addNotice('No recovered run to revert in.');
+      return;
+    }
+    const entry = run.changedFiles?.find((file) => file.path === filePath);
+    if (!entry) {
+      this.addNotice(`${filePath} is not part of this run review.`);
+      return;
+    }
+    const outcome = await this.restoreRunFile(run, filePath, entry, true);
+    if (outcome === 'unavailable') {
+      this.addNotice(`Could not restore ${filePath} from the run checkpoint.`);
+      return;
+    }
+    await this.completeRunFileRevert(run, filePath);
+  }
+
+  private async completeRunFileRevert(run: RunRecord, filePath: string): Promise<void> {
     run.changedFiles = (run.changedFiles ?? []).filter((file) => file.path !== filePath);
     run.updatedAt = Date.now();
     await this.saveRun(run);
@@ -3714,6 +3784,65 @@ export class SessionController {
       files: (run.changedFiles ?? []).map((file) => ({ path: file.path, status: file.status })),
     });
     this.pushState();
+  }
+
+  private async restoreRunFile(
+    run: RunRecord,
+    filePath: string,
+    entry: RunChangedFile,
+    force: boolean,
+  ): Promise<'ok' | 'conflict' | 'unavailable'> {
+    const root = workspaceRoot() ?? process.cwd();
+    const absolute = absoluteWorkspacePath(root, filePath);
+    let snapshot: FileSnapshotEntry | undefined;
+    try {
+      snapshot = await this.fileSnapshots.entry(run.id, filePath);
+    } catch {}
+    const originalHash = entry.originalHash ?? snapshot?.hash;
+    const afterHash = operationAfterHash(run, filePath);
+    const currentHash = await sha1File(absolute);
+    const originAbsent = entry.absent === true || snapshot?.absent === true;
+
+    if (!force) {
+      if (originAbsent) {
+        if (currentHash === undefined) {
+          return 'ok';
+        }
+        if (afterHash && currentHash !== afterHash) {
+          return 'conflict';
+        }
+      } else if (originalHash) {
+        if (currentHash === originalHash) {
+          return 'ok';
+        }
+        if (afterHash && currentHash !== afterHash) {
+          return 'conflict';
+        }
+      } else if (afterHash && currentHash !== afterHash) {
+        return 'conflict';
+      }
+    }
+
+    if (snapshot && !snapshot.absent) {
+      const original = await this.fileSnapshots.readOriginal(run.id, filePath);
+      if (original !== undefined) {
+        await writeFileAtomic(absolute, original, snapshot.mode);
+        return 'ok';
+      }
+    }
+
+    if (originAbsent || entry.status === 'added') {
+      await fs.rm(absolute, { force: true }).catch(() => undefined);
+      return 'ok';
+    }
+
+    if (run.checkpointId) {
+      const restored = await this.checkpoints.restoreFile(run.checkpointId, filePath);
+      return restored ? 'ok' : 'unavailable';
+    }
+
+    await this.diffManager.revertWholeFile(filePath);
+    return 'ok';
   }
 
   private async resolveRecoveredDecision(runId: string, approved: boolean): Promise<void> {

@@ -122,6 +122,7 @@ export default function App() {
   const [prefill, setPrefill] = useState<{ text: string; nonce: number } | null>(null);
   const [dismissedRecovery, setDismissedRecovery] = useState<string | null>(null);
   const [runReview, setRunReview] = useState<{ runId: string; files: RunReviewFile[] } | null>(null);
+  const [runReviewConflicts, setRunReviewConflicts] = useState<string[]>([]);
   const [learnMoreOpen, setLearnMoreOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsValues, setSettingsValues] = useState<Record<string, unknown>>({});
@@ -261,7 +262,17 @@ export default function App() {
         return;
       }
       if (message.type === 'runReview') {
-        setRunReview(message.files.length > 0 ? { runId: message.runId, files: message.files } : null);
+        const files = message.files;
+        setRunReview(files.length > 0 ? { runId: message.runId, files } : null);
+        setRunReviewConflicts((previous) =>
+          previous.filter((path) => files.some((file) => file.path === path)),
+        );
+        return;
+      }
+      if (message.type === 'runReviewConflict') {
+        setRunReviewConflicts((previous) =>
+          previous.includes(message.path) ? previous : [...previous, message.path],
+        );
         return;
       }
       if (message.type === 'suggestion') {
@@ -834,7 +845,15 @@ export default function App() {
               onDismiss={() => setDismissedRecovery(recoveryKey)}
             />
           )}
-          {runReview && <RunReviewCard runId={runReview.runId} files={runReview.files} />}
+          {runReview && (
+            <RunReviewCard
+              runId={runReview.runId}
+              files={runReview.files}
+              conflicts={runReviewConflicts.filter((path) =>
+                runReview.files.some((file) => file.path === path),
+              )}
+            />
+          )}
           <ChatRenderBoundary key={activeSessionId}>
             <ChatView
               messages={visibleMessages}

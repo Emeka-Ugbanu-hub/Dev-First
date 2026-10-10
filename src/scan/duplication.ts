@@ -15,6 +15,7 @@ import {
   stringContent,
 } from './rules/analyzerUtils';
 import { listWorkspaceFiles, TEXT_EXTENSIONS } from '../util/fsWalk';
+import { writeFileAtomic } from '../util/atomicWrite';
 import { matchGlob } from '../util/glob';
 import { isRegexRule } from './ruleTypes';
 import { stripForAi } from './strip';
@@ -2924,7 +2925,7 @@ export class DuplicationIndex {
     }
     try {
       await fs.mkdir(path.dirname(this.options.storageFile), { recursive: true });
-      await fs.writeFile(this.options.storageFile, JSON.stringify(this.data));
+      await writeFileAtomic(this.options.storageFile, JSON.stringify(this.data));
     } catch {
       // storage is best effort
     }

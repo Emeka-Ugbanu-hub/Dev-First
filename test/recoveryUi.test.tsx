@@ -249,6 +249,14 @@ describe('RunReviewCard', () => {
     const element = mount(createElement(RunReviewCard, { runId: 'run1', files: [] }));
     expect(element.querySelector('.run-review-card')).toBeNull();
   });
+
+  it('shows a conflict warning with a force restore action', () => {
+    const element = mount(createElement(RunReviewCard, { runId: 'run1', files, conflicts: ['src/a.ts'] }));
+    expect(element.textContent).toContain("Couldn't revert — the file was edited since.");
+    expect(element.textContent).toContain('Restore anyway');
+    click(button(element, 'Restore anyway'));
+    expect(sent).toEqual([{ type: 'revertRunFileForce', path: 'src/a.ts', runId: 'run1' }]);
+  });
 });
 
 describe('queued prompt actions', () => {
