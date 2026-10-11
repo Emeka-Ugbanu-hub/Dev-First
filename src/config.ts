@@ -47,22 +47,9 @@ export interface DevFirstConfig {
   notifyOnInput: boolean;
   notifySound: NotifySound;
   keepAwake: boolean;
-  scanEnabled: boolean;
-  scanAst: boolean;
-  scanHotspots: boolean;
-  scanDuplication: boolean;
-  scanDuplicationThreshold: number;
-  scanCrossFile: boolean;
-  scanConventions: boolean;
-  scanMaxFileKb: number;
   scanMaxFiles: number;
   scanIgnore: string[];
-  scanNewOnly: boolean;
-  scanDisabledCategories: string[];
-  scanAi: boolean;
   scanAiModel: string;
-  scanAiCrossFile: boolean;
-  scanAiCrossFileMaxPairs: number;
   architecture: boolean;
   pasteFileLines: number;
 }
@@ -111,36 +98,13 @@ export function getConfig(): DevFirstConfig {
     notifyOnInput: config.get<boolean>('notifyOnInput', true),
     notifySound: config.get<NotifySound>('notifySound', 'chime'),
     keepAwake: config.get<boolean>('keepAwake', false),
-    scanEnabled: config.get<boolean>('scanEnabled', true),
-    scanAst: config.get<boolean>('scanAst', true),
-    scanHotspots: config.get<boolean>('scanHotspots', true),
-    scanDuplication: config.get<boolean>('scanDuplication', true),
-    scanDuplicationThreshold: Math.min(
-      1,
-      Math.max(0.5, config.get<number>('scanDuplicationThreshold', 0.8)),
-    ),
-    scanCrossFile: config.get<boolean>('scanCrossFile', true),
-    scanConventions: config.get<boolean>('scanConventions', true),
-    scanMaxFileKb: config.get<number>('scanMaxFileKb', 1024),
     scanMaxFiles: config.get<number>('scanMaxFiles', 2000),
     scanIgnore: config
       .get<string>('scanIgnore', DEFAULT_SCAN_IGNORE)
       .split(',')
       .map((entry) => entry.trim())
       .filter(Boolean),
-    scanNewOnly: config.get<boolean>('scanNewOnly', false),
-    scanDisabledCategories: config
-      .get<string>('scanDisabledCategories', '')
-      .split(',')
-      .map((entry) => entry.trim())
-      .filter(Boolean),
-    scanAi: config.get<boolean>('scanAi', true),
     scanAiModel: config.get<string>('scanAiModel', ''),
-    scanAiCrossFile: config.get<boolean>('scanAiCrossFile', true),
-    scanAiCrossFileMaxPairs: Math.max(
-      0,
-      Math.floor(config.get<number>('scanAiCrossFileMaxPairs', 3)),
-    ),
     architecture: config.get<boolean>('architecture', true),
     pasteFileLines: Math.max(20, config.get<number>('pasteFileLines', 120)),
   };

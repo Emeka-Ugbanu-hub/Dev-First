@@ -42,6 +42,7 @@ const AI_RULE_IDS = new Set([
   'ai-scalability',
 ]);
 const MAX_RELATED_PAIRS = 8;
+const CROSS_FILE_PAIRS = 3;
 const SEVERITIES: Record<ScanSeverity, vscode.DiagnosticSeverity> = {
   error: vscode.DiagnosticSeverity.Error,
   warning: vscode.DiagnosticSeverity.Warning,
@@ -82,6 +83,7 @@ export class ScanRunner implements vscode.Disposable {
         const config = getConfig();
         return {
           ...config,
+          scanAi: true,
           reasoning:
             config.reasoningEffort === 'off'
               ? undefined
@@ -93,7 +95,12 @@ export class ScanRunner implements vscode.Disposable {
       executeTool: readOnlyTools?.executeTool,
     });
     this.crossFileAi = new CrossFileAi({
-      getConfig: () => getConfig(),
+      getConfig: () => ({
+        ...getConfig(),
+        scanAi: true,
+        scanAiCrossFile: true,
+        scanAiCrossFileMaxPairs: CROSS_FILE_PAIRS,
+      }),
       buildProvider: () => this.buildScanProvider(),
       cache: {
         get: (key) => this.duplication.getPairVerdict(key),
@@ -107,7 +114,7 @@ export class ScanRunner implements vscode.Disposable {
         ? path.join(context.globalStorageUri.fsPath, 'duplication-index.json')
         : undefined,
       getScanIgnore: () => getConfig().scanIgnore,
-      getMaxFileKb: () => getConfig().scanMaxFileKb,
+      getMaxFileKb: () => 1024,
       getMaxFiles: () => getConfig().scanMaxFiles,
     });
     this.memory = new MemoryStore(
@@ -183,12 +190,10 @@ export class ScanRunner implements vscode.Disposable {
         return;
       }
       this.factsUpdated.fire();
-      if (getConfig().scanConventions) {
-        const mined = mineConventions({ files: facts });
-        if (mined.length > 0) {
-          this.conventions = await this.conventionPhraser.phrase(mined);
-          await this.writeConventions(this.conventions);
-        }
+      const mined = mineConventions({ files: facts });
+      if (mined.length > 0) {
+        this.conventions = await this.conventionPhraser.phrase(mined);
+        await this.writeConventions(this.conventions);
       }
       await this.projectModel.ensureFresh(this.conventions);
     } catch {
@@ -286,7 +291,7 @@ export class ScanRunner implements vscode.Disposable {
         return;
       }
       this.setScanStatus(`$(sync~spin) Scanning ${fileName}…`, 'Checking related files');
-      const relatedOk = await this.runPairPass(document, version, getConfig(), { force: true, all: true });
+      const relatedOk = await this.runPairPass(document, version, { force: true, all: true });
       if (!relatedOk) return;
       if (document.version !== version) {
         this.setScanStatus('$(circle-slash) Scan cancelled', 'The file changed while related files were checked.');
@@ -414,13 +419,9 @@ export class ScanRunner implements vscode.Disposable {
   private async runPairPass(
     document: vscode.TextDocument,
     version: number,
-    config: DevFirstConfig,
     options: { force?: boolean; all?: boolean } = {},
   ): Promise<boolean> {
     const key = document.uri.toString();
-    if (!config.scanCrossFile || !config.scanAiCrossFile) {
-      return true;
-    }
     try {
       const [facts, entries] = await Promise.all([
         this.duplication.getFacts(),
@@ -435,7 +436,7 @@ export class ScanRunner implements vscode.Disposable {
         force: options.force,
         maxPairs: Math.min(
           MAX_RELATED_PAIRS,
-          options.all ? candidates.length : config.scanAiCrossFileMaxPairs,
+          options.all ? candidates.length : CROSS_FILE_PAIRS,
         ),
       });
       if (this.disposed || document.version !== version) {
