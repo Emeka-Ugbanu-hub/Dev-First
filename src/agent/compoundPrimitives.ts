@@ -171,7 +171,7 @@ export class GeneratedFileError extends Error {
   }
 }
 
-const GENERATED_DIRECTORIES = new Set(['generated', 'dist', 'out', 'build']);
+const GENERATED_DIRECTORIES = new Set(['generated', '__generated__', 'dist', 'out', 'build']);
 const GENERATED_FILES = new Set([
   'package-lock.json',
   'npm-shrinkwrap.json',

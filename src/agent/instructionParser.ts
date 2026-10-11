@@ -113,8 +113,12 @@ export function setQuotedString(content: string, name: string, value: string): S
       lines: matches.map((match) => match.line),
     };
   }
-  const match = matches[0];
-  const replacement = `${match.valueQuote}${value}${match.valueQuote}`;
-  const updated = content.slice(0, match.valueStart) + replacement + content.slice(match.valueEnd);
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(
+    `((['"])${escaped}\\2\\s*:\\s*)(['"])((?:\\\\.|(?!\\3).)*)(\\3)`,
+  );
+  const updated = content.replace(pattern, (_full, prefix: string, _keyQuote: string, valueQuote: string) =>
+    `${prefix}${valueQuote}${value}${valueQuote}`,
+  );
   return { ok: true, content: updated, count: 1 };
 }
