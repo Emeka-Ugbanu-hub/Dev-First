@@ -5,6 +5,88 @@ const ACCEPT_HEADER =
   'text/markdown, text/html;q=0.9, application/json;q=0.8, text/plain;q=0.7, */*;q=0.1';
 const DEFAULT_TIMEOUT_SECONDS = 30;
 const MAX_TIMEOUT_SECONDS = 120;
+const MAX_RETRIES = 2;
+const FETCH_CACHE_TTL = 24 * 60 * 60 * 1000;
+const SEARCH_CACHE_TTL = 60 * 60 * 1000;
+const fetchCache = new Map<string, { expires: number; value: FetchResult }>();
+const searchCache = new Map<string, { expires: number; value: string }>();
+const hostLastRequest = new Map<string, number>();
+const HOST_MIN_INTERVAL_MS = 200;
+
+
+export interface FetchResult {
+  content: string;
+  finalUrl: string;
+  contentType: string;
+  retrievedAt: string;
+  cached: boolean;
+}
+
+/** Normalize common documentation URLs without adding another network request. */
+export function normalizeDocumentationUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    if (url.hostname === 'github.com') {
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (parts[2] === 'blob' && parts.length >= 5) {
+        return `https://raw.githubusercontent.com/${parts[0]}/${parts[1]}/${parts.slice(3).join('/')}`;
+      }
+    }
+    return url.toString();
+  } catch {
+    return raw;
+  }
+}
+
+export interface RegistryMetadata {
+  name?: string;
+  version?: string;
+  description?: string;
+  homepage?: string;
+  repository?: string;
+  readme?: string;
+}
+
+export async function fetchLlmsTxt(rawUrl: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const source = new URL(normalizeDocumentationUrl(rawUrl));
+    const candidate = `${source.protocol}//${source.host}/llms.txt`;
+    const response = await fetchWithTimeout(candidate, { headers: { 'user-agent': HONEST_USER_AGENT, accept: 'text/plain' } }, 10, signal);
+    if (!response.ok) return undefined;
+    const text = await response.text();
+    return text.trim() ? text.slice(0, 40_000) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function selectRegistryMetadata(value: unknown): RegistryMetadata | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, any>;
+  const info = record.info ?? record.package ?? record.crate ?? record;
+  if (!info || typeof info !== 'object') return undefined;
+  const version = info.version ?? info.version_info?.version ?? info.max_version;
+  const result: RegistryMetadata = {
+    ...(typeof info.name === 'string' ? { name: info.name } : {}),
+    ...(typeof version === 'string' ? { version } : {}),
+    ...(typeof info.description === 'string' ? { description: info.description } : {}),
+    ...(typeof info.homepage === 'string' ? { homepage: info.homepage } : {}),
+    ...(typeof info.repository === 'string' ? { repository: info.repository } : {}),
+    ...(typeof info.readme === 'string' ? { readme: info.readme } : {}),
+  };
+  return Object.keys(result).length ? result : undefined;
+}
+
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function respectHostInterval(url: string): Promise<void> {
+  try {
+    const host = new URL(url).host;
+    const wait = HOST_MIN_INTERVAL_MS - (Date.now() - (hostLastRequest.get(host) ?? 0));
+    if (wait > 0) await delay(wait);
+    hostLastRequest.set(host, Date.now());
+  } catch {}
+}
 
 export function clampTimeoutSeconds(value: unknown): number {
   const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
@@ -44,22 +126,44 @@ export async function fetchUrl(
   signal?: AbortSignal,
   timeoutSeconds?: number,
 ): Promise<string> {
+  const result = await fetchUrlDetailed(url, maxChars, signal, timeoutSeconds, false);
+  return result.content;
+}
+
+export async function fetchUrlDetailed(
+  url: string,
+  maxChars: number,
+  signal?: AbortSignal,
+  timeoutSeconds?: number,
+  useCache = true,
+): Promise<FetchResult> {
   let parsed: URL;
   try {
-    parsed = new URL(url);
+    parsed = new URL(normalizeDocumentationUrl(url));
   } catch {
-    return `Error: invalid URL "${url}".`;
+    return { content: `Error: invalid URL "${url}".`, finalUrl: url, contentType: '', retrievedAt: new Date().toISOString(), cached: false };
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return `Error: only http(s) URLs are supported.`;
+    return { content: 'Error: only http(s) URLs are supported.', finalUrl: url, contentType: '', retrievedAt: new Date().toISOString(), cached: false };
   }
+  const cacheKey = `${parsed.toString()}|${Math.max(1000, Math.min(maxChars || 30_000, 200_000))}`;
+  const cached = fetchCache.get(cacheKey);
+  if (useCache && cached && cached.expires > Date.now()) return { ...cached.value, cached: true };
   const headers = { 'user-agent': USER_AGENT, accept: ACCEPT_HEADER };
   let response: Response;
-  try {
-    response = await fetchWithTimeout(parsed.toString(), { redirect: 'follow', headers }, timeoutSeconds, signal);
-  } catch (error) {
-    return `Error: request failed: ${error instanceof Error ? error.message : String(error)}`;
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      await respectHostInterval(parsed.toString());
+      response = await fetchWithTimeout(parsed.toString(), { redirect: 'follow', headers }, timeoutSeconds, signal);
+      if (response.ok || (response.status !== 429 && response.status < 500)) break;
+      if (attempt < MAX_RETRIES) await delay(100 * 2 ** attempt);
+    } catch (error) {
+      lastError = error;
+      if (attempt < MAX_RETRIES) await delay(100 * 2 ** attempt);
+    }
   }
+  if (!response!) return { content: `Error: request failed: ${lastError instanceof Error ? lastError.message : String(lastError ?? 'network error')}`, finalUrl: url, contentType: '', retrievedAt: new Date().toISOString(), cached: false };
   if (response.status === 403 && response.headers.get('cf-mitigated')) {
     try {
       response = await fetchWithTimeout(
@@ -69,24 +173,38 @@ export async function fetchUrl(
         signal,
       );
     } catch (error) {
-      return `Error: request failed: ${error instanceof Error ? error.message : String(error)}`;
+      return { content: `Error: request failed: ${error instanceof Error ? error.message : String(error)}`, finalUrl: url, contentType: '', retrievedAt: new Date().toISOString(), cached: false };
     }
   }
   if (!response.ok) {
-    return `Error: HTTP ${response.status} ${response.statusText}`;
+    return { content: `Error: HTTP ${response.status} ${response.statusText}`, finalUrl: response.url || url, contentType: response.headers.get('content-type') ?? '', retrievedAt: new Date().toISOString(), cached: false };
   }
   const contentType = response.headers.get('content-type') ?? '';
   const body = await response.text();
   const text = contentType.includes('html') ? htmlToMarkdown(body) : body;
   const limit = Math.max(1000, Math.min(maxChars || 30_000, 200_000));
-  return text.length > limit ? `${text.slice(0, limit)}\n... [truncated at ${limit} chars]` : text;
+  const result: FetchResult = {
+    content: text.length > limit ? `${text.slice(0, limit)}\n... [truncated at ${limit} chars]` : text,
+    finalUrl: response.url || parsed.toString(),
+    contentType,
+    retrievedAt: new Date().toISOString(),
+    cached: false,
+  };
+  if (useCache) fetchCache.set(cacheKey, { expires: Date.now() + FETCH_CACHE_TTL, value: result });
+  return result;
 }
 
 export async function webSearch(query: string, maxResults: number, signal?: AbortSignal): Promise<string> {
+  const key = `${query}|${Math.min(maxResults || 5, 10)}`;
+  const cached = searchCache.get(key);
+  if (cached && cached.expires > Date.now()) return `${cached.value}\n[WEB_SEARCH cached: true]`;
   const body = new URLSearchParams({ q: query }).toString();
   let response: Response;
-  try {
-    response = await fetch('https://html.duckduckgo.com/html/', {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      await respectHostInterval('https://html.duckduckgo.com/html/');
+      response = await fetch('https://html.duckduckgo.com/html/', {
       method: 'POST',
       headers: {
         'user-agent': USER_AGENT,
@@ -94,10 +212,15 @@ export async function webSearch(query: string, maxResults: number, signal?: Abor
       },
       body,
       signal,
-    });
-  } catch (error) {
-    return `Error: search request failed: ${error instanceof Error ? error.message : String(error)}`;
+      });
+      if (response.ok || (response.status !== 429 && response.status < 500)) break;
+      if (attempt < MAX_RETRIES) await delay(100 * 2 ** attempt);
+    } catch (error) {
+      lastError = error;
+      if (attempt < MAX_RETRIES) await delay(100 * 2 ** attempt);
+    }
   }
+  if (!response!) return `Error: search request failed: ${lastError instanceof Error ? lastError.message : String(lastError ?? 'network error')}`;
   if (!response.ok) {
     return `Error: search failed with HTTP ${response.status}.`;
   }
@@ -106,9 +229,11 @@ export async function webSearch(query: string, maxResults: number, signal?: Abor
   if (results.length === 0) {
     return 'No results found.';
   }
-  return results
+  const value = results
     .map((result, i) => `${i + 1}. ${result.title}\n   ${result.url}${result.snippet ? `\n   ${result.snippet}` : ''}`)
     .join('\n\n');
+  searchCache.set(key, { expires: Date.now() + SEARCH_CACHE_TTL, value });
+  return `${value}\n[WEB_SEARCH retrievedAt: ${new Date().toISOString()}]`;
 }
 
 export function parseDuckDuckGoResults(

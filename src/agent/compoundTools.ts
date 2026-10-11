@@ -376,12 +376,17 @@ export function appendSnippet(content: string, snippet: string, eol: string = '\
 export const inspectFileContextTool: ToolDef = {
   name: 'inspect_file_context',
   description:
-    'Compact file snapshot: content, symbols, imports, and current diagnostics in one call.',
+    'Compact file snapshot: content, symbols, imports, and current diagnostics in one call. Set includeMap only when cross-file structure is genuinely unclear; it returns a small scoped orientation map, not proof.',
   parameters: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'Workspace-relative file path.' },
       includeReferences: { type: 'boolean', description: 'Also include a capped reference summary (optional).' },
+      includeMap: { type: 'boolean', description: 'Include a small scoped structural map around this file when cross-file context is genuinely needed (optional).' },
+      mapTokenBudget: { type: 'number', description: 'Map budget, capped by the harness (optional).' },
+      mapTier: { type: 'string', enum: ['compact', 'standard', 'large'], description: 'Context profile tier (optional).' },
+      scope: { type: 'string', enum: ['file', 'symbol', 'package', 'plan'], description: 'Map scope (optional; defaults to file).' },
+      symbol: { type: 'string', description: 'Symbol to emphasize for symbol scope (optional).' },
     },
     required: ['path'],
   },

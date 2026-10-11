@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { parsePatch } from '../agent/patch';
-import { PendingDecisionRecord, RunChangedFile, RunOperation, RunRecord } from '../shared/protocol';
+import { PendingDecisionRecord, QuestionOption, RunChangedFile, RunOperation, RunRecord } from '../shared/protocol';
 import { randomId } from '../util/id';
 
 export const MAX_STEP_HASHES = 200;
@@ -97,6 +97,70 @@ export function validateRecoveredDecision(
     return true;
   }
   return Boolean(decision.command?.trim()) && options.cwdExists;
+}
+
+export function questionAnswerId(pending: Pick<PendingDecisionRecord, 'id' | 'requestId'>, index: number): string {
+  return `${pending.requestId ?? pending.id}:${index}`;
+}
+
+function validAnswerValue(value: string, options: QuestionOption[], allowCustom: boolean, multiple: boolean): boolean {
+  const trimmed = (value ?? '').trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (multiple) {
+    const parts = trimmed
+      .split(',')
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (parts.length === 0) {
+      return false;
+    }
+    return parts.every((part) => options.some((option) => option.label === part) || allowCustom);
+  }
+  if (options.some((option) => option.label === trimmed)) {
+    return true;
+  }
+  return allowCustom;
+}
+
+export function validateRecoveredAnswers(
+  pending: Pick<
+    PendingDecisionRecord,
+    'kind' | 'id' | 'requestId' | 'options' | 'allowCustom' | 'multiple' | 'questions'
+  >,
+  answers: Array<{ questionId?: string; value: string }>,
+): boolean {
+  if (pending.kind !== 'question' || !Array.isArray(answers)) {
+    return false;
+  }
+  const questions = pending.questions ?? [];
+  if (questions.length > 0) {
+    if (answers.length !== questions.length) {
+      return false;
+    }
+    for (let index = 0; index < questions.length; index++) {
+      const item = questions[index];
+      const id = item.id ?? questionAnswerId(pending, index);
+      const matches = answers.filter((answer) => (answer.questionId ?? '') === id);
+      if (matches.length !== 1) {
+        return false;
+      }
+      if (!validAnswerValue(matches[0].value, item.options ?? [], item.custom !== false, Boolean(item.multiple))) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (answers.length < 1) {
+    return false;
+  }
+  return validAnswerValue(
+    answers[0].value,
+    pending.options ?? [],
+    pending.allowCustom !== false,
+    Boolean(pending.multiple),
+  );
 }
 
 export function parseOperationExpectations(operation: Pick<RunOperation, 'expected'>): OperationExpectation[] {

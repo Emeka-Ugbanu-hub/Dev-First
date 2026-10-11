@@ -48,6 +48,16 @@ function button(element: ParentNode, label: string): Element {
   return match!;
 }
 
+function typeInto(element: ParentNode, selector: string, value: string): void {
+  const field = element.querySelector<HTMLInputElement>(selector);
+  expect(field, selector).toBeDefined();
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!;
+  act(() => {
+    setter.call(field!, value);
+    field!.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}
+
 function runRecord(overrides: Partial<RunRecord> = {}): RunRecord {
   return {
     id: 'run1',
@@ -213,6 +223,129 @@ describe('RecoveryCard', () => {
     const element = mount(createElement(RecoveryCard, { run: runRecord(), onDismiss }));
     click(element.querySelector('.recovery-dismiss')!);
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('RecoveryCard recovered questions', () => {
+  const pending = {
+    id: 'p1',
+    kind: 'question' as const,
+    prompt: 'Which database?',
+    requestId: 'q1',
+    options: [{ label: 'Postgres', description: 'managed' }, { label: 'SQLite' }],
+    allowCustom: true,
+    createdAt: 4,
+  };
+
+  it('renders option buttons, a custom input, Submit and Skip', () => {
+    const element = mount(
+      createElement(RecoveryCard, { run: runRecord({ pending }), onDismiss: () => undefined }),
+    );
+    expect(element.textContent).toContain('Which database?');
+    expect(element.textContent).toContain('Postgres');
+    expect(element.textContent).toContain('SQLite');
+    expect(element.querySelector('.recovery-question-custom')).not.toBeNull();
+    expect(element.textContent).toContain('Submit');
+    expect(element.textContent).toContain('Skip');
+    expect(element.textContent).toContain('Nothing runs until you answer.');
+  });
+
+  it('posts the selected option and does not post twice after submit', () => {
+    const element = mount(
+      createElement(RecoveryCard, { run: runRecord({ pending }), onDismiss: () => undefined }),
+    );
+    click(button(element, 'Postgres'));
+    click(button(element, 'Submit'));
+    click(button(element, 'Submit'));
+    expect(sent).toEqual([{ type: 'answerRecoveredQuestion', runId: 'run1', answers: [{ value: 'Postgres' }] }]);
+  });
+
+  it('submits a custom answer typed into the recovery input', () => {
+    const element = mount(
+      createElement(RecoveryCard, { run: runRecord({ pending }), onDismiss: () => undefined }),
+    );
+    typeInto(element, '.recovery-question-custom', 'MySQL');
+    click(button(element, 'Submit'));
+    expect(sent).toEqual([{ type: 'answerRecoveredQuestion', runId: 'run1', answers: [{ value: 'MySQL' }] }]);
+  });
+
+  it('hides the custom input when custom answers are disabled', () => {
+    const element = mount(
+      createElement(RecoveryCard, {
+        run: runRecord({ pending: { ...pending, allowCustom: false } }),
+        onDismiss: () => undefined,
+      }),
+    );
+    expect(element.querySelector('.recovery-question-custom')).toBeNull();
+  });
+
+  it('renders every batch question and posts one answer per question id', () => {
+    const batch = {
+      ...pending,
+      questions: [
+        { id: 'q1:0', question: 'Which database?', options: [{ label: 'Postgres' }, { label: 'SQLite' }] },
+        { id: 'q1:1', question: 'Run migrations?', options: [{ label: 'Yes' }, { label: 'No' }], custom: false },
+      ],
+    };
+    const element = mount(
+      createElement(RecoveryCard, { run: runRecord({ pending: batch }), onDismiss: () => undefined }),
+    );
+    expect(element.textContent).toContain('Which database?');
+    expect(element.textContent).toContain('Run migrations?');
+    click(button(element, 'Postgres'));
+    click(button(element, 'Yes'));
+    click(button(element, 'Submit'));
+    expect(sent).toEqual([
+      {
+        type: 'answerRecoveredQuestion',
+        runId: 'run1',
+        answers: [
+          { questionId: 'q1:0', value: 'Postgres' },
+          { questionId: 'q1:1', value: 'Yes' },
+        ],
+      },
+    ]);
+  });
+
+  it('posts skipRecoveredQuestion for the run', () => {
+    const element = mount(
+      createElement(RecoveryCard, { run: runRecord({ pending }), onDismiss: () => undefined }),
+    );
+    click(button(element, 'Skip'));
+    expect(sent).toEqual([{ type: 'skipRecoveredQuestion', runId: 'run1' }]);
+  });
+
+  it('renders a session-level question without run fields', () => {
+    const element = mount(
+      createElement(RecoveryCard, {
+        pending: { ...pending, prompt: 'Pick a branch?' },
+        onDismiss: () => undefined,
+      }),
+    );
+    expect(element.textContent).toContain('Waiting for your answer');
+    expect(element.textContent).toContain('Pick a branch?');
+    expect(element.querySelector('.recovery-meta')).toBeNull();
+    expect(element.querySelector('.recovery-actions')).toBeNull();
+    expect(element.textContent).not.toContain('Plan v2');
+    click(button(element, 'Postgres'));
+    click(button(element, 'Submit'));
+    expect(sent).toEqual([{ type: 'answerRecoveredQuestion', answers: [{ value: 'Postgres' }] }]);
+  });
+
+  it('keeps approve and deny for question records without a request id', () => {
+    const element = mount(
+      createElement(RecoveryCard, {
+        run: runRecord({ pending: { id: 'p1', kind: 'question', prompt: 'Which file?', createdAt: 6 } }),
+        onDismiss: () => undefined,
+      }),
+    );
+    expect(element.textContent).toContain('Which file?');
+    click(button(element, 'Approve'));
+    click(button(element, 'Deny'));
+    expect(sent).toEqual([
+      { type: 'resolveRecoveredDecision', runId: 'run1', approved: true },
+      { type: 'resolveRecoveredDecision', runId: 'run1', approved: false },
+    ]);
   });
 });
 

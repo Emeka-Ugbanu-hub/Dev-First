@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { ChatMessage } from '../llm/types';
-import { Plan, QueuedPromptRecord, SessionSummary, TodoItem, UiMessage } from '../shared/protocol';
+import { Plan, PendingDecisionRecord, QueuedPromptRecord, SessionSummary, TodoItem, UiMessage } from '../shared/protocol';
 
 export interface StoredSession {
   id: string;
@@ -16,6 +16,7 @@ export interface StoredSession {
   lastRequest: string;
   contextTokens: number;
   queued?: QueuedPromptRecord[];
+  pending?: PendingDecisionRecord;
 }
 
 interface IndexEntry {

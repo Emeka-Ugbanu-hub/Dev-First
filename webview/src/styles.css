@@ -2986,6 +2986,31 @@ body.vscode-light .hljs-meta {
   margin-top: var(--df-space-2);
 }
 
+.recovery-question {
+  display: flex;
+  flex-direction: column;
+  gap: var(--df-space-3);
+}
+
+.recovery-question-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--df-space-2);
+}
+
+.recovery-question-item .question-options {
+  margin-top: var(--df-space-1);
+}
+
+.recovery-question-custom {
+  width: 100%;
+  min-height: 30px;
+  padding: 6px 8px;
+  border: 1px solid var(--vscode-input-border, var(--df-border));
+  border-radius: 6px;
+  background: var(--vscode-input-background, transparent);
+}
+
 /* ---------- Run review card ---------- */
 
 .run-review-card {

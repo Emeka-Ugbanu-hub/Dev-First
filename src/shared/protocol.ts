@@ -108,6 +108,11 @@ export interface PendingDecisionRecord {
   command?: string;
   cwd?: string;
   step?: string;
+  options?: QuestionOption[];
+  allowCustom?: boolean;
+  multiple?: boolean;
+  requestId?: string;
+  questions?: QuestionItem[];
   createdAt: number;
 }
 
@@ -239,6 +244,7 @@ export interface QuestionOption {
 }
 
 export interface QuestionItem {
+  id?: string;
   question: string;
   header?: string;
   options: QuestionOption[];
@@ -328,7 +334,7 @@ export interface UiState {
   model: string;
   pasteFileLines: number;
   queued?: QueuedPromptRecord[];
-  recovery?: { run: RunRecord; runDrift?: boolean; processesAlive?: number[] };
+  recovery?: { run?: RunRecord; runDrift?: boolean; processesAlive?: number[]; pending?: PendingDecisionRecord };
 }
 
 export type WebviewMessage =
@@ -365,6 +371,8 @@ export type WebviewMessage =
   | { type: 'discardRun'; id: string }
   | { type: 'rollbackRun'; id: string }
   | { type: 'resolveRecoveredDecision'; runId: string; approved: boolean }
+  | { type: 'answerRecoveredQuestion'; runId?: string; answers: Array<{ questionId?: string; value: string }> }
+  | { type: 'skipRecoveredQuestion'; runId?: string }
   | { type: 'newSession' }
   | { type: 'switchSession'; id: string }
   | { type: 'deleteSession'; id: string }

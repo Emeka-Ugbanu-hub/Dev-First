@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { clampTimeoutSeconds, fetchUrl, htmlToMarkdown, parseDuckDuckGoResults } from '../src/agent/web';
+import { clampTimeoutSeconds, fetchLlmsTxt, fetchUrl, htmlToMarkdown, normalizeDocumentationUrl, parseDuckDuckGoResults, selectRegistryMetadata } from '../src/agent/web';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -21,6 +21,25 @@ describe('htmlToMarkdown', () => {
     expect(markdown).toContain('```ts\nconst a = 1;\n```');
     expect(markdown).not.toContain('alert');
     expect(markdown).not.toContain('color');
+  });
+});
+
+describe('documentation adapters', () => {
+  it('rewrites GitHub blob URLs to raw content', () => {
+    expect(normalizeDocumentationUrl('https://github.com/acme/app/blob/main/README.md'))
+      .toBe('https://raw.githubusercontent.com/acme/app/main/README.md');
+  });
+
+  it('selects stable registry metadata fields', () => {
+    expect(selectRegistryMetadata({ info: { name: 'pkg', version: '1.2.3', readme: '# docs', extra: 'ignore' } }))
+      .toEqual({ name: 'pkg', version: '1.2.3', readme: '# docs' });
+  });
+
+  it('probes llms.txt only when requested by the caller', async () => {
+    const fetchMock = vi.fn(async () => new Response('# Docs\n- /guide', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchLlmsTxt('https://docs.example.com/guide')).resolves.toContain('/guide');
+    expect(fetchMock.mock.calls[0][0]).toBe('https://docs.example.com/llms.txt');
   });
 });
 

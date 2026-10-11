@@ -144,7 +144,11 @@ export default function App() {
         .map((record) => record.id),
     [state.queued],
   );
-  const recoveryKey = state.recovery ? `${state.recovery.run.id}:${state.recovery.run.updatedAt}` : null;
+  const recoveryKey = state.recovery
+    ? state.recovery.run
+      ? `${state.recovery.run.id}:${state.recovery.run.updatedAt}`
+      : `session:${state.recovery.pending?.createdAt ?? 0}`
+    : null;
   const continueInterrupted = useCallback(
     () => setPrefill({ text: 'Continue from where you stopped.', nonce: Date.now() }),
     [],
@@ -840,6 +844,7 @@ export default function App() {
           {state.recovery && dismissedRecovery !== recoveryKey && (
             <RecoveryCard
               run={state.recovery.run}
+              pending={state.recovery.pending}
               runDrift={state.recovery.runDrift}
               processesAlive={state.recovery.processesAlive}
               onDismiss={() => setDismissedRecovery(recoveryKey)}

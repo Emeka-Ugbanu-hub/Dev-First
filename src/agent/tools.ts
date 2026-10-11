@@ -204,6 +204,7 @@ export const webFetchTool: ToolDef = {
         type: 'number',
         description: 'Request timeout in seconds (optional, default 30, max 120).',
       },
+      discover_docs: { type: 'boolean', description: 'Optionally probe the host for llms.txt documentation links (adds one bounded request).' },
     },
     required: ['url'],
   },

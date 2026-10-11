@@ -20,6 +20,8 @@ import {
   Plan,
   ProviderConnection,
   QueuedPromptRecord,
+  QuestionItem,
+  QuestionOption,
   QuestionRequest,
   RunChangedFile,
   RunOperation,
@@ -61,9 +63,11 @@ import {
   mutationTargets,
   operationAfterHash,
   parseOperationExpectations,
+  questionAnswerId,
   serializeOperationExpectations,
   sha1File,
   upsertRunChangedFile,
+  validateRecoveredAnswers,
   validateRecoveredDecision,
 } from './runRecovery';
 import { PromptFamily, promptFamilyFor } from '../planner/prompts';
@@ -217,6 +221,76 @@ function normalizeStoredMessage(value: unknown, index: number): UiMessage | unde
   };
 }
 
+function normalizeQuestionOptions(value: unknown): QuestionOption[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const options = value
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    .filter((item) => typeof item.label === 'string' && item.label)
+    .map((item) => ({
+      label: item.label as string,
+      ...(typeof item.description === 'string' ? { description: item.description } : {}),
+    }));
+  return options.length > 0 ? options : undefined;
+}
+
+function normalizeQuestionItems(value: unknown): QuestionItem[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const questions: QuestionItem[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+    const raw = entry as Record<string, unknown>;
+    const question = typeof raw.question === 'string' ? raw.question.trim() : '';
+    if (!question) {
+      continue;
+    }
+    questions.push({
+      ...(typeof raw.id === 'string' && raw.id ? { id: raw.id } : {}),
+      question,
+      ...(typeof raw.header === 'string' && raw.header ? { header: raw.header } : {}),
+      options: normalizeQuestionOptions(raw.options) ?? [],
+      ...(raw.multiple === true ? { multiple: true } : {}),
+      ...(raw.custom === false ? { custom: false } : {}),
+    });
+  }
+  return questions.length > 0 ? questions : undefined;
+}
+
+function normalizeStoredPending(value: unknown): PendingDecisionRecord | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+  const raw = value as Record<string, unknown>;
+  if (
+    raw.kind !== 'question' ||
+    typeof raw.id !== 'string' ||
+    !raw.id ||
+    typeof raw.prompt !== 'string' ||
+    !raw.prompt.trim()
+  ) {
+    return undefined;
+  }
+  const options = normalizeQuestionOptions(raw.options);
+  const questions = normalizeQuestionItems(raw.questions);
+  return {
+    id: raw.id,
+    kind: 'question',
+    prompt: raw.prompt,
+    createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
+    ...(typeof raw.requestId === 'string' && raw.requestId ? { requestId: raw.requestId } : {}),
+    ...(typeof raw.allowCustom === 'boolean' ? { allowCustom: raw.allowCustom } : {}),
+    ...(raw.multiple === true ? { multiple: true } : {}),
+    ...(options ? { options } : {}),
+    ...(questions ? { questions } : {}),
+    ...(typeof raw.step === 'string' && raw.step ? { step: raw.step } : {}),
+  };
+}
+
 function isAuthFailure(error: unknown): boolean {
   if (error instanceof HttpError) {
     return error.status === 401 || error.status === 403;
@@ -272,6 +346,11 @@ export class SessionController {
   private sessionCreatedAt = Date.now();
   private currentQuestion: QuestionRequest | null = null;
   private readonly pendingQuestions = new Map<string, (answer: string) => void>();
+  private readonly recoveredAnswers = new Map<
+    string,
+    { prompt: string; questions?: Array<{ id: string; question: string }>; values: Map<string, string> }
+  >();
+  private sessionPending: PendingDecisionRecord | undefined;
   private readonly approvalMemory = new ApprovalMemory();
   private readonly externalDirectories = new ExternalDirectoryConsent();
   private subagentDepth = 0;
@@ -335,6 +414,7 @@ export class SessionController {
     const metadata = this.selectedModelMetadata(preset.id, config.model, preset.provider);
     const reasoningLevels = metadata.reasoningLevels ?? [];
     const reasoningEffort = this.selectedReasoningEffort(preset.id, config.model, reasoningLevels, metadata.reasoningDefault);
+    const recovery = this.buildRecoveryState();
     return {
       phase: this.phase,
       messages: this.uiMessages,
@@ -371,15 +451,19 @@ export class SessionController {
       model: config.model,
       pasteFileLines: config.pasteFileLines,
       queued: this.queuedRecords(),
-      ...(this.recoveryRun
-        ? {
-            recovery: {
-              run: this.recoveryRun,
-              ...(this.recoveryDrift ? { runDrift: true } : {}),
-              ...this.recoveryProcessesAlive(),
-            },
-          }
-        : {}),
+      ...(recovery ? { recovery } : {}),
+    };
+  }
+
+  private buildRecoveryState(): UiState['recovery'] | undefined {
+    if (!this.recoveryRun && !this.sessionPending) {
+      return undefined;
+    }
+    return {
+      ...(this.recoveryRun ? { run: this.recoveryRun } : {}),
+      ...(this.recoveryRun && this.recoveryDrift ? { runDrift: true } : {}),
+      ...(this.recoveryRun ? this.recoveryProcessesAlive() : {}),
+      ...(this.sessionPending ? { pending: this.sessionPending } : {}),
     };
   }
 
@@ -505,6 +589,8 @@ export class SessionController {
       }));
     this.runningQueued = undefined;
     this.currentRun = undefined;
+    this.sessionPending = normalizeStoredPending(stored.pending);
+    this.recoveredAnswers.clear();
     void this.context.workspaceState.update(ACTIVE_SESSION_KEY, this.sessionId);
   }
 
@@ -532,6 +618,7 @@ export class SessionController {
       lastRequest: this.lastRequest,
       contextTokens: this.contextTokens,
       queued: this.queuedRecords(),
+      ...(this.sessionPending ? { pending: this.sessionPending } : {}),
     };
   }
 
@@ -612,6 +699,8 @@ export class SessionController {
     this.currentRun = undefined;
     this.recoveryRun = undefined;
     this.recoveryDrift = false;
+    this.sessionPending = undefined;
+    this.recoveredAnswers.clear();
     this.approvalMemory.clear();
     this.externalDirectories.clear();
     void this.context.workspaceState.update(ACTIVE_SESSION_KEY, this.sessionId);
@@ -1040,6 +1129,12 @@ export class SessionController {
       case 'resolveRecoveredDecision':
         await this.resolveRecoveredDecision(message.runId, message.approved);
         break;
+      case 'answerRecoveredQuestion':
+        await this.answerRecoveredQuestion(message.runId, message.answers);
+        break;
+      case 'skipRecoveredQuestion':
+        await this.skipRecoveredQuestion(message.runId);
+        break;
       case 'stopRunProcess':
         await this.stopRunProcess(message.runId, message.pid);
         break;
@@ -1202,19 +1297,126 @@ export class SessionController {
   }
 
   private requestUserAnswer(request: QuestionRequest): Promise<string> {
+    const recovered = this.consumeRecoveredAnswer(request);
+    if (recovered !== undefined) {
+      return Promise.resolve(recovered);
+    }
     this.currentQuestion = request;
-    this.setRunPending({
-      id: request.id,
-      kind: 'question',
-      prompt: request.question,
-      createdAt: Date.now(),
-      ...(this.activeStepLabel() ? { step: this.activeStepLabel() as string } : {}),
-    });
+    const record = this.pendingQuestionRecord(request);
+    if (this.currentRun) {
+      this.setRunPending(record);
+    } else {
+      this.sessionPending = record;
+      void this.persistNow();
+    }
     this.needsInputListener?.('the agent asked you a question');
     this.post({ type: 'question', request });
     return new Promise<string>((resolve) => {
       this.pendingQuestions.set(request.id, resolve);
     });
+  }
+
+  private pendingQuestionRecord(request: QuestionRequest): PendingDecisionRecord {
+    const step = this.activeStepLabel();
+    const questions = request.questions?.map((item, index) => ({
+      id: item.id ?? `${request.id}:${index}`,
+      question: item.question,
+      ...(item.header ? { header: item.header } : {}),
+      options: item.options,
+      ...(item.multiple ? { multiple: true } : {}),
+      ...(item.custom === false ? { custom: false } : {}),
+    }));
+    return {
+      id: request.id,
+      kind: 'question',
+      prompt: request.question,
+      requestId: request.id,
+      options: request.options,
+      allowCustom: questions ? questions.some((item) => item.custom !== false) : true,
+      ...(request.multiple ? { multiple: true } : {}),
+      ...(questions && questions.length > 0 ? { questions } : {}),
+      createdAt: Date.now(),
+      ...(step ? { step } : {}),
+    };
+  }
+
+  private consumeRecoveredAnswer(request: QuestionRequest): string | undefined {
+    const keys = [this.currentRun?.id, this.recoveryRun?.id, 'session'];
+    for (const key of keys) {
+      if (!key) {
+        continue;
+      }
+      const entry = this.recoveredAnswers.get(key);
+      if (!entry) {
+        continue;
+      }
+      const answer = this.matchRecoveredAnswer(entry, request);
+      if (answer === undefined) {
+        continue;
+      }
+      this.recoveredAnswers.delete(key);
+      if (key === 'session') {
+        this.sessionPending = undefined;
+        void this.persistNow();
+      } else {
+        this.clearRecoveredRunPending(key);
+      }
+      return answer;
+    }
+    return undefined;
+  }
+
+  private matchRecoveredAnswer(
+    entry: { prompt: string; questions?: Array<{ id: string; question: string }>; values: Map<string, string> },
+    request: QuestionRequest,
+  ): string | undefined {
+    const incoming = request.questions ?? [];
+    if (incoming.length > 0) {
+      if (!entry.questions || entry.questions.length !== incoming.length) {
+        return undefined;
+      }
+      const matches = incoming.every(
+        (item, index) => item.question.trim() === entry.questions![index].question.trim(),
+      );
+      if (!matches) {
+        return undefined;
+      }
+      const lines = incoming.map(
+        (item, index) => `${item.question}: ${entry.values.get(entry.questions![index].id) ?? ''}`,
+      );
+      return `Developer answered:\n${lines.join('\n')}`;
+    }
+    if (entry.questions?.length || request.question.trim() !== entry.prompt.trim()) {
+      return undefined;
+    }
+    const value = [...entry.values.values()][0] ?? '';
+    return value ? `Developer answered: ${value}` : undefined;
+  }
+
+  private clearRecoveredRunPending(runId: string): void {
+    const run =
+      this.currentRun?.id === runId ? this.currentRun : this.recoveryRun?.id === runId ? this.recoveryRun : undefined;
+    if (!run) {
+      void this.runJournal.load(runId).then((stored) => {
+        if (!stored?.pending) {
+          return;
+        }
+        stored.pending = undefined;
+        if (stored.status === 'waiting') {
+          stored.status = 'executing';
+        }
+        stored.updatedAt = Date.now();
+        return this.saveRun(stored);
+      });
+      return;
+    }
+    run.pending = undefined;
+    if (run.status === 'waiting') {
+      run.status = 'executing';
+    }
+    run.updatedAt = Date.now();
+    void this.saveRun(run);
+    this.pushState();
   }
 
   private resolveQuestion(id: string, answer: string): void {
@@ -1225,8 +1427,17 @@ export class SessionController {
     this.pendingQuestions.delete(id);
     this.currentQuestion = null;
     this.clearRunPending();
+    this.clearSessionPending();
     this.post({ type: 'question', request: null });
     resolve(answer);
+  }
+
+  private clearSessionPending(): void {
+    if (!this.sessionPending) {
+      return;
+    }
+    this.sessionPending = undefined;
+    void this.persistNow();
   }
 
   private cancelPendingQuestion(): void {
@@ -1239,6 +1450,7 @@ export class SessionController {
       this.clearRunPending();
       this.post({ type: 'question', request: null });
     }
+    this.clearSessionPending();
   }
 
   private cancelQueued(id: string): void {
@@ -3399,6 +3611,9 @@ export class SessionController {
       this.recoveryDrift = false;
     }
     if (status === 'completed' || status === 'stopped' || status === 'failed' || status === 'interrupted') {
+      if (status !== 'interrupted') {
+        this.recoveredAnswers.delete(run.id);
+      }
       this.currentRun = undefined;
     }
   }
@@ -3760,6 +3975,7 @@ export class SessionController {
   private async discardRun(id: string): Promise<void> {
     await this.runJournal.remove(id);
     await this.fileSnapshots.remove(id);
+    this.recoveredAnswers.delete(id);
     if (this.currentRun?.id === id) {
       this.currentRun = undefined;
     }
@@ -3776,6 +3992,8 @@ export class SessionController {
       await this.discardRun(id);
       return;
     }
+    this.recoveredAnswers.delete(id);
+    run.pending = undefined;
     if (run.checkpointId) {
       await this.revertToCheckpoint(run.checkpointId);
       await this.discardRun(id);
@@ -3991,6 +4209,95 @@ export class SessionController {
 
     await this.diffManager.revertWholeFile(filePath);
     return 'ok';
+  }
+
+  private async answerRecoveredQuestion(
+    runId: string | undefined,
+    answers: Array<{ questionId?: string; value: string }>,
+  ): Promise<void> {
+    const run = runId ? await this.loadAnyRun(runId) : undefined;
+    const pending = runId ? run?.pending : this.sessionPending;
+    if (!pending || pending.kind !== 'question') {
+      this.addNotice('That question is no longer pending.');
+      return;
+    }
+    if (!validateRecoveredAnswers(pending, answers)) {
+      this.addNotice('That answer is not valid for this question.');
+      return;
+    }
+    const values = new Map<string, string>();
+    if (pending.questions && pending.questions.length > 0) {
+      pending.questions.forEach((item, index) => {
+        const id = item.id ?? questionAnswerId(pending, index);
+        const answer = answers.find((candidate) => (candidate.questionId ?? '') === id);
+        values.set(id, (answer?.value ?? '').trim());
+      });
+    } else {
+      values.set(pending.requestId ?? pending.id, (answers[0]?.value ?? '').trim());
+    }
+    const key = runId ?? 'session';
+    this.recoveredAnswers.set(key, {
+      prompt: pending.prompt,
+      ...(pending.questions && pending.questions.length > 0
+        ? {
+            questions: pending.questions.map((item, index) => ({
+              id: item.id ?? questionAnswerId(pending, index),
+              question: item.question,
+            })),
+          }
+        : {}),
+      values,
+    });
+    if (run) {
+      for (const operation of run.operations) {
+        if (operation.status === 'started' && operation.startedAt <= pending.createdAt) {
+          operation.status = 'failed';
+          operation.finishedAt = Date.now();
+        }
+      }
+      run.activeTool = undefined;
+      run.updatedAt = Date.now();
+      await this.saveRun(run);
+      if (this.recoveryRun?.id === run.id) {
+        this.recoveryRun = run;
+      }
+    } else {
+      this.sessionPending = undefined;
+      await this.persistNow();
+    }
+    this.pushState();
+  }
+
+  private async skipRecoveredQuestion(runId?: string): Promise<void> {
+    if (runId) {
+      const run = await this.loadAnyRun(runId);
+      if (!run || !run.pending) {
+        this.addNotice('That question is no longer pending.');
+        return;
+      }
+      run.pending = undefined;
+      run.status = 'stopped';
+      run.updatedAt = Date.now();
+      await this.saveRun(run);
+      this.recoveredAnswers.delete(runId);
+      if (this.currentRun?.id === runId) {
+        this.currentRun = undefined;
+      }
+      if (this.recoveryRun?.id === runId) {
+        this.recoveryRun = undefined;
+        this.recoveryDrift = false;
+      }
+      this.pushState();
+      return;
+    }
+    if (!this.sessionPending) {
+      this.addNotice('That question is no longer pending.');
+      return;
+    }
+    this.sessionPending = undefined;
+    this.recoveredAnswers.delete('session');
+    await this.persistNow();
+    this.pushState();
   }
 
   private async resolveRecoveredDecision(runId: string, approved: boolean): Promise<void> {
