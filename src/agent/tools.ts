@@ -1,10 +1,16 @@
 import { ToolCall, ToolDef } from '../llm/types';
 import { parseJsonLoose } from '../util/json';
 import {
+  addImportAndUseTool,
+  applyChangeSetTool,
+  boundedInvestigationTool,
+  fixDiagnosticTool,
+  fixInFileTool,
   inspectFileContextTool,
   investigateIssueTool,
-  mutatingCompoundTools,
-  readOnlyCompoundTools,
+  refactorSymbolTool,
+  renameSymbolTool,
+  updateRelatedFilesTool,
   verifyChangeTools,
 } from './compoundTools';
 
@@ -676,10 +682,11 @@ export function plannerToolSet(tools: ToolDef[], options: PlannerToolSetOptions 
 
 export function plannerTools(options: ToolRegistryOptions = {}): ToolDef[] {
   return [
-    ...readOnlyTools(options),
     inspectFileContextTool,
     investigateIssueTool,
+    boundedInvestigationTool,
     verifyChangeTools().planner,
+    ...readOnlyTools(options),
     runTerminalTool,
   ];
 }
@@ -739,9 +746,21 @@ export function readOnlyTools(options: ToolRegistryOptions = {}): ToolDef[] {
 }
 
 export function executionTools(options: ToolRegistryOptions = {}): ToolDef[] {
+  const ordered: ToolDef[] = [
+    fixInFileTool,
+    applyChangeSetTool,
+    renameSymbolTool,
+    refactorSymbolTool,
+    fixDiagnosticTool,
+    addImportAndUseTool,
+    updateRelatedFilesTool,
+    investigateIssueTool,
+    verifyChangeTools().executor,
+    inspectFileContextTool,
+    boundedInvestigationTool,
+  ];
   const tools: ToolDef[] = [
-    ...mutatingCompoundTools,
-    ...readOnlyCompoundTools(),
+    ...ordered,
     ...readOnlyTools(options),
     writeFileTool,
     editFileTool,
@@ -843,6 +862,8 @@ export function describeToolCall(call: ToolCall): string {
       return `Investigate ${shortPath(args.path)}${args.line ? `:${args.line}` : ''}`;
     case 'verify_change':
       return `Verify ${Array.isArray(args.paths) ? args.paths.length : 0} file(s)`;
+    case 'bounded_investigation':
+      return `Bounded investigation (${Array.isArray(args.operations) ? args.operations.length : 0} op${Array.isArray(args.operations) && args.operations.length === 1 ? '' : 's'})`;
     case 'run_terminal_command':
       return `Run: ${truncate(String(args.command ?? ''), 60)}`;
     case 'todo_write':
@@ -958,6 +979,8 @@ export function toolIcon(name: string): string {
       return 'search';
     case 'verify_change':
       return 'check';
+    case 'bounded_investigation':
+      return 'search-fuzzy';
     case 'run_terminal_command':
       return 'terminal';
     case 'todo_write':

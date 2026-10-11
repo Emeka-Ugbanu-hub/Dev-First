@@ -246,16 +246,20 @@ describe('hunk parsing', () => {
 });
 
 describe('registry wiring', () => {
-  it('puts mutating compound tools first in the executor and never in the planner', () => {
+  it('puts the executor compound order first and never puts mutating compound tools in the planner', () => {
     const executor = executionTools().map((tool) => tool.name);
-    expect(executor.slice(0, 7)).toEqual([
-      'apply_change_set',
+    expect(executor.slice(0, 11)).toEqual([
       'fix_in_file',
-      'fix_diagnostic',
+      'apply_change_set',
       'rename_symbol',
+      'refactor_symbol',
+      'fix_diagnostic',
       'add_import_and_use',
       'update_related_files',
-      'refactor_symbol',
+      'investigate_issue',
+      'verify_change',
+      'inspect_file_context',
+      'bounded_investigation',
     ]);
     const planner = plannerTools().map((tool) => tool.name);
     for (const name of [
@@ -269,12 +273,18 @@ describe('registry wiring', () => {
     ]) {
       expect(planner).not.toContain(name);
     }
+    expect(planner.slice(0, 4)).toEqual([
+      'inspect_file_context',
+      'investigate_issue',
+      'bounded_investigation',
+      'verify_change',
+    ]);
   });
 
-  it('registers the read-only trio in both sets with distinct verify_change schemas', () => {
+  it('registers the read-only compound tools in both sets with distinct verify_change schemas', () => {
     const executor = executionTools();
     const planner = plannerTools();
-    for (const name of ['inspect_file_context', 'investigate_issue', 'verify_change']) {
+    for (const name of ['inspect_file_context', 'investigate_issue', 'verify_change', 'bounded_investigation']) {
       expect(executor.map((tool) => tool.name)).toContain(name);
       expect(planner.map((tool) => tool.name)).toContain(name);
     }
@@ -327,7 +337,7 @@ describe('preflight mechanism', () => {
 });
 
 describe('apply_change_set', () => {
-  it('rolls back already-applied files when a later change fails', async () => {
+  it('preflights every match before writing anything', async () => {
     await fs.writeFile(path.join(root, 'a.txt'), 'one\n', 'utf-8');
     await fs.writeFile(path.join(root, 'b.txt'), 'two\n', 'utf-8');
     const result = await toolbox().execute(
@@ -340,14 +350,47 @@ describe('apply_change_set', () => {
       }),
       context,
     );
-    expect(result).toContain('Error: change set failed at b.txt');
-    expect(result).toContain('Rolled back: a.txt');
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('failed');
+    expect(parsed.message).toContain('nothing was written');
+    expect(parsed.message).toContain('b.txt');
+    expect(applyChange).not.toHaveBeenCalled();
+    expect(await fs.readFile(path.join(root, 'a.txt'), 'utf-8')).toBe('one\n');
+    expect(await fs.readFile(path.join(root, 'b.txt'), 'utf-8')).toBe('two\n');
+  });
+
+  it('rolls back already-applied files when a later write fails', async () => {
+    await fs.writeFile(path.join(root, 'a.txt'), 'one\n', 'utf-8');
+    await fs.writeFile(path.join(root, 'b.txt'), 'two\n', 'utf-8');
+    applyChange = vi.fn(async (file: string, content: string) => {
+      if (file.endsWith('b.txt')) {
+        throw new Error('disk full');
+      }
+      await fs.writeFile(file, content, 'utf-8');
+      return `Applied changes to ${path.basename(file)}.`;
+    });
+    const result = await toolbox().execute(
+      'apply_change_set',
+      JSON.stringify({
+        changes: [
+          { path: 'a.txt', action: 'edit', patch: '@@\n-one\n+ONE' },
+          { path: 'b.txt', action: 'edit', patch: '@@\n-two\n+TWO' },
+        ],
+      }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('failed');
+    expect(parsed.message).toContain('disk full');
+    expect(JSON.stringify(parsed.evidence)).toContain('rolled back a.txt');
+    expect(parsed.diff).toContain('-one');
     expect(await fs.readFile(path.join(root, 'a.txt'), 'utf-8')).toBe('one\n');
     expect(await fs.readFile(path.join(root, 'b.txt'), 'utf-8')).toBe('two\n');
   });
 
   it('applies an ordered change set with per-file status', async () => {
     await fs.writeFile(path.join(root, 'a.txt'), 'one\n', 'utf-8');
+    await fs.writeFile(path.join(root, 'old.txt'), 'old\n', 'utf-8');
     const result = await toolbox().execute(
       'apply_change_set',
       JSON.stringify({
@@ -359,16 +402,19 @@ describe('apply_change_set', () => {
       }),
       context,
     );
-    expect(result).toContain('- a.txt [edit] ok');
-    expect(result).toContain('- new.txt [create] ok');
-    expect(result).toContain('Error: change set failed at old.txt');
-    expect(await fs.readFile(path.join(root, 'a.txt'), 'utf-8')).toBe('one\n');
-    await expect(fs.stat(path.join(root, 'new.txt'))).rejects.toThrow();
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.files).toEqual(['a.txt', 'new.txt', 'old.txt']);
+    expect(parsed.diff).toContain('+ONE');
+    expect(parsed.rollbackAvailable).toBe(true);
+    expect(await fs.readFile(path.join(root, 'a.txt'), 'utf-8')).toBe('ONE\n');
+    expect(await fs.readFile(path.join(root, 'new.txt'), 'utf-8')).toBe('created\n');
+    await expect(fs.stat(path.join(root, 'old.txt'))).rejects.toThrow();
   });
 });
 
 describe('fix_in_file', () => {
-  it('reports before and after diagnostics for the file', async () => {
+  it('applies the change and reports a verifiable result', async () => {
     const target = path.join(root, 'broken.ts');
     await fs.writeFile(target, 'const broken = 1;\n', 'utf-8');
     env.getDiagnostics = (fileUri: any) => {
@@ -393,11 +439,11 @@ describe('fix_in_file', () => {
       JSON.stringify({ path: 'broken.ts', content: 'const fixed = 1;\n' }),
       context,
     );
-    expect(result).toContain('Diagnostics before:');
-    expect(result).toContain('broken.ts:1:7 [error] (ts) broken code');
-    expect(result).toContain('Diagnostics after:');
-    expect(result).toContain('(none)');
-    expect(result).toContain('Summary: 1 resolved, 0 new.');
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.files).toEqual(['broken.ts']);
+    expect(parsed.diff).toContain('+const fixed = 1;');
+    expect(parsed.verification.level).toBe('full');
     expect(await fs.readFile(target, 'utf-8')).toBe('const fixed = 1;\n');
   });
 
@@ -408,9 +454,30 @@ describe('fix_in_file', () => {
       JSON.stringify({ path: 'a.txt', patch: '@@\n-missing\n+changed' }),
       context,
     );
-    expect(result).toContain('Error:');
-    expect(result).toContain('Could not locate');
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('failed');
+    expect(parsed.message).toContain('Could not locate');
     expect(await fs.readFile(path.join(root, 'a.txt'), 'utf-8')).toBe('one\n');
+  });
+
+  it('applies directive oldText/newText replacements and rejects ambiguity', async () => {
+    await fs.writeFile(path.join(root, 'dup.txt'), 'alpha\nalpha\n', 'utf-8');
+    const ambiguous = await toolbox().execute(
+      'fix_in_file',
+      JSON.stringify({ path: 'dup.txt', oldText: 'alpha', newText: 'beta' }),
+      context,
+    );
+    const ambiguousParsed = JSON.parse(ambiguous);
+    expect(ambiguousParsed.status).toBe('needs_input');
+    expect(ambiguousParsed.message).toContain('lines 1, 2');
+
+    const applied = await toolbox().execute(
+      'fix_in_file',
+      JSON.stringify({ path: 'dup.txt', oldText: 'alpha', newText: 'beta', occurrence: 2 }),
+      context,
+    );
+    expect(JSON.parse(applied).status).toBe('verified');
+    expect(await fs.readFile(path.join(root, 'dup.txt'), 'utf-8')).toBe('alpha\nbeta\n');
   });
 });
 
@@ -433,7 +500,9 @@ describe('add_import_and_use', () => {
       }),
       context,
     );
-    expect(result).toContain("Inserted: import { value } from './values';");
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(JSON.stringify(parsed.evidence)).toContain("Inserted: import { value } from './values';");
     const content = await fs.readFile(path.join(root, 'use.ts'), 'utf-8');
     expect(content.startsWith("import { value } from './values';\n")).toBe(true);
     expect(content).toContain('const result = value();');
@@ -455,10 +524,25 @@ describe('rename_symbol', () => {
       JSON.stringify({ path: 'greet.ts', line: 1, character: 7, newName: 'count' }),
       context,
     );
-    expect(result).toContain('Renamed symbol to count.');
-    expect(result).toContain('language server rename was unavailable');
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.message).toContain('Renamed symbol to count.');
+    expect(parsed.message).toContain('language server rename was unavailable');
     const content = await fs.readFile(target, 'utf-8');
     expect(content).toBe('const count = 1;\nreturn count;\n');
+  });
+
+  it('accepts a deterministic rename instruction without a position', async () => {
+    await fs.writeFile(path.join(root, 'a.ts'), 'export const value = 1;\n', 'utf-8');
+    const result = await toolbox().execute(
+      'rename_symbol',
+      JSON.stringify({ instruction: 'rename value to total' }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.files).toContain('a.ts');
+    expect(await fs.readFile(path.join(root, 'a.ts'), 'utf-8')).toBe('export const total = 1;\n');
   });
 });
 
@@ -497,8 +581,10 @@ describe('update_related_files', () => {
       JSON.stringify({ symbol_or_pattern: 'MARKER', patchTemplate: '@@\n-let MARKER = 1;\n+let marker = 1;' }),
       context,
     );
-    expect(result).toContain('Found 12 candidate files');
-    expect(result).toContain('Re-call with confirm: true');
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('needs_input');
+    expect(parsed.message).toContain('Found 12 candidate files');
+    expect(parsed.message).toContain('Re-call with confirm: true');
     expect(applyChange).not.toHaveBeenCalled();
   });
 
@@ -513,7 +599,9 @@ describe('update_related_files', () => {
       }),
       context,
     );
-    expect(result).toContain('Updated 12/12 files');
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.message).toContain('Updated 12/12 files');
     expect(await fs.readFile(path.join(root, 'file-5.ts'), 'utf-8')).toBe('let marker = 1;\n');
   });
 });
@@ -534,7 +622,9 @@ describe('refactor_symbol', () => {
       }),
       context,
     );
-    expect(result).toContain('Extracted compute in main.ts.');
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.message).toContain('Extracted compute in main.ts.');
     const content = await fs.readFile(target, 'utf-8');
     expect(content.startsWith('const a = extracted(1);\n')).toBe(true);
     expect(content).toContain('function extracted(x: number) { return x; }');
@@ -557,7 +647,9 @@ describe('refactor_symbol', () => {
       }),
       context,
     );
-    expect(result).toContain('Moved helper from a.ts to b.ts.');
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.message).toContain('Moved helper from a.ts to b.ts.');
     const movedContent = await fs.readFile(target, 'utf-8');
     expect(movedContent).toContain('export { helper };');
     expect(movedContent).toContain('export function helper() {');
@@ -583,7 +675,9 @@ describe('refactor_symbol', () => {
       }),
       context,
     );
-    expect(failed).toContain('The source change was rolled back.');
+    const failedParsed = JSON.parse(failed);
+    expect(failedParsed.status).toBe('failed');
+    expect(failedParsed.message).toContain('The source change was rolled back.');
     expect(await fs.readFile(source, 'utf-8')).toBe('export function helper() {\n  return 1;\n}\n');
   });
 });
@@ -601,7 +695,10 @@ describe('verify_change', () => {
       JSON.stringify({ paths: ['a.ts'], mode: 'auto' }),
       { requestTerminalApproval: async () => 'allow' as const, planning: true },
     );
-    expect(result).toContain('# verify_change (diagnostics)');
-    expect(result).not.toContain('## Command');
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('needs_input');
+    expect(parsed.verification.level).toBe('partial');
+    expect(parsed.verification.checks).toContain('diagnostics');
+    expect(parsed.message).not.toContain('npm run typecheck');
   });
 });

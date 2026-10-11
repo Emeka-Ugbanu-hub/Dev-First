@@ -75,6 +75,7 @@ import {
   UPDATE_CONFIRM_THRESHOLD,
   UPDATE_MAX_FILES,
   appendSnippet,
+  boundedInvestigationTool,
   buildImportStatement,
   detectVerifyCommand,
   insertImport,
@@ -92,6 +93,37 @@ import {
   validateChangeSet,
   wordAtPosition,
 } from './compoundTools';
+import {
+  FileReadCache,
+  FileReadResult,
+  StaleContentError,
+  assertFresh,
+  changeDiff,
+  fileCacheKey,
+  generatedBlockedMessage,
+  isGeneratedPath,
+  makeReadCache,
+  occurrenceLines,
+  readFileWithHash,
+  replaceExactAll,
+  replaceExactAt,
+  validateWorkspacePath,
+} from './compoundPrimitives';
+import {
+  INSTRUCTION_ASK,
+  ParsedInstruction,
+  parseInstruction,
+  setQuotedString,
+} from './instructionParser';
+import {
+  CompoundDiagnostic,
+  CompoundEvidence,
+  CompoundResultPartial,
+  ProposedChangeValidation,
+  buildCompoundResult,
+  compoundDiagnostics,
+  compoundResult,
+} from './compoundResult';
 import { discoverRelatedTargets, searchTargets } from './compoundPreflight';
 import {
   IGNORED_DIRS,
@@ -110,6 +142,7 @@ import { BrowserSession } from '../browser/BrowserSession';
 import { SandboxMode } from './sandbox';
 import { QuestionItem, QuestionRequest, TerminalApprovalDecision, TodoItem } from '../shared/protocol';
 import { randomId } from '../util/id';
+import { sha1Of } from '../util/atomicWrite';
 import { MemoryStore } from '../memory/MemoryStore';
 import { BackgroundProcesses } from './BackgroundProcesses';
 import { ApprovalMemory, ExternalDirectoryConsent } from './approvals';
@@ -119,6 +152,25 @@ const MAX_STREAM_BYTES = 50 * 1024 * 1024;
 const MAX_LIST_ENTRIES = 500;
 const MAX_SEARCH_RESULTS = 100;
 const SKIP_SPILL = new Set(['todo_write']);
+const BOUNDED_DEFAULT_OPERATIONS = 6;
+const BOUNDED_HARD_CAP = 8;
+const BOUNDED_OP_BYTES = 8 * 1024;
+const BOUNDED_TOTAL_BYTES = 24 * 1024;
+const BOUNDED_ALLOWED_TOOLS = new Set([
+  'read_file',
+  'list_files',
+  'search_text',
+  'semantic_search',
+  'find_references',
+  'go_to_definition',
+  'document_symbols',
+  'find_symbol',
+  'hover',
+  'incoming_calls',
+  'outgoing_calls',
+  'inspect_file_context',
+  'investigate_issue',
+]);
 
 const useSkillSchema: ToolDef = {
   name: 'use_skill',
@@ -196,14 +248,21 @@ export interface ToolBoxOptions {
   approvalMemory?: ApprovalMemory;
   externalDirectories?: ExternalDirectoryConsent;
   recentRunOperations?: (filePath: string) => string[];
+  readCache?: FileReadCache;
 }
 
 export class ToolBox {
   private readonly externalDirectories: ExternalDirectoryConsent;
+  private readonly readCache: FileReadCache;
 
   constructor(private readonly options: ToolBoxOptions) {
     this.externalDirectories = options.externalDirectories ?? new ExternalDirectoryConsent();
+    this.readCache = options.readCache ?? makeReadCache();
     initOutputStore(options.root);
+  }
+
+  resetReadCache(): void {
+    this.readCache.clear();
   }
 
   async execute(name: string, argsJson: string, context: ToolExecutionContext): Promise<string> {
@@ -257,6 +316,8 @@ export class ToolBox {
         return { text: await this.inspectFileContext(args, context) };
       case 'investigate_issue':
         return { text: await this.investigateIssue(args, context) };
+      case 'bounded_investigation':
+        return { text: await this.boundedInvestigation(args, context) };
       case 'verify_change':
         return { text: await this.verifyChange(args, context) };
       case 'apply_change_set':
@@ -999,77 +1060,204 @@ export class ToolBox {
     return this.options.browser.screenshot(path.join(this.options.root, '.dev-first', 'screenshots'));
   }
 
+  private needsInput(message: string, partial: Partial<CompoundResultPartial> = {}): string {
+    return compoundResult({
+      ...partial,
+      status: 'needs_input',
+      message,
+      files: partial.files ?? [],
+      verification: partial.verification ?? { level: 'none', checks: [] },
+      rollbackAvailable: partial.rollbackAvailable ?? false,
+    });
+  }
+
+  private blocked(message: string, files: string[] = []): string {
+    return compoundResult({
+      status: 'blocked',
+      files,
+      message,
+      verification: { level: 'none', checks: [] },
+      rollbackAvailable: false,
+    });
+  }
+
+  private failed(message: string, partial: Partial<CompoundResultPartial> = {}): string {
+    return compoundResult({
+      ...partial,
+      status: 'failed',
+      message,
+      files: partial.files ?? [],
+      verification: partial.verification ?? { level: 'none', checks: [] },
+      rollbackAvailable: partial.rollbackAvailable ?? false,
+    });
+  }
+
+  private resolveCompoundTarget(value: unknown): { relative: string; absolute: string } | undefined {
+    const validation = validateWorkspacePath(this.options.root, value);
+    if (!validation.ok) {
+      return undefined;
+    }
+    return { relative: validation.relative, absolute: validation.absolute };
+  }
+
+  private resolveCompoundPaths(values: unknown, partial: Partial<CompoundResultPartial> = {}): string[] | string {
+    if (!Array.isArray(values)) {
+      return [];
+    }
+    const resolved: string[] = [];
+    for (const value of values) {
+      const target = this.resolveCompoundTarget(value);
+      if (!target) {
+        return this.needsInput(`"${String(value)}" must be a workspace-relative path without escapes.`, partial);
+      }
+      resolved.push(target.relative);
+    }
+    return resolved;
+  }
+
+  private async collectDiagnostics(paths: string[]): Promise<FileDiagnostic[]> {
+    if (paths.length === 0) {
+      return [];
+    }
+    return this.safeDiagnostics([...new Set(paths)]);
+  }
+
+  private diagnosticsEvidence(items: FileDiagnostic[]): CompoundEvidence {
+    const lines = diagnosticLines(items).slice(0, 40);
+    return { kind: 'diagnostics', summary: lines.join('\n') || '(none)' };
+  }
+
+  private addedErrorDiagnostics(before: FileDiagnostic[], after: FileDiagnostic[]): FileDiagnostic[] {
+    return after.filter(
+      (item) => item.severity === 'error' && !before.some((candidate) => sameDiagnostic(candidate, item)),
+    );
+  }
+
+  private compoundFiles(relativePaths: string[]): string[] {
+    return [...new Set(relativePaths)];
+  }
+
+  private async compoundWrite(
+    relative: string,
+    absolute: string,
+    next: string,
+    expectedHash: string,
+  ): Promise<{ ok: true } | { ok: false; stale?: string; error?: string }> {
+    let current: string;
+    try {
+      current = await fs.readFile(absolute, 'utf-8');
+    } catch (error) {
+      return { ok: false, error: errorMessage(error) };
+    }
+    try {
+      assertFresh(expectedHash, current, relative);
+    } catch (error) {
+      return { ok: false, stale: errorMessage(error) };
+    }
+    try {
+      await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, next));
+    } catch (error) {
+      return { ok: false, error: errorMessage(error) };
+    }
+    return { ok: true };
+  }
+
   private async inspectFileContext(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     const display = String(args.path ?? '');
-    const absolute = await this.resolvePath(args.path, context);
-    const content = await this.readTextIfExists(absolute);
-    if (content === undefined) {
-      return `Error: ${display} does not exist.`;
+    const target = this.resolveCompoundTarget(args.path);
+    if (!target) {
+      return this.needsInput('A workspace-relative file path is required.');
     }
-    const sections: string[] = [`# ${display}`];
-    const allLines = content.replace(/\r\n/g, '\n').split('\n');
+    const [read, symbols, diagnostics] = await Promise.all([
+      readFileWithHash(this.options.root, target.relative, this.readCache),
+      documentSymbolLines(target.absolute, 30).catch(() => [] as string[]),
+      this.collectDiagnostics([target.absolute]),
+    ]);
+    if (!read) {
+      return this.failed(`Error: ${display} does not exist.`, { files: [] });
+    }
+    const evidence: CompoundEvidence[] = [];
+    const allLines = read.text.replace(/\r\n/g, '\n').split('\n');
     const endLine = budgetEndLine(allLines, 1, Math.min(200, allLines.length), MAX_READ_BYTES);
     const lines = allLines.slice(0, endLine);
-    sections.push(
-      `## Content (first ${lines.length} lines)\n${lines.map((line, index) => `${index + 1} | ${truncateLine(line)}`).join('\n') || '(empty file)'}`,
-    );
-    let symbols: string[] = [];
-    try {
-      symbols = await documentSymbolLines(absolute, 30);
-    } catch {}
-    sections.push(`## Symbols\n${symbols.join('\n') || '(none)'}`);
-    const diagnostics = await this.safeDiagnostics([absolute]);
-    sections.push(`## Diagnostics\n${diagnosticLines(diagnostics.slice(0, 20)).join('\n') || '(none)'}`);
-    sections.push(`## Imports\n${importLines(content, 20).join('\n') || '(none)'}`);
+    evidence.push({
+      kind: 'content',
+      summary: `${lines.map((line, index) => `${index + 1} | ${truncateLine(line)}`).join('\n') || '(empty file)'}`,
+      file: target.relative,
+    });
+    evidence.push({ kind: 'symbols', summary: symbols.join('\n') || '(none)', file: target.relative });
+    evidence.push(this.diagnosticsEvidence(diagnostics));
+    evidence.push({ kind: 'imports', summary: importLines(read.text, 20).join('\n') || '(none)' });
     if (args.includeReferences) {
       const symbol = symbols[0] ? symbolNameFromEntry(symbols[0]) : undefined;
       if (symbol) {
         let references = '';
         try {
-          references = await findReferences(absolute, symbol);
+          references = await findReferences(target.absolute, symbol);
         } catch {}
-        sections.push(`## References to ${symbol} (capped)\n${capLines(references, 20)}`);
+        evidence.push({
+          kind: 'references',
+          summary: capLines(references, 20),
+          file: target.relative,
+        });
       } else {
-        sections.push('## References\n(no symbol found to reference)');
+        evidence.push({ kind: 'references', summary: '(no symbol found to reference)' });
       }
     }
-    return sections.join('\n\n');
+    return compoundResult({
+      status: 'verified',
+      files: [target.relative],
+      diagnostics: compoundDiagnostics(diagnostics),
+      evidence,
+      verification: { level: 'none', checks: ['read-only'] },
+      rollbackAvailable: false,
+    });
   }
 
   private async investigateIssue(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     const display = String(args.path ?? '');
-    const absolute = await this.resolvePath(args.path, context);
-    const content = await this.readTextIfExists(absolute);
-    if (content === undefined) {
-      return `Error: ${display} does not exist.`;
+    const target = this.resolveCompoundTarget(args.path);
+    if (!target) {
+      return this.needsInput('A workspace-relative file path is required.');
     }
     const line = clampInt(args.line, 1, Number.MAX_SAFE_INTEGER);
-    const symbol = line ? symbolAtLine(content, line) : undefined;
-    const sections: string[] = [`# Investigation: ${display}${line ? `:${line}` : ''}`];
-    const diagnostics = await this.safeDiagnostics([absolute]);
+    const [read, diagnostics] = await Promise.all([
+      readFileWithHash(this.options.root, target.relative, this.readCache),
+      this.collectDiagnostics([target.absolute]),
+    ]);
+    if (!read) {
+      return this.failed(`Error: ${display} does not exist.`, { files: [] });
+    }
+    const symbol = line ? symbolAtLine(read.text, line) : undefined;
     const nearby = line ? diagnostics.filter((item) => Math.abs(item.line - line) <= 5) : diagnostics;
-    sections.push(
-      `## Diagnostics ${line ? `near line ${line}` : 'for the file'}\n${diagnosticLines(nearby.slice(0, 20)).join('\n') || '(none)'}`,
-    );
+    const evidence: CompoundEvidence[] = [{ kind: 'diagnostics', summary: diagnosticLines(nearby.slice(0, 20)).join('\n') || '(none)' }];
     if (symbol) {
-      let references = '';
-      try {
-        references = await findReferences(absolute, symbol);
-      } catch (error) {
-        references = `Error: ${errorMessage(error)}`;
-      }
-      sections.push(`## Related files (references to ${symbol})\n${capLines(references, 20)}`);
+      const [references, matches] = await Promise.all([
+        findReferences(target.absolute, symbol).catch((error) => `Error: ${errorMessage(error)}`),
+        this.searchText({ query: symbol, max_results: 10 }, context),
+      ]);
+      evidence.push({ kind: 'references', summary: capLines(references, 20), file: target.relative });
+      evidence.push({ kind: 'symbol-search', summary: capLines(matches, 20) });
     } else {
-      sections.push('## Related files\n(no symbol detected; pass line to enable reference lookup)');
+      evidence.push({
+        kind: 'references',
+        summary: '(no symbol detected; pass line to enable reference lookup)',
+      });
     }
-    sections.push(`## Imports\n${importLines(content, 20).join('\n') || '(none)'}`);
+    evidence.push({ kind: 'imports', summary: importLines(read.text, 20).join('\n') || '(none)' });
     const runLines = this.options.recentRunOperations?.(display) ?? [];
-    sections.push(`## Recent run journal\n${runLines.slice(0, 5).join('\n') || 'No active run operations for this file.'}`);
-    if (symbol) {
-      const matches = await this.searchText({ query: symbol, max_results: 10 }, context);
-      sections.push(`## Symbol search: ${symbol}\n${capLines(matches, 20)}`);
-    }
-    return sections.join('\n\n');
+    evidence.push({
+      kind: 'run-journal',
+      summary: runLines.slice(0, 5).join('\n') || 'No active run operations for this file.',
+    });
+    return compoundResult({
+      status: 'verified',
+      files: [target.relative],
+      diagnostics: compoundDiagnostics(diagnostics),
+      evidence,
+      verification: { level: 'none', checks: ['read-only'] },
+      rollbackAvailable: false,
+    });
   }
 
   private async verifyChange(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
@@ -1077,443 +1265,1466 @@ export class ToolBox {
       ? args.paths.filter((entry: unknown): entry is string => typeof entry === 'string' && entry.trim().length > 0)
       : [];
     if (rawPaths.length === 0) {
-      return 'Error: paths must be a non-empty array of workspace-relative file paths.';
+      return this.needsInput('paths must be a non-empty array of workspace-relative file paths.');
     }
-    const absolutes: string[] = [];
+    const resolved: string[] = [];
     for (const entry of rawPaths) {
-      absolutes.push(await this.resolvePath(entry, context));
+      const target = this.resolveCompoundTarget(entry);
+      if (!target) {
+        return this.needsInput(`"${entry}" must be a workspace-relative path without escapes.`);
+      }
+      resolved.push(target.absolute);
     }
-    const unique = [...new Set(absolutes)];
+    const unique = [...new Set(resolved)];
+    const files = this.compoundFiles(resolved.map((absolute) => path.relative(this.options.root, absolute).split(path.sep).join('/')));
     const mode = context.planning || args.mode !== 'auto' ? 'diagnostics' : 'auto';
-    const before = await this.safeDiagnostics(unique);
-    const sections: string[] = [`# verify_change (${mode})`];
-    sections.push(`## Diagnostics before\n${diagnosticLines(before).join('\n') || '(none)'}`);
-    let after = before;
+    const diagnostics = await this.safeDiagnostics(unique);
+    const errors = diagnostics.filter((item) => item.severity === 'error');
+    if (errors.length > 0) {
+      return this.failed(`${errors.length} error diagnostic${errors.length === 1 ? '' : 's'} remain in the checked files.`, {
+        files,
+        diagnostics: compoundDiagnostics(diagnostics),
+        evidence: [this.diagnosticsEvidence(diagnostics)],
+        verification: { level: 'none', checks: ['diagnostics'] },
+        rollbackAvailable: false,
+      });
+    }
     if (mode === 'auto') {
       const detection = await this.detectVerificationCommand();
       if (!detection) {
-        sections.push('## Command\nNo verification script found in package.json (looked for typecheck, test, build).');
-      } else {
-        const outcome = await this.runCommand({ command: detection.command }, context);
-        after = await this.safeDiagnostics(unique);
-        const status = /^Exit code: 0\b/m.test(outcome.text) ? 'passed' : 'failed';
-        sections.push(`## Command\n${detection.command} — ${status}\n${capLines(outcome.text, 30)}`);
+        return this.needsInput(
+          'No verification script was found in package.json (looked for typecheck, test, build); no check ran.',
+          {
+            files,
+            diagnostics: compoundDiagnostics(diagnostics),
+            evidence: [this.diagnosticsEvidence(diagnostics)],
+            verification: { level: 'partial', checks: ['diagnostics'] },
+          },
+        );
+      }
+      const outcome = await this.runCommand({ command: detection.command }, context);
+      const passed = /^Exit code: 0\b/m.test(outcome.text);
+      if (passed) {
+        return compoundResult({
+          status: 'verified',
+          files,
+          diagnostics: compoundDiagnostics(diagnostics),
+          evidence: [
+            this.diagnosticsEvidence(diagnostics),
+            { kind: 'command', summary: `${detection.command} — passed` },
+          ],
+          verification: { level: 'full', checks: ['diagnostics', detection.script] },
+          rollbackAvailable: false,
+        });
+      }
+      return this.failed(`${detection.command} failed.`, {
+        files,
+        diagnostics: compoundDiagnostics(diagnostics),
+        evidence: [
+          this.diagnosticsEvidence(diagnostics),
+          { kind: 'command', summary: capLines(outcome.text, 30) },
+        ],
+        verification: { level: 'none', checks: ['diagnostics', detection.script] },
+      });
+    }
+    if (diagnostics.length === 0) {
+      return this.needsInput(
+        'No diagnostics were reported for the checked files and diagnostics-only mode cannot run a command; no check ran.',
+        {
+          files,
+          evidence: [this.diagnosticsEvidence(diagnostics)],
+          verification: { level: 'partial', checks: ['diagnostics'] },
+        },
+      );
+    }
+    return this.failed(`${diagnostics.length} diagnostic${diagnostics.length === 1 ? '' : 's'} remain in the checked files.`, {
+      files,
+      diagnostics: compoundDiagnostics(diagnostics),
+      evidence: [this.diagnosticsEvidence(diagnostics)],
+      verification: { level: 'none', checks: ['diagnostics'] },
+    });
+  }
+
+  private async boundedInvestigation(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const rawOps = Array.isArray(args.operations) ? args.operations : [];
+    if (rawOps.length === 0) {
+      return this.needsInput('operations must be a non-empty array of { tool, args }.');
+    }
+    const requested = clampInt(args.maxOperations, 1, BOUNDED_HARD_CAP) ?? BOUNDED_DEFAULT_OPERATIONS;
+    const limit = Math.min(requested, BOUNDED_HARD_CAP);
+    if (rawOps.length > limit) {
+      return this.blocked(
+        `bounded_investigation is limited to ${limit} operations per call (received ${rawOps.length}).`,
+      );
+    }
+    const ops: Array<{ tool: string; args: Record<string, any> }> = [];
+    for (let index = 0; index < rawOps.length; index++) {
+      const op = rawOps[index];
+      if (!op || typeof op !== 'object' || Array.isArray(op)) {
+        return this.blocked(`operations[${index}] must be an object with tool and args.`);
+      }
+      const tool = typeof op.tool === 'string' ? op.tool.trim() : '';
+      if (!tool) {
+        return this.blocked(`operations[${index}].tool is required.`);
+      }
+      if (!BOUNDED_ALLOWED_TOOLS.has(tool)) {
+        return this.blocked(
+          `operations[${index}] uses "${tool}", which is not allowed in bounded_investigation. Allowed: ${[
+            ...BOUNDED_ALLOWED_TOOLS,
+          ].join(', ')}.`,
+        );
+      }
+      const opArgs = op.args;
+      if (!opArgs || typeof opArgs !== 'object' || Array.isArray(opArgs)) {
+        return this.blocked(`operations[${index}].args must be an object.`);
+      }
+      const schema = TOOL_SCHEMAS.get(tool);
+      const required = Array.isArray((schema?.parameters as { required?: unknown } | undefined)?.required)
+        ? ((schema!.parameters as { required: unknown[] }).required.filter(
+            (key): key is string => typeof key === 'string',
+          ))
+        : [];
+      for (const key of required) {
+        if (opArgs[key] === undefined || opArgs[key] === null) {
+          return this.blocked(`operations[${index}] (${tool}) is missing required argument "${key}".`);
+        }
+      }
+      ops.push({ tool, args: opArgs });
+    }
+
+    const controller = new AbortController();
+    let resolveAborted: () => void = () => {};
+    const aborted = new Promise<'aborted'>((resolve) => {
+      resolveAborted = () => resolve('aborted');
+    });
+    controller.signal.addEventListener('abort', () => resolveAborted());
+
+    type OpOutcome =
+      | { kind: 'done'; tool: string; text: string; truncated: boolean }
+      | { kind: 'skipped'; tool: string };
+    let totalBytes = 0;
+    let truncated = false;
+    const outcomes = await Promise.all(
+      ops.map(async (op): Promise<OpOutcome> => {
+        if (controller.signal.aborted) {
+          return { kind: 'skipped', tool: op.tool };
+        }
+        const running = this.dispatch(op.tool, op.args, context)
+          .then((outcome) => outcome.text)
+          .catch((error) => `Error: ${errorMessage(error)}`);
+        running.catch(() => undefined);
+        const raced = await Promise.race([running, aborted]);
+        if (raced === 'aborted') {
+          return { kind: 'skipped', tool: op.tool };
+        }
+        let text = raced;
+        let opTruncated = false;
+        if (Buffer.byteLength(text, 'utf-8') > BOUNDED_OP_BYTES) {
+          text = truncateUtf8(text, BOUNDED_OP_BYTES);
+          opTruncated = true;
+          truncated = true;
+        }
+        totalBytes += Buffer.byteLength(text, 'utf-8');
+        if (totalBytes > BOUNDED_TOTAL_BYTES) {
+          truncated = true;
+          controller.abort();
+        }
+        return { kind: 'done', tool: op.tool, text, truncated: opTruncated };
+      }),
+    );
+
+    const evidence: CompoundEvidence[] = [];
+    const skipped: string[] = [];
+    const referencedFiles: string[] = [];
+    const opPaths = ops.map((op) => this.boundedOperationPaths(op.args));
+    for (const paths of opPaths) {
+      referencedFiles.push(...paths);
+    }
+    for (let index = 0; index < outcomes.length; index++) {
+      const outcome = outcomes[index];
+      if (outcome.kind === 'skipped') {
+        skipped.push(outcome.tool);
+        continue;
+      }
+      evidence.push({
+        kind: 'operation',
+        summary: `[${outcome.tool}]${outcome.truncated ? ' (truncated)' : ''}\n${outcome.text}`,
+        ...(opPaths[index]?.[0] ? { file: opPaths[index][0] } : {}),
+      });
+    }
+    const proposedChangeSet: ProposedChangeValidation[] = [];
+    const rawProposed = Array.isArray(args.proposedChanges) ? args.proposedChanges : [];
+    for (const raw of rawProposed) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        proposedChangeSet.push({ path: '', oldText: '', newText: '', ok: false, reason: 'entry must be an object' });
+        continue;
+      }
+      const pathValue = typeof raw.path === 'string' ? raw.path : '';
+      const oldText = typeof raw.oldText === 'string' ? raw.oldText : '';
+      const newText = typeof raw.newText === 'string' ? raw.newText : '';
+      const validation = validateWorkspacePath(this.options.root, pathValue);
+      if (!validation.ok) {
+        proposedChangeSet.push({
+          path: pathValue,
+          oldText,
+          newText,
+          ok: false,
+          reason: validation.error,
+        });
+        continue;
+      }
+      referencedFiles.push(validation.relative);
+      const read = await readFileWithHash(this.options.root, validation.relative, this.readCache);
+      if (!read) {
+        proposedChangeSet.push({ path: validation.relative, oldText, newText, ok: false, reason: 'file not found' });
+        continue;
+      }
+      const lines = occurrenceLines(read.text, oldText);
+      if (lines.length === 0) {
+        proposedChangeSet.push({ path: validation.relative, oldText, newText, ok: false, reason: 'oldText was not found' });
+        continue;
+      }
+      if (lines.length > 1) {
+        proposedChangeSet.push({
+          path: validation.relative,
+          oldText,
+          newText,
+          ok: false,
+          line: lines[0],
+          reason: `oldText matches ${lines.length} locations (lines ${lines.join(', ')}); it must occur exactly once`,
+        });
+        continue;
+      }
+      proposedChangeSet.push({ path: validation.relative, oldText, newText, ok: true, line: lines[0] });
+    }
+    const coverage = {
+      operations: ops.length - skipped.length,
+      files: this.compoundFiles(referencedFiles).length,
+      skipped: skipped.length,
+    };
+    evidence.unshift({
+      kind: 'coverage',
+      summary: `ran ${coverage.operations}/${ops.length} read-only operation${ops.length === 1 ? '' : 's'}; ${coverage.files} file${coverage.files === 1 ? '' : 's'} referenced${
+        skipped.length > 0 ? `; skipped: ${skipped.join(', ')}` : ''
+      }${truncated ? '; output truncated' : ''}`,
+    });
+    const files = this.compoundFiles(referencedFiles);
+    const partial: Omit<CompoundResultPartial, 'status'> = {
+      files,
+      evidence,
+      ...(truncated ? { truncated: true } : {}),
+      ...(skipped.length > 0 ? { skipped } : {}),
+      ...(proposedChangeSet.length > 0 ? { proposedChangeSet } : {}),
+      coverage,
+      verification: { level: truncated || skipped.length > 0 ? 'partial' : 'full', checks: ['read-only'] },
+      rollbackAvailable: false,
+    };
+    const proposedProblems = proposedChangeSet.filter((entry) => !entry.ok);
+    if (proposedProblems.length > 0) {
+      return this.needsInput(
+        `proposedChanges has ${proposedProblems.length} problem${proposedProblems.length === 1 ? '' : 's'}: ${proposedProblems
+          .map((entry) => `${entry.path || '(no path)'}: ${entry.reason ?? 'invalid'}`)
+          .join('; ')}.`,
+        partial,
+      );
+    }
+    return compoundResult({ ...partial, status: 'verified' });
+  }
+
+  private boundedOperationPaths(opArgs: Record<string, any>): string[] {
+    const paths: string[] = [];
+    for (const key of ['path', 'targetPath'] as const) {
+      const value = opArgs[key];
+      if (typeof value === 'string' && value.trim()) {
+        paths.push(value.trim());
       }
     }
-    sections.push(`## Diagnostics after\n${diagnosticLines(after).join('\n') || '(none)'}`);
-    const resolved = before.filter((item) => !after.some((candidate) => sameDiagnostic(candidate, item)));
-    const added = after.filter((item) => !before.some((candidate) => sameDiagnostic(candidate, item)));
-    sections.push(`## Summary\n${resolved.length} resolved, ${added.length} new`);
-    return sections.join('\n\n');
+    if (Array.isArray(opArgs.paths)) {
+      for (const value of opArgs.paths) {
+        if (typeof value === 'string' && value.trim()) {
+          paths.push(value.trim());
+        }
+      }
+    }
+    return paths;
   }
 
   private async applyChangeSet(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     const validation = validateChangeSet(args);
     if (!validation.ok) {
-      return `Error: ${validation.error}`;
+      return this.needsInput(`Error: ${validation.error}`);
     }
+    const allowGenerated = Boolean(args.allowGenerated);
     const resolved: Array<{ entry: ChangeSetEntry; absolute: string; relative: string }> = [];
     for (const entry of validation.changes) {
-      resolved.push({
-        entry,
-        absolute: await this.resolvePath(entry.path, context),
-        relative: entry.path,
+      const target = this.resolveCompoundTarget(entry.path);
+      if (!target) {
+        return this.blocked(`"${entry.path}" must be a workspace-relative path without escapes.`);
+      }
+      if (isGeneratedPath(target.relative) && !allowGenerated) {
+        return this.blocked(generatedBlockedMessage(target.relative), [target.relative]);
+      }
+      resolved.push({ entry, absolute: target.absolute, relative: target.relative });
+    }
+    const files = this.compoundFiles(resolved.map((item) => item.relative));
+    if (!(await this.editApproved('apply_change_set', files.join(', '), context))) {
+      return this.blocked('The developer denied this edit. Do not retry it unless asked.', files);
+    }
+    const originals = new Map<string, FileReadResult | undefined>();
+    for (const { relative } of resolved) {
+      originals.set(relative, await readFileWithHash(this.options.root, relative, this.readCache));
+    }
+    type Planned = { entry: ChangeSetEntry; absolute: string; relative: string; before?: string; after?: string };
+    const planned: Planned[] = [];
+    const preflightProblems: string[] = [];
+    for (const { entry, absolute, relative } of resolved) {
+      const original = originals.get(relative);
+      if (entry.action === 'create') {
+        planned.push({ entry, absolute, relative, after: entry.content ?? '' });
+        continue;
+      }
+      if (!original) {
+        preflightProblems.push(`${relative} does not exist; use action create`);
+        continue;
+      }
+      if (entry.action === 'delete') {
+        planned.push({ entry, absolute, relative, before: original.text });
+        continue;
+      }
+      if (entry.patch) {
+        const hunks = patchHunksFor(entry.patch);
+        if (hunks.length === 0) {
+          preflightProblems.push(`${relative}: patch has no hunks`);
+          continue;
+        }
+        const outcome = applyHunks(original.text, hunks);
+        if (!outcome.ok) {
+          preflightProblems.push(`${relative}: ${outcome.error}`);
+          continue;
+        }
+        planned.push({ entry, absolute, relative, before: original.text, after: outcome.content });
+      } else {
+        planned.push({ entry, absolute, relative, before: original.text, after: entry.content ?? '' });
+      }
+    }
+    const plannedDiff = planned
+      .map((item) => changeDiff(item.relative, item.before, item.after))
+      .filter(Boolean)
+      .join('\n');
+    if (preflightProblems.length > 0) {
+      return this.failed(`Change set preflight failed; nothing was written: ${preflightProblems.join('; ')}.`, {
+        files,
+        ...(plannedDiff ? { diff: plannedDiff } : {}),
+        evidence: [{ kind: 'checkpoint', summary: 'no files written; preflight only' }],
+        rollbackAvailable: false,
       });
     }
-    if (!(await this.editApproved('apply_change_set', resolved.map((item) => item.relative).join(', '), context))) {
-      return 'The developer denied this edit. Do not retry it unless asked.';
+    const checkpoint = `captured ${planned.length} file${planned.length === 1 ? '' : 's'} before any write`;
+    const stale = await this.staleTargets(
+      planned.map((item) => ({ relative: item.relative, absolute: item.absolute, hash: originals.get(item.relative)?.hash })),
+    );
+    if (stale.length > 0) {
+      return this.needsInput(`Concurrent edit detected in ${stale.join(', ')}; the change set was aborted.`, {
+        files,
+        ...(plannedDiff ? { diff: plannedDiff } : {}),
+        evidence: [{ kind: 'checkpoint', summary: `${checkpoint}; no changes applied` }],
+        rollbackAvailable: false,
+      });
     }
-    const originals = new Map<string, string | undefined>();
-    for (const { absolute } of resolved) {
-      originals.set(absolute, await this.readTextIfExists(absolute));
-    }
-    const applied: Array<{ absolute: string; relative: string }> = [];
-    const results: string[] = [];
-    for (const { entry, absolute, relative } of resolved) {
+    const before = await this.collectDiagnostics(planned.map((item) => item.absolute));
+    const applied: string[] = [];
+    for (const item of planned) {
+      const changedNow = await this.staleTargets([
+        { relative: item.relative, absolute: item.absolute, hash: originals.get(item.relative)?.hash },
+      ]);
+      if (changedNow.length > 0) {
+        const rollback = await this.rollbackApplied(applied, planned, originals);
+        return this.needsInput(`Concurrent edit detected in ${changedNow.join(', ')}; the change set was aborted.`, {
+          files,
+          ...(plannedDiff ? { diff: plannedDiff } : {}),
+          evidence: [
+            { kind: 'checkpoint', summary: rollback.rolledBack.length > 0 ? `rolled back ${rollback.rolledBack.join(', ')}` : `${checkpoint}; nothing applied` },
+          ],
+          rollbackAvailable: rollback.rolledBack.length > 0,
+        });
+      }
       try {
-        await this.applyChangeSetEntry(entry, absolute, originals.get(absolute));
-        applied.push({ absolute, relative });
-        results.push(`- ${relative} [${entry.action}] ok`);
+        if (item.entry.action === 'delete') {
+          await withFileLock(item.absolute, () => this.options.diffManager.applyDeletion(item.absolute));
+        } else {
+          await withFileLock(item.absolute, () => this.options.diffManager.applyChange(item.absolute, item.after ?? ''));
+        }
+        applied.push(item.relative);
       } catch (error) {
-        const rolledBack = await this.rollbackFiles(applied, originals);
-        results.push(`- ${relative} [${entry.action}] failed: ${errorMessage(error)}`);
-        const suffix = rolledBack.length > 0 ? `\nRolled back: ${rolledBack.join(', ')}.` : '\nNothing needed rollback.';
-        return `Error: change set failed at ${relative} — ${errorMessage(error)}.${suffix}\n${results.join('\n')}`;
+        const rollback = await this.rollbackApplied(applied, planned, originals);
+        const rollbackNote =
+          rollback.failedRollback.length > 0
+            ? `rollback failed for ${rollback.failedRollback.join(', ')}`
+            : rollback.rolledBack.length > 0
+              ? `rolled back ${rollback.rolledBack.join(', ')}`
+              : 'nothing needed rollback';
+        return this.failed(`Change set failed at ${item.relative} — ${errorMessage(error)}.`, {
+          files,
+          ...(plannedDiff ? { diff: plannedDiff } : {}),
+          evidence: [{ kind: 'checkpoint', summary: `${checkpoint}; ${rollbackNote}` }],
+          rollbackAvailable: rollback.failedRollback.length > 0,
+        });
       }
     }
-    const diagnostics = await this.safeDiagnostics([...new Set(resolved.map((item) => item.absolute))]);
-    const diagnosticText = diagnosticLines(diagnostics).join('\n');
-    return `Applied ${resolved.length} change${resolved.length === 1 ? '' : 's'}:\n${results.join('\n')}${
-      diagnosticText ? `\n\nDiagnostics:\n${diagnosticText}` : '\n\nDiagnostics: none'
-    }`;
+    const diagnostics = await this.collectDiagnostics(planned.map((item) => item.absolute));
+    const addedErrors = this.addedErrorDiagnostics(before, diagnostics);
+    const evidence: CompoundEvidence[] = [
+      { kind: 'checkpoint', summary: checkpoint },
+      ...planned.map((item) => ({ kind: 'change', summary: `- ${item.relative} [${item.entry.action}] ok`, file: item.relative })),
+      this.diagnosticsEvidence(diagnostics),
+    ];
+    if (addedErrors.length > 0) {
+      return this.needsInput(
+        `Change set applied, but ${addedErrors.length} new error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
+        {
+          files,
+          ...(plannedDiff ? { diff: plannedDiff } : {}),
+          diagnostics: compoundDiagnostics(diagnostics),
+          evidence,
+          verification: { level: 'partial', checks: ['preflight', 'stale-guard', 'diagnostics'] },
+          rollbackAvailable: true,
+        },
+      );
+    }
+    return compoundResult({
+      status: 'verified',
+      files,
+      ...(plannedDiff ? { diff: plannedDiff } : {}),
+      diagnostics: compoundDiagnostics(diagnostics),
+      evidence,
+      verification: { level: 'full', checks: ['preflight', 'stale-guard', 'diagnostics'] },
+      rollbackAvailable: true,
+    });
   }
 
-  private async applyChangeSetEntry(
-    entry: ChangeSetEntry,
-    absolute: string,
-    original: string | undefined,
-  ): Promise<void> {
-    if (entry.action === 'create') {
-      await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, entry.content ?? ''));
-      return;
-    }
-    if (original === undefined) {
-      throw new Error('does not exist; use action create');
-    }
-    if (entry.action === 'delete') {
-      await withFileLock(absolute, () => this.options.diffManager.applyDeletion(absolute));
-      return;
-    }
-    let next: string;
-    if (entry.patch) {
-      const hunks = patchHunksFor(entry.patch);
-      if (hunks.length === 0) {
-        throw new Error('patch has no hunks');
-      }
-      const outcome = applyHunks(original, hunks);
-      if (!outcome.ok) {
-        throw new Error(outcome.error);
-      }
-      next = outcome.content;
-    } else {
-      next = entry.content ?? '';
-    }
-    await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, next));
-  }
-
-  private async rollbackFiles(
-    applied: Array<{ absolute: string; relative: string }>,
-    originals: Map<string, string | undefined>,
+  private async staleTargets(
+    entries: Array<{ relative: string; absolute: string; hash?: string }>,
   ): Promise<string[]> {
+    const stale: string[] = [];
+    for (const item of entries) {
+      const current = await this.readTextIfExists(item.absolute);
+      if (current === undefined) {
+        if (item.hash !== undefined) {
+          stale.push(item.relative);
+        }
+        continue;
+      }
+      if (item.hash === undefined || sha1Of(current) !== item.hash) {
+        stale.push(item.relative);
+      }
+    }
+    return stale;
+  }
+
+  private async rollbackApplied(
+    applied: string[],
+    planned: Array<{ entry: ChangeSetEntry; absolute: string; relative: string }>,
+    originals: Map<string, FileReadResult | undefined>,
+  ): Promise<{ rolledBack: string[]; failedRollback: string[] }> {
     const rolledBack: string[] = [];
-    for (const item of [...applied].reverse()) {
-      const original = originals.get(item.absolute);
+    const failedRollback: string[] = [];
+    for (const relative of [...applied].reverse()) {
+      const item = planned.find((candidate) => candidate.relative === relative);
+      if (!item) {
+        continue;
+      }
+      const original = originals.get(relative);
       try {
         if (original === undefined) {
           if (await this.pathExists(item.absolute)) {
             await withFileLock(item.absolute, () => this.options.diffManager.applyDeletion(item.absolute));
           }
         } else {
-          await withFileLock(item.absolute, () => this.options.diffManager.applyChange(item.absolute, original));
+          await withFileLock(item.absolute, () => this.options.diffManager.applyChange(item.absolute, original.text));
         }
-        rolledBack.push(item.relative);
-      } catch {}
+        rolledBack.push(relative);
+      } catch {
+        failedRollback.push(relative);
+      }
     }
-    return rolledBack;
+    return { rolledBack, failedRollback };
   }
 
   private async fixInFile(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     const display = String(args.path ?? '');
-    const absolute = await this.resolvePath(args.path, context);
+    const target = this.resolveCompoundTarget(args.path);
+    if (!target) {
+      return this.needsInput('A workspace-relative file path is required.');
+    }
+    if (isGeneratedPath(target.relative) && !args.allowGenerated) {
+      return this.blocked(generatedBlockedMessage(target.relative), [target.relative]);
+    }
+    const read = await readFileWithHash(this.options.root, target.relative, this.readCache);
+    if (!read) {
+      return this.needsInput(`${display} does not exist. Create it with write_file first.`, {
+        files: [target.relative],
+      });
+    }
+    const verifyPaths = this.resolveCompoundPaths(args.verify, { files: [target.relative] });
+    if (typeof verifyPaths === 'string') {
+      return verifyPaths;
+    }
     const patch = typeof args.patch === 'string' && args.patch.trim() ? args.patch : undefined;
     const content = typeof args.content === 'string' ? args.content : undefined;
-    if (!patch && content === undefined) {
-      return 'Error: provide patch or content.';
+    const hasInstruction = typeof args.instruction === 'string' && args.instruction.trim().length > 0;
+    const hasOldText = typeof args.oldText === 'string';
+    const sources = [hasInstruction, hasOldText, Boolean(patch), content !== undefined].filter(Boolean).length;
+    if (sources === 0) {
+      return this.needsInput('provide instruction, oldText, patch, or content.', {
+        files: [target.relative],
+      });
     }
-    if (patch && content !== undefined) {
-      return 'Error: provide either patch or content, not both.';
+    if (sources > 1) {
+      return this.needsInput('provide exactly one of instruction, oldText, patch, or content.', {
+        files: [target.relative],
+      });
+    }
+    let next: string;
+    const notes: string[] = [];
+    const checks: string[] = [];
+    if (hasInstruction) {
+      const parsed = parseInstruction(String(args.instruction));
+      if (parsed.kind === 'unknown') {
+        return this.needsInput(parsed.ask, { files: [target.relative] });
+      }
+      if (parsed.kind === 'rename') {
+        const renamed = renameInContent(read.text, parsed.oldName, parsed.newName);
+        if (renamed.count === 0) {
+          return this.needsInput(`No occurrences of "${parsed.oldName}" were found in ${target.relative}.`, {
+            files: [target.relative],
+          });
+        }
+        next = renamed.content;
+        notes.push(`renamed ${parsed.oldName} to ${parsed.newName} (${renamed.count} occurrence${renamed.count === 1 ? '' : 's'})`);
+        checks.push('instruction:rename');
+      } else if (parsed.kind === 'set_string') {
+        const outcome = setQuotedString(read.text, parsed.name, parsed.value);
+        if (!outcome.ok) {
+          const lines = outcome.lines?.length ? ` Lines: ${outcome.lines.join(', ')}.` : '';
+          return this.needsInput(`${outcome.reason}${lines}`, { files: [target.relative] });
+        }
+        next = outcome.content;
+        notes.push(`set the string ${parsed.name} to "${parsed.value}"`);
+        checks.push('instruction:set-string');
+      } else {
+        const newText = parsed.kind === 'remove' ? '' : parsed.newText;
+        const lines = occurrenceLines(read.text, parsed.oldText);
+        if (lines.length === 0) {
+          return this.needsInput(`"${parsed.oldText}" was not found in ${target.relative}.`, {
+            files: [target.relative],
+          });
+        }
+        if (lines.length > 1) {
+          return this.needsInput(
+            `"${parsed.oldText}" matches ${lines.length} locations (lines ${lines.join(', ')}); the instruction is ambiguous.`,
+            { files: [target.relative] },
+          );
+        }
+        next = replaceExactAt(read.text, parsed.oldText, newText, 1) ?? read.text;
+        notes.push(parsed.kind === 'remove' ? `removed ${JSON.stringify(parsed.oldText)}` : 'applied the exact replacement');
+        checks.push(`instruction:${parsed.kind}`);
+      }
+    } else if (hasOldText) {
+      const oldText = String(args.oldText);
+      if (!oldText) {
+        return this.needsInput('oldText must not be empty.', { files: [target.relative] });
+      }
+      if (typeof args.newText !== 'string') {
+        return this.needsInput('newText is required with oldText.', { files: [target.relative] });
+      }
+      const lines = occurrenceLines(read.text, oldText);
+      if (lines.length === 0) {
+        return this.needsInput(`oldText was not found in ${target.relative}.`, {
+          files: [target.relative],
+        });
+      }
+      if (args.all) {
+        next = replaceExactAll(read.text, oldText, String(args.newText));
+        notes.push(`replaced ${lines.length} occurrence${lines.length === 1 ? '' : 's'}`);
+      } else if (lines.length > 1) {
+        const occurrence = clampInt(args.occurrence, 1, lines.length);
+        if (occurrence === undefined) {
+          return this.needsInput(
+            `oldText matches ${lines.length} locations (lines ${lines.join(', ')}). Pass occurrence or all.`,
+            { files: [target.relative] },
+          );
+        }
+        next = replaceExactAt(read.text, oldText, String(args.newText), occurrence) ?? read.text;
+        notes.push(`replaced occurrence ${occurrence}`);
+      } else {
+        next = replaceExactAt(read.text, oldText, String(args.newText), 1) ?? read.text;
+        notes.push('replaced the exact match');
+      }
+      checks.push('exact-match');
+    } else if (patch) {
+      const hunks = patchHunksFor(patch);
+      if (hunks.length === 0) {
+        return this.failed('patch has no hunks.', { files: [target.relative] });
+      }
+      const applied = applyHunks(read.text, hunks);
+      if (!applied.ok) {
+        return this.failed(applied.error, { files: [target.relative] });
+      }
+      next = applied.content;
+      checks.push('patch');
+    } else {
+      next = content ?? '';
+      checks.push('content');
+    }
+    const verifyAbsolutes: string[] = [];
+    for (const relative of verifyPaths) {
+      const resolved = this.resolveCompoundTarget(relative);
+      if (resolved) {
+        verifyAbsolutes.push(resolved.absolute);
+      }
+    }
+    const touched = [target.relative, ...verifyPaths];
+    if (next === read.text) {
+      const diagnostics = await this.collectDiagnostics([target.absolute, ...verifyAbsolutes]);
+      return compoundResult({
+        status: 'verified',
+        files: this.compoundFiles(touched),
+        diagnostics: compoundDiagnostics(diagnostics),
+        evidence: [{ kind: 'change', summary: 'no changes were necessary', file: target.relative }],
+        verification: { level: 'full', checks: ['stale-guard', 'diagnostics'] },
+        rollbackAvailable: true,
+      });
     }
     if (!(await this.editApproved('fix_in_file', display, context))) {
-      return 'The developer denied this edit. Do not retry it unless asked.';
+      return this.blocked('The developer denied this edit. Do not retry it unless asked.', [target.relative]);
     }
-    const before = await this.safeDiagnostics([absolute]);
-    const outcome = await this.applySingleFileChange(absolute, patch, content);
-    if (!outcome.ok) {
-      return `Error: ${outcome.message}`;
+    const before = await this.collectDiagnostics([target.absolute, ...verifyAbsolutes]);
+    const write = await this.compoundWrite(target.relative, target.absolute, next, read.hash);
+    if (!write.ok) {
+      if (write.stale) {
+        return this.needsInput(write.stale, { files: [target.relative] });
+      }
+      return this.failed(write.error ?? 'the write failed.', { files: [target.relative] });
     }
-    const after = await this.safeDiagnostics([absolute]);
-    return `${outcome.message}\n\nDiagnostics before:\n${diagnosticLines(before).join('\n') || '(none)'}\n\nDiagnostics after:\n${
-      diagnosticLines(after).join('\n') || '(none)'
-    }${changeSummary(before, after)}`;
+    const after = await this.collectDiagnostics([target.absolute, ...verifyAbsolutes]);
+    const addedErrors = this.addedErrorDiagnostics(before, after);
+    const diff = changeDiff(target.relative, read.text, next);
+    const evidence: CompoundEvidence[] = [
+      ...notes.map((summary) => ({ kind: 'change', summary, file: target.relative })),
+      this.diagnosticsEvidence(after),
+    ];
+    if (addedErrors.length > 0) {
+      return this.needsInput(
+        `Change applied to ${target.relative}, but ${addedErrors.length} new error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
+        {
+          files: this.compoundFiles(touched),
+          diff,
+          diagnostics: compoundDiagnostics(after),
+          evidence,
+          verification: { level: 'partial', checks: [...checks, 'stale-guard', 'diagnostics'] },
+          rollbackAvailable: true,
+        },
+      );
+    }
+    return compoundResult({
+      status: 'verified',
+      files: this.compoundFiles(touched),
+      diff,
+      diagnostics: compoundDiagnostics(after),
+      evidence,
+      verification: { level: 'full', checks: [...checks, 'stale-guard', 'diagnostics'] },
+      rollbackAvailable: true,
+    });
   }
 
   private async fixDiagnostic(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     const display = String(args.path ?? '');
-    const absolute = await this.resolvePath(args.path, context);
+    const target = this.resolveCompoundTarget(args.path);
+    if (!target) {
+      return this.needsInput('A workspace-relative file path is required.');
+    }
+    if (isGeneratedPath(target.relative) && !args.allowGenerated) {
+      return this.blocked(generatedBlockedMessage(target.relative), [target.relative]);
+    }
     const line = clampInt(args.line, 1, Number.MAX_SAFE_INTEGER);
     if (!line) {
-      return 'Error: line is required (1-based number).';
+      return this.needsInput('line is required (1-based number).', { files: [target.relative] });
     }
     const patch = typeof args.patch === 'string' && args.patch.trim() ? args.patch : undefined;
     const content = typeof args.content === 'string' ? args.content : undefined;
     if (!patch && content === undefined) {
-      return 'Error: provide patch or content for the fix.';
+      return this.needsInput('provide patch or content for the fix.', { files: [target.relative] });
     }
-    const before = await this.safeDiagnostics([absolute]);
-    const target = closestDiagnostic(before, line, 3);
-    if (!target) {
-      return `No diagnostic found at or near ${display}:${line}.\n${diagnosticLines(before).join('\n') || '(none)'}`;
+    const read = await readFileWithHash(this.options.root, target.relative, this.readCache);
+    if (!read) {
+      return this.needsInput(`${display} does not exist.`, { files: [target.relative] });
+    }
+    const before = await this.collectDiagnostics([target.absolute]);
+    const targetDiagnostic = closestDiagnostic(before, line, 3);
+    if (!targetDiagnostic) {
+      return this.needsInput(`No diagnostic found at or near ${display}:${line}.`, {
+        files: [target.relative],
+        diagnostics: compoundDiagnostics(before),
+        evidence: [this.diagnosticsEvidence(before)],
+        verification: { level: 'partial', checks: ['diagnostics'] },
+      });
+    }
+    let next: string;
+    if (patch) {
+      const hunks = patchHunksFor(patch);
+      if (hunks.length === 0) {
+        return this.failed('patch has no hunks.', { files: [target.relative] });
+      }
+      const applied = applyHunks(read.text, hunks);
+      if (!applied.ok) {
+        return this.failed(applied.error, { files: [target.relative] });
+      }
+      next = applied.content;
+    } else {
+      next = content ?? '';
     }
     if (!(await this.editApproved('fix_diagnostic', display, context))) {
-      return 'The developer denied this edit. Do not retry it unless asked.';
+      return this.blocked('The developer denied this edit. Do not retry it unless asked.', [target.relative]);
     }
-    const outcome = await this.applySingleFileChange(absolute, patch, content);
-    if (!outcome.ok) {
-      return `Error: ${outcome.message}`;
+    const write = await this.compoundWrite(target.relative, target.absolute, next, read.hash);
+    if (!write.ok) {
+      if (write.stale) {
+        return this.needsInput(write.stale, { files: [target.relative] });
+      }
+      return this.failed(write.error ?? 'the write failed.', { files: [target.relative] });
     }
-    const after = await this.safeDiagnostics([absolute]);
-    const cleared = !after.some((item) => sameDiagnostic(item, target));
-    const added = after.filter((item) => !before.some((candidate) => sameDiagnostic(candidate, item)));
-    return `${outcome.message}\nTarget diagnostic at ${target.path}:${target.line} ${
-      cleared ? 'cleared' : 'is still present'
-    }.\nNew diagnostics: ${added.length}${
-      added.length > 0 ? `\n${diagnosticLines(added).join('\n')}` : ''
-    }${changeSummary(before, after)}`;
+    const after = await this.collectDiagnostics([target.absolute]);
+    const cleared = !after.some((item) => sameDiagnostic(item, targetDiagnostic));
+    const addedErrors = this.addedErrorDiagnostics(before, after);
+    const diff = changeDiff(target.relative, read.text, next);
+    const evidence: CompoundEvidence[] = [
+      {
+        kind: 'diagnostic',
+        summary: `target diagnostic at ${targetDiagnostic.path}:${targetDiagnostic.line} ${cleared ? 'cleared' : 'is still present'}${addedErrors.length > 0 ? `; ${addedErrors.length} new` : ''}`,
+        file: target.relative,
+        line: targetDiagnostic.line,
+      },
+      this.diagnosticsEvidence(after),
+    ];
+    if (!cleared || addedErrors.length > 0) {
+      const message = !cleared
+        ? `The diagnostic at ${targetDiagnostic.path}:${targetDiagnostic.line} is still present after the change.`
+        : `${addedErrors.length} new error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`;
+      return this.needsInput(message, {
+        files: [target.relative],
+        diff,
+        diagnostics: compoundDiagnostics(after),
+        evidence,
+        verification: { level: 'partial', checks: ['stale-guard', 'diagnostics'] },
+        rollbackAvailable: true,
+      });
+    }
+    return compoundResult({
+      status: 'verified',
+      files: [target.relative],
+      diff,
+      diagnostics: compoundDiagnostics(after),
+      evidence,
+      verification: { level: 'full', checks: ['stale-guard', 'diagnostics'] },
+      rollbackAvailable: true,
+    });
   }
 
   private async addImportAndUse(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     const display = String(args.path ?? '');
-    const absolute = await this.resolvePath(args.path, context);
+    const target = this.resolveCompoundTarget(args.path);
+    if (!target) {
+      return this.needsInput('A workspace-relative file path is required.');
+    }
+    if (isGeneratedPath(target.relative) && !args.allowGenerated) {
+      return this.blocked(generatedBlockedMessage(target.relative), [target.relative]);
+    }
     const symbol = typeof args.symbol === 'string' ? args.symbol.trim() : '';
     if (!symbol) {
-      return 'Error: symbol is required.';
+      return this.needsInput('symbol is required.', { files: [target.relative] });
     }
-    const content = await this.readTextIfExists(absolute);
-    if (content === undefined) {
-      return `Error: ${display} does not exist.`;
+    const read = await readFileWithHash(this.options.root, target.relative, this.readCache);
+    if (!read) {
+      return this.needsInput(`${display} does not exist.`, { files: [target.relative] });
     }
-    const before = await this.safeDiagnostics([absolute]);
     if (!(await this.editApproved('add_import_and_use', display, context))) {
-      return 'The developer denied this edit. Do not retry it unless asked.';
+      return this.blocked('The developer denied this edit. Do not retry it unless asked.', [target.relative]);
     }
-    const parts: string[] = [];
-    const zeroBased = toZeroBased(args.line, args.character);
+    const before = await this.collectDiagnostics([target.absolute]);
+    const notes: string[] = [];
+    let previousText = read.text;
     let importAdded = false;
+    const zeroBased = toZeroBased(args.line, args.character);
     if (zeroBased) {
-      const action = await addImportCodeActionEdit(absolute, args.line, args.character, symbol);
+      const action = await addImportCodeActionEdit(target.absolute, args.line, args.character, symbol);
       if (action.status === 'edit' && action.edit) {
         importAdded = await applyWorkspaceEdit(action.edit);
         if (importAdded) {
-          parts.push('Inserted the import with a language-server code action.');
+          notes.push('Inserted the import with a language-server code action.');
         } else {
-          parts.push('The language-server code action could not be applied.');
+          notes.push('The language-server code action could not be applied.');
         }
       } else if (action.status === 'unavailable' && action.message) {
-        parts.push(action.message);
+        notes.push(action.message);
       }
     }
     if (!importAdded) {
       const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const alreadyImported = new RegExp(`\\bimport\\b[^\\n]*\\b${escaped}\\b`).test(content);
+      const alreadyImported = new RegExp(`\\bimport\\b[^\\n]*\\b${escaped}\\b`).test(previousText);
       if (alreadyImported) {
-        parts.push(`"${symbol}" is already imported.`);
+        notes.push(`"${symbol}" is already imported.`);
       } else {
         const source = typeof args.source === 'string' ? args.source.trim() : '';
         if (!source) {
-          return 'Error: no code action inserted the import and no source was provided to insert it textually.';
+          return this.needsInput(
+            'No code action inserted the import and no source was provided to insert it textually.',
+            { files: [target.relative] },
+          );
         }
-        const statement = buildImportStatement(symbol, source, content);
-        await withFileLock(absolute, () =>
-          this.options.diffManager.applyChange(absolute, insertImport(content, statement)),
-        );
+        const statement = buildImportStatement(symbol, source, previousText);
+        const next = insertImport(previousText, statement);
+        const write = await this.compoundWrite(target.relative, target.absolute, next, read.hash);
+        if (!write.ok) {
+          if (write.stale) {
+            return this.needsInput(write.stale, { files: [target.relative] });
+          }
+          return this.failed(write.error ?? 'the import write failed.', { files: [target.relative] });
+        }
+        previousText = next;
         importAdded = true;
-        parts.push(`Inserted: ${statement}`);
+        notes.push(`Inserted: ${statement}`);
       }
     }
     const patch = typeof args.patch === 'string' && args.patch.trim() ? args.patch : undefined;
     const replacement = typeof args.content === 'string' ? args.content : undefined;
     if (patch || replacement !== undefined) {
-      const outcome = await this.applySingleFileChange(absolute, patch, replacement);
-      if (!outcome.ok) {
-        return `Error: import step finished, but the use-site edit failed — ${outcome.message}`;
+      const current = (await readFileWithHash(this.options.root, target.relative, undefined)) ?? read;
+      let next: string;
+      if (patch) {
+        const hunks = patchHunksFor(patch);
+        if (hunks.length === 0) {
+          return this.failed('patch has no hunks.', { files: [target.relative] });
+        }
+        const applied = applyHunks(current.text, hunks);
+        if (!applied.ok) {
+          return this.failed(applied.error, { files: [target.relative] });
+        }
+        next = applied.content;
+      } else {
+        next = replacement ?? '';
       }
-      parts.push(outcome.message);
+      const write = await this.compoundWrite(target.relative, target.absolute, next, current.hash);
+      if (!write.ok) {
+        if (write.stale) {
+          return this.needsInput(write.stale, { files: [target.relative] });
+        }
+        return this.failed(write.error ?? 'the use-site write failed.', { files: [target.relative] });
+      }
+      previousText = next;
+      notes.push('Applied the use-site edit.');
     }
-    const after = await this.safeDiagnostics([absolute]);
-    const added = after.filter((item) => !before.some((candidate) => sameDiagnostic(candidate, item)));
-    return `${parts.join('\n')}\nNew diagnostics: ${added.length}${
-      added.length > 0 ? `\n${diagnosticLines(added).join('\n')}` : ''
-    }`;
+    const after = await this.collectDiagnostics([target.absolute]);
+    const addedErrors = this.addedErrorDiagnostics(before, after);
+    const diff = changeDiff(target.relative, read.text, previousText);
+    const evidence: CompoundEvidence[] = [
+      ...notes.map((summary) => ({ kind: 'change', summary, file: target.relative })),
+      this.diagnosticsEvidence(after),
+    ];
+    if (addedErrors.length > 0) {
+      return this.needsInput(
+        `Import step finished, but ${addedErrors.length} new error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
+        {
+          files: [target.relative],
+          diff,
+          diagnostics: compoundDiagnostics(after),
+          evidence,
+          verification: { level: 'partial', checks: ['stale-guard', 'diagnostics'] },
+          rollbackAvailable: true,
+        },
+      );
+    }
+    return compoundResult({
+      status: 'verified',
+      files: [target.relative],
+      diff,
+      diagnostics: compoundDiagnostics(after),
+      evidence,
+      verification: { level: 'full', checks: ['stale-guard', 'diagnostics'] },
+      rollbackAvailable: true,
+    });
   }
 
   private async renameSymbol(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     const display = String(args.path ?? '');
-    const absolute = await this.resolvePath(args.path, context);
-    const newName = typeof args.newName === 'string' ? args.newName.trim() : '';
-    if (!isWorkspaceIdentifier(newName)) {
-      return 'Error: newName must be a valid identifier.';
-    }
-    const content = await this.readTextIfExists(absolute);
-    if (content === undefined) {
-      return `Error: ${display} does not exist.`;
-    }
-    if (!(await this.editApproved('rename_symbol', display, context))) {
-      return 'The developer denied this edit. Do not retry it unless asked.';
-    }
-    const changed = new Map<string, number>();
-    let warning = '';
-    const outcome = await documentRenameEdit(absolute, args.line, args.character, newName);
-    let applied = false;
-    if (outcome.status === 'edit' && outcome.edit) {
-      applied = await applyWorkspaceEdit(outcome.edit);
-      if (applied) {
-        try {
-          for (const [uri, edits] of outcome.edit.entries()) {
-            const relative = vscode.workspace.asRelativePath(uri);
-            changed.set(relative, (changed.get(relative) ?? 0) + edits.length);
-          }
-        } catch {}
-      } else {
-        warning = 'The language-server rename edit could not be applied; ';
-      }
-    } else if (outcome.message) {
-      warning = `${outcome.message} `;
-    }
-    if (!applied) {
-      const oldName = wordAtPosition(content, args.line, args.character);
-      if (!oldName) {
-        return `Error: no symbol found at ${display}:${args.line}:${args.character}.`;
-      }
-      const candidates = await searchTargets(this.options.root, oldName);
-      let total = 0;
-      for (const candidate of candidates.slice(0, UPDATE_MAX_FILES)) {
-        const text = await this.readTextIfExists(candidate.absolute);
-        if (text === undefined) {
-          continue;
-        }
-        const renamed = renameInContent(text, oldName, newName);
-        if (renamed.count === 0) {
-          continue;
-        }
-        await withFileLock(candidate.absolute, () =>
-          this.options.diffManager.applyChange(candidate.absolute, renamed.content),
+    const allowGenerated = Boolean(args.allowGenerated);
+    const hasInstruction = typeof args.instruction === 'string' && args.instruction.trim().length > 0;
+    let newName = typeof args.newName === 'string' ? args.newName.trim() : '';
+    let oldNameHint = '';
+    if (hasInstruction) {
+      const parsed = parseInstruction(String(args.instruction));
+      if (parsed.kind !== 'rename') {
+        return this.needsInput(
+          parsed.kind === 'unknown' ? parsed.ask : 'rename_symbol only accepts a rename instruction.',
         );
-        changed.set(candidate.path, (changed.get(candidate.path) ?? 0) + renamed.count);
-        total += renamed.count;
       }
-      if (changed.size === 0) {
-        return `No occurrences of "${oldName}" found to rename.`;
-      }
-      warning = `${warning}Note: a language server rename was unavailable; applied a word-boundary textual rename (${total} occurrence${total === 1 ? '' : 's'}).`;
+      newName = parsed.newName;
+      oldNameHint = parsed.oldName;
     }
-    const files = [...changed.entries()];
-    const lines = files.map(([file, count]) => `- ${file} (${count} edit${count === 1 ? '' : 's'})`);
-    return `Renamed symbol to ${newName}.${warning ? `\n${warning.trim()}` : ''}\nChanged files (${files.length}):\n${lines.join('\n')}`;
+    if (!isWorkspaceIdentifier(newName)) {
+      return this.needsInput('newName must be a valid identifier.');
+    }
+    const hasTarget = typeof args.path === 'string' && args.path.trim().length > 0;
+    const target = hasTarget ? this.resolveCompoundTarget(args.path) : undefined;
+    if (hasTarget && !target) {
+      return this.blocked(`"${display}" must be a workspace-relative path without escapes.`);
+    }
+    if (target && isGeneratedPath(target.relative) && !allowGenerated) {
+      return this.blocked(generatedBlockedMessage(target.relative), [target.relative]);
+    }
+    if (!target && !oldNameHint) {
+      return this.needsInput('provide path/line/character with newName, or a rename instruction.');
+    }
+    const verifyPaths = this.resolveCompoundPaths(args.verify, {});
+    if (typeof verifyPaths === 'string') {
+      return verifyPaths;
+    }
+    if (!(await this.editApproved('rename_symbol', display || oldNameHint, context))) {
+      return this.blocked('The developer denied this edit. Do not retry it unless asked.', target ? [target.relative] : []);
+    }
+    const changed = new Map<string, { count: number; absolute: string; before?: string; after?: string }>();
+    const evidence: CompoundEvidence[] = [];
+    let warning = '';
+    let applied = false;
+    let textHash: string | undefined;
+    if (target && args.line !== undefined && args.character !== undefined) {
+      const read = await readFileWithHash(this.options.root, target.relative, this.readCache);
+      if (!read) {
+        return this.needsInput(`${display} does not exist.`, { files: [target.relative] });
+      }
+      textHash = read.hash;
+      const outcome = await documentRenameEdit(target.absolute, args.line, args.character, newName);
+      if (outcome.status === 'edit' && outcome.edit) {
+        applied = await applyWorkspaceEdit(outcome.edit);
+        if (applied) {
+          try {
+            for (const [uri, edits] of outcome.edit.entries()) {
+              const relative = vscode.workspace.asRelativePath(uri);
+              changed.set(relative, {
+                count: (changed.get(relative)?.count ?? 0) + edits.length,
+                absolute: uri.fsPath,
+              });
+            }
+          } catch {}
+        } else {
+          warning = 'The language-server rename edit could not be applied; ';
+        }
+      } else if (outcome.message) {
+        warning = `${outcome.message} `;
+      }
+      if (!applied) {
+        const oldName = oldNameHint || wordAtPosition(read.text, args.line, args.character);
+        if (!oldName) {
+          return this.needsInput(`No symbol found at ${display}:${args.line}:${args.character}.`, {
+            files: [target.relative],
+          });
+        }
+        const textual = await this.textualRename(oldName, newName, allowGenerated);
+        if (textual.stale.length > 0) {
+          await this.rollbackTextualRename(textual.applied);
+          return this.needsInput(
+            `Concurrent edit detected in ${textual.stale.join(', ')}; the rename was aborted.`,
+            { files: this.compoundFiles(textual.applied.map((item) => item.relative)) },
+          );
+        }
+        for (const [relative, entry] of textual.changed) {
+          changed.set(relative, entry);
+        }
+        evidence.push(...textual.skipped.map((file) => ({ kind: 'skip', summary: `skipped generated file ${file}`, file })));
+        const total = [...textual.changed.values()].reduce((sum, entry) => sum + entry.count, 0);
+        if (changed.size > 0) {
+          warning = `${warning}Note: a language server rename was unavailable; applied a word-boundary textual rename (${total} occurrence${total === 1 ? '' : 's'}).`;
+        }
+      }
+    } else if (oldNameHint) {
+      const textual = await this.textualRename(oldNameHint, newName, allowGenerated);
+      if (textual.stale.length > 0) {
+        await this.rollbackTextualRename(textual.applied);
+        return this.needsInput(`Concurrent edit detected in ${textual.stale.join(', ')}; the rename was aborted.`, {
+          files: this.compoundFiles(textual.applied.map((item) => item.relative)),
+        });
+      }
+      for (const [relative, entry] of textual.changed) {
+        changed.set(relative, entry);
+      }
+      evidence.push(...textual.skipped.map((file) => ({ kind: 'skip', summary: `skipped generated file ${file}`, file })));
+    }
+    if (changed.size === 0) {
+      const name = oldNameHint || (target ? display : newName);
+      return this.needsInput(`No occurrences of "${name}" found to rename.`, {
+        ...(target ? { files: [target.relative] } : {}),
+      });
+    }
+    const changedEntries = [...changed.entries()];
+    const absoluteTargets = changedEntries.map(([, entry]) => entry.absolute);
+    const verifyAbsolutes: string[] = [];
+    for (const relative of verifyPaths) {
+      const resolved = this.resolveCompoundTarget(relative);
+      if (resolved) {
+        verifyAbsolutes.push(resolved.absolute);
+      }
+    }
+    const diagnostics = await this.collectDiagnostics([...absoluteTargets, ...verifyAbsolutes]);
+    const addedErrors = this.addedErrorDiagnostics([], diagnostics);
+    const diff = changedEntries
+      .filter(([, entry]) => entry.before !== undefined && entry.after !== undefined)
+      .map(([relative, entry]) => changeDiff(relative, entry.before, entry.after))
+      .filter(Boolean)
+      .join('\n');
+    if (warning) {
+      evidence.push({ kind: 'warning', summary: warning.trim() });
+    }
+    const files = this.compoundFiles([
+      ...changedEntries.map(([relative]) => relative),
+      ...verifyPaths,
+    ]);
+    if (addedErrors.length > 0) {
+      return this.needsInput(
+        `Renamed to ${newName}, but ${addedErrors.length} error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
+        {
+          files,
+          ...(diff ? { diff } : {}),
+          diagnostics: compoundDiagnostics(diagnostics),
+          evidence: [...evidence, this.diagnosticsEvidence(diagnostics)],
+          verification: { level: 'partial', checks: ['stale-guard', 'diagnostics'] },
+          rollbackAvailable: true,
+        },
+      );
+    }
+    return compoundResult({
+      status: 'verified',
+      files,
+      ...(diff ? { diff } : {}),
+      diagnostics: compoundDiagnostics(diagnostics),
+      evidence: [...evidence, this.diagnosticsEvidence(diagnostics)],
+      message: `Renamed symbol to ${newName}.${warning ? ` ${warning.trim()}` : ''}`,
+      verification: { level: 'full', checks: ['stale-guard', 'diagnostics'] },
+      rollbackAvailable: true,
+    });
+  }
+
+  private async textualRename(
+    oldName: string,
+    newName: string,
+    allowGenerated: boolean,
+  ): Promise<{
+    changed: Map<string, { count: number; absolute: string; before: string; after: string }>;
+    skipped: string[];
+    stale: string[];
+    applied: Array<{ relative: string; absolute: string; before: string }>;
+  }> {
+    const changed = new Map<string, { count: number; absolute: string; before: string; after: string }>();
+    const skipped: string[] = [];
+    const stale: string[] = [];
+    const applied: Array<{ relative: string; absolute: string; before: string }> = [];
+    const candidates = await searchTargets(this.options.root, oldName);
+    for (const candidate of candidates.slice(0, UPDATE_MAX_FILES)) {
+      if (isGeneratedPath(candidate.path) && !allowGenerated) {
+        skipped.push(candidate.path);
+        continue;
+      }
+      const read = await readFileWithHash(this.options.root, candidate.path, this.readCache);
+      if (!read) {
+        continue;
+      }
+      const renamed = renameInContent(read.text, oldName, newName);
+      if (renamed.count === 0) {
+        continue;
+      }
+      const write = await this.compoundWrite(candidate.path, candidate.absolute, renamed.content, read.hash);
+      if (!write.ok) {
+        if (write.stale) {
+          stale.push(...applied.map((item) => item.relative), candidate.path);
+          return { changed, skipped, stale, applied };
+        }
+        continue;
+      }
+      changed.set(candidate.path, {
+        count: renamed.count,
+        absolute: candidate.absolute,
+        before: read.text,
+        after: renamed.content,
+      });
+      applied.push({ relative: candidate.path, absolute: candidate.absolute, before: read.text });
+    }
+    return { changed, skipped, stale, applied };
+  }
+
+  private async rollbackTextualRename(
+    applied: Array<{ relative: string; absolute: string; before: string }>,
+  ): Promise<void> {
+    for (const item of [...applied].reverse()) {
+      try {
+        await withFileLock(item.absolute, () => this.options.diffManager.applyChange(item.absolute, item.before));
+      } catch {}
+    }
   }
 
   private async updateRelatedFiles(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
-    const query = typeof args.symbol_or_pattern === 'string' ? args.symbol_or_pattern.trim() : '';
+    const allowGenerated = Boolean(args.allowGenerated);
+    const hasInstruction = typeof args.instruction === 'string' && args.instruction.trim().length > 0;
+    let parsed: Extract<ParsedInstruction, { kind: 'rename' | 'replace' | 'remove' }> | undefined;
+    let query = typeof args.symbol_or_pattern === 'string' ? args.symbol_or_pattern.trim() : '';
+    if (hasInstruction) {
+      const instruction = parseInstruction(String(args.instruction));
+      if (instruction.kind === 'unknown') {
+        return this.needsInput(instruction.ask);
+      }
+      if (instruction.kind === 'set_string') {
+        return this.needsInput('update_related_files supports rename, replace, or remove instructions.');
+      }
+      parsed = instruction;
+      if (!query) {
+        query = instruction.kind === 'rename' ? instruction.oldName : instruction.oldText;
+      }
+    }
     if (!query) {
-      return 'Error: symbol_or_pattern is required.';
+      return this.needsInput('symbol_or_pattern or instruction is required.');
     }
     const template = typeof args.patchTemplate === 'string' ? args.patchTemplate : '';
-    if (!template.trim()) {
-      return 'Error: patchTemplate is required.';
+    if (!parsed && !template.trim()) {
+      return this.needsInput('patchTemplate or instruction is required.');
+    }
+    let hunks = patchHunksFor(template);
+    if (!parsed && template.trim() && hunks.length === 0) {
+      return this.failed('patchTemplate has no hunks.');
     }
     const candidates = await discoverRelatedTargets(query);
     if (candidates.length === 0) {
-      return `No related files found for "${query}".`;
+      return this.needsInput(`No related files found for "${query}".`);
     }
     if (candidates.length > UPDATE_CONFIRM_THRESHOLD && args.confirm !== true) {
       const listing = candidates.slice(0, 30).map((candidate) => `- ${candidate.path}`).join('\n');
       const extra = candidates.length > 30 ? `\n... and ${candidates.length - 30} more` : '';
-      return `Found ${candidates.length} candidate files (more than ${UPDATE_CONFIRM_THRESHOLD}). Re-call with confirm: true to apply, or narrow the search.\n${listing}${extra}`;
+      return this.needsInput(
+        `Found ${candidates.length} candidate files (more than ${UPDATE_CONFIRM_THRESHOLD}). Re-call with confirm: true to apply, or narrow the search.\n${listing}${extra}`,
+        { files: candidates.map((candidate) => candidate.path) },
+      );
     }
     const selected = candidates.slice(0, UPDATE_MAX_FILES);
     if (!(await this.editApproved('update_related_files', query, context))) {
-      return 'The developer denied this edit. Do not retry it unless asked.';
+      return this.blocked('The developer denied this edit. Do not retry it unless asked.', selected.map((candidate) => candidate.path));
     }
-    const results: string[] = [];
-    const changed: string[] = [];
+    const results: CompoundEvidence[] = [];
+    const changed: Array<{ relative: string; absolute: string; before: string; after: string }> = [];
+    const applied: Array<{ relative: string; absolute: string; before: string }> = [];
+    const verifyPaths = this.resolveCompoundPaths(args.verify, {});
+    if (typeof verifyPaths === 'string') {
+      return verifyPaths;
+    }
     for (const candidate of selected) {
-      const content = await this.readTextIfExists(candidate.absolute);
-      if (content === undefined) {
-        results.push(`- ${candidate.path} skipped: file not found`);
+      if (isGeneratedPath(candidate.path) && !allowGenerated) {
+        results.push({ kind: 'skip', summary: `- ${candidate.path} skipped: generated or read-only`, file: candidate.path });
         continue;
       }
-      const hunks = patchHunksFor(template);
-      if (hunks.length === 0) {
-        return 'Error: patchTemplate has no hunks.';
-      }
-      const outcome = applyHunks(content, hunks);
-      if (!outcome.ok) {
-        results.push(`- ${candidate.path} failed: ${outcome.error}`);
+      const read = await readFileWithHash(this.options.root, candidate.path, this.readCache);
+      if (!read) {
+        results.push({ kind: 'skip', summary: `- ${candidate.path} skipped: file not found`, file: candidate.path });
         continue;
       }
-      await withFileLock(candidate.absolute, () =>
-        this.options.diffManager.applyChange(candidate.absolute, outcome.content),
-      );
-      changed.push(candidate.path);
-      results.push(`- ${candidate.path} ok`);
+      let next: string;
+      if (parsed) {
+        if (parsed.kind === 'rename') {
+          const renamed = renameInContent(read.text, parsed.oldName, parsed.newName);
+          if (renamed.count === 0) {
+            results.push({ kind: 'skip', summary: `- ${candidate.path} skipped: no occurrences`, file: candidate.path });
+            continue;
+          }
+          next = renamed.content;
+        } else {
+          const newText = parsed.kind === 'remove' ? '' : parsed.newText;
+          if (!read.text.includes(parsed.oldText)) {
+            results.push({ kind: 'skip', summary: `- ${candidate.path} skipped: text not found`, file: candidate.path });
+            continue;
+          }
+          next = replaceExactAll(read.text, parsed.oldText, newText);
+        }
+      } else {
+        const outcome = applyHunks(read.text, hunks);
+        if (!outcome.ok) {
+          results.push({ kind: 'error', summary: `- ${candidate.path} failed: ${outcome.error}`, file: candidate.path });
+          continue;
+        }
+        next = outcome.content;
+      }
+      const write = await this.compoundWrite(candidate.path, candidate.absolute, next, read.hash);
+      if (!write.ok) {
+        if (write.stale) {
+          const affected = [...applied.map((item) => item.relative), candidate.path];
+          for (const item of [...applied].reverse()) {
+            try {
+              await withFileLock(item.absolute, () => this.options.diffManager.applyChange(item.absolute, item.before));
+            } catch {}
+          }
+          return this.needsInput(`Concurrent edit detected in ${affected.join(', ')}; the updates were aborted.`, {
+            files: this.compoundFiles(affected),
+          });
+        }
+        results.push({ kind: 'error', summary: `- ${candidate.path} failed: ${write.error ?? 'write failed'}`, file: candidate.path });
+        continue;
+      }
+      changed.push({ relative: candidate.path, absolute: candidate.absolute, before: read.text, after: next });
+      applied.push({ relative: candidate.path, absolute: candidate.absolute, before: read.text });
+      results.push({ kind: 'change', summary: `- ${candidate.path} ok`, file: candidate.path });
     }
-    const diagnostics = await this.safeDiagnostics(
-      selected.filter((candidate) => changed.includes(candidate.path)).map((candidate) => candidate.absolute),
-    );
-    const diagnosticText = diagnosticLines(diagnostics).join('\n');
+    const failedCount = results.filter((item) => item.kind === 'error').length;
+    const verifyAbsolutes: string[] = [];
+    for (const relative of verifyPaths) {
+      const resolved = this.resolveCompoundTarget(relative);
+      if (resolved) {
+        verifyAbsolutes.push(resolved.absolute);
+      }
+    }
+    const diagnostics = await this.collectDiagnostics([
+      ...changed.map((item) => item.absolute),
+      ...verifyAbsolutes,
+    ]);
+    const addedErrors = this.addedErrorDiagnostics([], diagnostics);
+    const diff = changed
+      .map((item) => changeDiff(item.relative, item.before, item.after))
+      .filter(Boolean)
+      .join('\n');
     const applyNote =
-      candidates.length > selected.length ? `\n(${candidates.length - selected.length} candidates beyond the ${UPDATE_MAX_FILES}-file limit were not applied.)` : '';
-    return `Updated ${changed.length}/${selected.length} files for "${query}":\n${results.join('\n')}${applyNote}${
-      diagnosticText ? `\n\nDiagnostics:\n${diagnosticText}` : '\n\nDiagnostics: none'
-    }`;
+      candidates.length > selected.length
+        ? `\n(${candidates.length - selected.length} candidates beyond the ${UPDATE_MAX_FILES}-file limit were not applied.)`
+        : '';
+    const message = `Updated ${changed.length}/${selected.length} files for "${query}":\n${results
+      .map((item) => item.summary)
+      .join('\n')}${applyNote}`;
+    const files = this.compoundFiles([...changed.map((item) => item.relative), ...verifyPaths]);
+    if (changed.length === 0 && failedCount > 0) {
+      return this.failed(message, {
+        files,
+        diagnostics: compoundDiagnostics(diagnostics),
+        evidence: [...results, this.diagnosticsEvidence(diagnostics)],
+      });
+    }
+    if (addedErrors.length > 0) {
+      return this.needsInput(
+        `${message}\n${addedErrors.length} error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
+        {
+          files,
+          ...(diff ? { diff } : {}),
+          diagnostics: compoundDiagnostics(diagnostics),
+          evidence: [...results, this.diagnosticsEvidence(diagnostics)],
+          verification: { level: 'partial', checks: ['stale-guard', 'diagnostics'] },
+          rollbackAvailable: true,
+        },
+      );
+    }
+    return compoundResult({
+      status: 'verified',
+      files,
+      ...(diff ? { diff } : {}),
+      diagnostics: compoundDiagnostics(diagnostics),
+      evidence: [...results, this.diagnosticsEvidence(diagnostics)],
+      message,
+      verification: { level: 'full', checks: ['stale-guard', 'diagnostics'] },
+      rollbackAvailable: true,
+    });
   }
 
   private async refactorSymbol(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     const display = String(args.path ?? '');
-    const absolute = await this.resolvePath(args.path, context);
+    const allowGenerated = Boolean(args.allowGenerated);
+    const target = this.resolveCompoundTarget(args.path);
+    if (!target) {
+      return this.needsInput('A workspace-relative file path is required.');
+    }
+    if (isGeneratedPath(target.relative) && !allowGenerated) {
+      return this.blocked(generatedBlockedMessage(target.relative), [target.relative]);
+    }
     const operation = args.operation === 'extract' || args.operation === 'move' ? args.operation : undefined;
     if (!operation) {
-      return 'Error: operation must be extract or move.';
+      return this.needsInput('operation must be extract or move.', { files: [target.relative] });
     }
     const range = parseRefactorRange(args.range);
     if (!range) {
-      return 'Error: range must provide 1-based startLine, startChar, endLine, endChar.';
+      return this.needsInput('range must provide 1-based startLine, startChar, endLine, endChar.', {
+        files: [target.relative],
+      });
     }
-    const original = await this.readTextIfExists(absolute);
-    if (original === undefined) {
-      return `Error: ${display} does not exist.`;
+    const original = await readFileWithHash(this.options.root, target.relative, this.readCache);
+    if (!original) {
+      return this.needsInput(`${display} does not exist.`, { files: [target.relative] });
     }
-    const eol = original.includes('\r\n') ? '\r\n' : '\n';
+    const eol = original.text.includes('\r\n') ? '\r\n' : '\n';
     if (operation === 'extract') {
       const extracted = typeof args.extractedCode === 'string' ? args.extractedCode.trim() : '';
       const call = typeof args.callCode === 'string' ? args.callCode : '';
       if (!extracted) {
-        return 'Error: extract requires extractedCode.';
+        return this.needsInput('extract requires extractedCode.', { files: [target.relative] });
       }
       if (!call.trim()) {
-        return 'Error: extract requires callCode to replace the range.';
+        return this.needsInput('extract requires callCode to replace the range.', { files: [target.relative] });
       }
+      const updated = appendSnippet(replaceRange(original.text, range, call), extracted, eol);
       if (!(await this.editApproved('refactor_symbol', display, context))) {
-        return 'The developer denied this edit. Do not retry it unless asked.';
+        return this.blocked('The developer denied this edit. Do not retry it unless asked.', [target.relative]);
       }
-      const updated = appendSnippet(replaceRange(original, range, call), extracted, eol);
-      await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, updated));
-      const diagnostics = await this.safeDiagnostics([absolute]);
-      return `Extracted ${String(args.name ?? 'symbol')} in ${display}.\nDiagnostics:\n${
-        diagnosticLines(diagnostics).join('\n') || 'none'
-      }`;
+      const write = await this.compoundWrite(target.relative, target.absolute, updated, original.hash);
+      if (!write.ok) {
+        if (write.stale) {
+          return this.needsInput(write.stale, { files: [target.relative] });
+        }
+        return this.failed(write.error ?? 'the write failed.', { files: [target.relative] });
+      }
+      const diagnostics = await this.collectDiagnostics([target.absolute]);
+      const addedErrors = this.addedErrorDiagnostics([], diagnostics);
+      const diff = changeDiff(target.relative, original.text, updated);
+      const evidence: CompoundEvidence[] = [
+        { kind: 'change', summary: `extracted ${String(args.name ?? 'symbol')}`, file: target.relative },
+        this.diagnosticsEvidence(diagnostics),
+      ];
+      if (addedErrors.length > 0) {
+        return this.needsInput(
+          `Extracted ${String(args.name ?? 'symbol')}, but ${addedErrors.length} error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
+          {
+            files: [target.relative],
+            diff,
+            diagnostics: compoundDiagnostics(diagnostics),
+            evidence,
+            verification: { level: 'partial', checks: ['stale-guard', 'diagnostics'] },
+            rollbackAvailable: true,
+          },
+        );
+      }
+      return compoundResult({
+        status: 'verified',
+        files: [target.relative],
+        diff,
+        diagnostics: compoundDiagnostics(diagnostics),
+        evidence,
+        message: `Extracted ${String(args.name ?? 'symbol')} in ${display}.`,
+        verification: { level: 'full', checks: ['stale-guard', 'diagnostics'] },
+        rollbackAvailable: true,
+      });
     }
     const targetPath = typeof args.targetPath === 'string' ? args.targetPath.trim() : '';
     if (!targetPath) {
-      return 'Error: move requires targetPath.';
+      return this.needsInput('move requires targetPath.', { files: [target.relative] });
     }
-    const targetAbsolute = await this.resolvePath(targetPath, context);
-    const targetOriginal = await this.readTextIfExists(targetAbsolute);
-    const removed = rangeText(original, range);
+    const moveTarget = this.resolveCompoundTarget(targetPath);
+    if (!moveTarget) {
+      return this.blocked(`"${targetPath}" must be a workspace-relative path without escapes.`);
+    }
+    if (isGeneratedPath(moveTarget.relative) && !allowGenerated) {
+      return this.blocked(generatedBlockedMessage(moveTarget.relative), [moveTarget.relative]);
+    }
+    const targetOriginal = await readFileWithHash(this.options.root, moveTarget.relative, this.readCache);
+    const removed = rangeText(original.text, range);
     if (!removed.trim()) {
-      return 'Error: the range does not contain symbol text to move.';
+      return this.needsInput('the range does not contain symbol text to move.', { files: [target.relative] });
     }
     if (!(await this.editApproved('refactor_symbol', `${display} -> ${targetPath}`, context))) {
-      return 'The developer denied this edit. Do not retry it unless asked.';
+      return this.blocked('The developer denied this edit. Do not retry it unless asked.', [
+        target.relative,
+        moveTarget.relative,
+      ]);
     }
     const header = String(args.targetHeader ?? args.callCode ?? '').trim();
     const headerAndSymbol = [header, removed.trimEnd()].filter(Boolean).join('\n');
     const targetContent = targetOriginal
-      ? `${targetOriginal.trimEnd()}\n\n${headerAndSymbol}\n`
+      ? `${targetOriginal.text.trimEnd()}\n\n${headerAndSymbol}\n`
       : `${headerAndSymbol}\n`;
-    const sourceContent = removeRange(original, range);
-    await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, sourceContent));
-    try {
-      await withFileLock(targetAbsolute, () =>
-        this.options.diffManager.applyChange(targetAbsolute, targetContent),
-      );
-    } catch (error) {
-      await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, original));
-      return `Error: move failed at ${targetPath} — ${errorMessage(error)}. The source change was rolled back.`;
+    const sourceContent = removeRange(original.text, range);
+    const sourceWrite = await this.compoundWrite(target.relative, target.absolute, sourceContent, original.hash);
+    if (!sourceWrite.ok) {
+      if (sourceWrite.stale) {
+        return this.needsInput(sourceWrite.stale, { files: [target.relative] });
+      }
+      return this.failed(sourceWrite.error ?? 'the source write failed.', { files: [target.relative] });
     }
-    const diagnostics = await this.safeDiagnostics([absolute, targetAbsolute]);
-    return `Moved ${String(args.name ?? 'symbol')} from ${display} to ${targetPath}.\nDiagnostics:\n${
-      diagnosticLines(diagnostics).join('\n') || 'none'
-    }`;
+    if (targetOriginal) {
+      const targetWrite = await this.compoundWrite(moveTarget.relative, moveTarget.absolute, targetContent, targetOriginal.hash);
+      if (!targetWrite.ok) {
+        let rolledBack = false;
+        try {
+          await withFileLock(target.absolute, () => this.options.diffManager.applyChange(target.absolute, original.text));
+          rolledBack = true;
+        } catch {}
+        if (!targetWrite.stale && rolledBack) {
+          return this.failed(`Move failed at ${targetPath} — ${targetWrite.error ?? 'write failed'}. The source change was rolled back.`, {
+            files: [target.relative, moveTarget.relative],
+          });
+        }
+        return this.failed(
+          `Move failed at ${targetPath} — ${targetWrite.stale ?? targetWrite.error ?? 'write failed'}.${
+            rolledBack ? ' The source change was rolled back.' : ' The source change could NOT be rolled back.'
+          }`,
+          {
+            files: [target.relative, moveTarget.relative],
+            diff: changeDiff(target.relative, original.text, sourceContent),
+            evidence: [
+              {
+                kind: 'checkpoint',
+                summary: rolledBack ? `rolled back ${target.relative}` : `rollback failed for ${target.relative}`,
+              },
+            ],
+            rollbackAvailable: !rolledBack,
+          },
+        );
+      }
+    } else {
+      try {
+        await withFileLock(moveTarget.absolute, () => this.options.diffManager.applyChange(moveTarget.absolute, targetContent));
+      } catch (error) {
+        let rolledBack = false;
+        try {
+          await withFileLock(target.absolute, () => this.options.diffManager.applyChange(target.absolute, original.text));
+          rolledBack = true;
+        } catch {}
+        return this.failed(`Move failed at ${targetPath} — ${errorMessage(error)}.${rolledBack ? ' The source change was rolled back.' : ' The source change could NOT be rolled back.'}`, {
+          files: [target.relative, moveTarget.relative],
+          diff: changeDiff(target.relative, original.text, sourceContent),
+          evidence: [
+            { kind: 'checkpoint', summary: rolledBack ? `rolled back ${target.relative}` : `rollback failed for ${target.relative}` },
+          ],
+          rollbackAvailable: !rolledBack,
+        });
+      }
+    }
+    const diagnostics = await this.collectDiagnostics([target.absolute, moveTarget.absolute]);
+    const addedErrors = this.addedErrorDiagnostics([], diagnostics);
+    const diff = [changeDiff(target.relative, original.text, sourceContent), changeDiff(moveTarget.relative, targetOriginal?.text, targetContent)]
+      .filter(Boolean)
+      .join('\n');
+    const evidence: CompoundEvidence[] = [
+      { kind: 'change', summary: `moved ${String(args.name ?? 'symbol')}`, file: moveTarget.relative },
+      this.diagnosticsEvidence(diagnostics),
+    ];
+    if (addedErrors.length > 0) {
+      return this.needsInput(
+        `Moved ${String(args.name ?? 'symbol')}, but ${addedErrors.length} error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
+        {
+          files: [target.relative, moveTarget.relative],
+          diff,
+          diagnostics: compoundDiagnostics(diagnostics),
+          evidence,
+          verification: { level: 'partial', checks: ['stale-guard', 'diagnostics'] },
+          rollbackAvailable: true,
+        },
+      );
+    }
+    return compoundResult({
+      status: 'verified',
+      files: [target.relative, moveTarget.relative],
+      diff,
+      diagnostics: compoundDiagnostics(diagnostics),
+      evidence,
+      message: `Moved ${String(args.name ?? 'symbol')} from ${display} to ${targetPath}.`,
+      verification: { level: 'full', checks: ['stale-guard', 'diagnostics'] },
+      rollbackAvailable: true,
+    });
   }
 
   private async applySingleFileChange(
@@ -1590,6 +2801,14 @@ function importLines(content: string, max: number): string[] {
     )
     .slice(0, max)
     .map((line) => truncateLine(line.trim(), 200));
+}
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  const buffer = Buffer.from(text, 'utf-8');
+  if (buffer.length <= maxBytes) {
+    return text;
+  }
+  return `${buffer.subarray(0, maxBytes).toString('utf-8')}\n... [truncated]`;
 }
 
 function capLines(text: string, max: number): string {

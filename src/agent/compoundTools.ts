@@ -406,6 +406,10 @@ export const applyChangeSetTool: ToolDef = {
           required: ['path', 'action'],
         },
       },
+      allowGenerated: {
+        type: 'boolean',
+        description: 'Allow editing generated or read-only files (dist, out, build, lockfiles, *.min.*, *.generated.*). Default false.',
+      },
     },
     required: ['changes'],
   },
@@ -413,13 +417,32 @@ export const applyChangeSetTool: ToolDef = {
 
 export const fixInFileTool: ToolDef = {
   name: 'fix_in_file',
-  description: 'One-file change with checkpoint, exact-match validation, atomic write, and diagnostics.',
+  description:
+    'One-file change with checkpoint, exact-match validation, atomic write, and diagnostics. Accepts patch, full content, an exact oldText/newText pair, or a natural instruction such as `replace "old" with "new"`, `remove "text"`, `rename X to Y`, or `set the string name to "value"`.',
   parameters: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'Workspace-relative file path.' },
       patch: { type: 'string', description: 'Hunks to apply (@@ blocks, same semantics as apply_patch).' },
       content: { type: 'string', description: 'Full replacement contents (alternative to patch).' },
+      instruction: {
+        type: 'string',
+        description:
+          'Deterministic instruction parsed without a model call: replace "old" with "new", remove "text", rename X to Y, or set the string name to "value".',
+      },
+      oldText: { type: 'string', description: 'Exact text to replace (alternative to patch or instruction).' },
+      newText: { type: 'string', description: 'Replacement for oldText.' },
+      occurrence: { type: 'number', description: '1-based occurrence of oldText to replace when it appears more than once.' },
+      all: { type: 'boolean', description: 'Replace every occurrence of oldText (alternative to occurrence).' },
+      verify: {
+        type: 'array',
+        description: 'Additional workspace-relative paths to check diagnostics on after the change.',
+        items: { type: 'string' },
+      },
+      allowGenerated: {
+        type: 'boolean',
+        description: 'Allow editing generated or read-only files (dist, out, build, lockfiles, *.min.*, *.generated.*). Default false.',
+      },
     },
     required: ['path'],
   },
@@ -435,6 +458,10 @@ export const fixDiagnosticTool: ToolDef = {
       line: { type: 'number', description: '1-based line of the diagnostic.' },
       patch: { type: 'string', description: 'Minimal hunks that fix the diagnostic.' },
       content: { type: 'string', description: 'Full replacement contents (alternative to patch).' },
+      allowGenerated: {
+        type: 'boolean',
+        description: 'Allow editing generated or read-only files (dist, out, build, lockfiles, *.min.*, *.generated.*). Default false.',
+      },
     },
     required: ['path', 'line'],
   },
@@ -453,6 +480,10 @@ export const addImportAndUseTool: ToolDef = {
       content: { type: 'string', description: 'Full replacement contents for the use site (alternative to patch).' },
       line: { type: 'number', description: '1-based line of the use site, for a language-server code action (optional).' },
       character: { type: 'number', description: '1-based column of the use site (optional).' },
+      allowGenerated: {
+        type: 'boolean',
+        description: 'Allow editing generated or read-only files (dist, out, build, lockfiles, *.min.*, *.generated.*). Default false.',
+      },
     },
     required: ['path', 'symbol'],
   },
@@ -460,22 +491,35 @@ export const addImportAndUseTool: ToolDef = {
 
 export const renameSymbolTool: ToolDef = {
   name: 'rename_symbol',
-  description: 'Definition-and-reference rename.',
+  description:
+    'Definition-and-reference rename. Provide path/line/character/newName, or an instruction such as `rename old to new` (then path and position are optional and the rename is applied to files that reference the name).',
   parameters: {
     type: 'object',
     properties: {
-      path: { type: 'string', description: 'Workspace-relative file path containing the symbol.' },
+      path: { type: 'string', description: 'Workspace-relative file path containing the symbol (optional with instruction).' },
       line: { type: 'number', description: '1-based line of the symbol.' },
       character: { type: 'number', description: '1-based column of the symbol.' },
       newName: { type: 'string', description: 'The new symbol name.' },
+      instruction: {
+        type: 'string',
+        description: 'Deterministic instruction: rename X to Y (or rename X -> Y).',
+      },
+      verify: {
+        type: 'array',
+        description: 'Additional workspace-relative paths to check diagnostics on after the rename.',
+        items: { type: 'string' },
+      },
+      allowGenerated: {
+        type: 'boolean',
+        description: 'Allow editing generated or read-only files (dist, out, build, lockfiles, *.min.*, *.generated.*). Default false.',
+      },
     },
-    required: ['path', 'line', 'character', 'newName'],
   },
 };
 
 export const updateRelatedFilesTool: ToolDef = {
   name: 'update_related_files',
-  description: 'Apply one patch template across every file that references a symbol.',
+  description: 'Apply one patch template or one exact instruction across every file that references a symbol.',
   parameters: {
     type: 'object',
     properties: {
@@ -487,12 +531,26 @@ export const updateRelatedFilesTool: ToolDef = {
         type: 'string',
         description: 'Hunks applied to each discovered file (@@ blocks, same semantics as apply_patch).',
       },
+      instruction: {
+        type: 'string',
+        description:
+          'Deterministic instruction applied to every related file: replace "old" with "new", remove "text", or rename X to Y.',
+      },
       confirm: {
         type: 'boolean',
         description: 'Required when more than 10 candidate files are found (optional).',
       },
+      verify: {
+        type: 'array',
+        description: 'Additional workspace-relative paths to check diagnostics on after the updates.',
+        items: { type: 'string' },
+      },
+      allowGenerated: {
+        type: 'boolean',
+        description: 'Allow editing generated or read-only files (dist, out, build, lockfiles, *.min.*, *.generated.*). Default false.',
+      },
     },
-    required: ['symbol_or_pattern', 'patchTemplate'],
+    required: [],
   },
 };
 
@@ -520,8 +578,55 @@ export const refactorSymbolTool: ToolDef = {
       },
       targetPath: { type: 'string', description: 'Workspace-relative destination file (move).' },
       targetHeader: { type: 'string', description: 'Import/export lines to place at the top of the target (move, optional).' },
+      allowGenerated: {
+        type: 'boolean',
+        description: 'Allow editing generated or read-only files (dist, out, build, lockfiles, *.min.*, *.generated.*). Default false.',
+      },
     },
     required: ['path', 'operation', 'name', 'range'],
+  },
+};
+
+export const boundedInvestigationTool: ToolDef = {
+  name: 'bounded_investigation',
+  description:
+    'Read-only exploration with a bounded operation budget: runs whitelisted read-only tool calls in parallel, caps each output and the total output, and validates a proposed change set without writing anything. Use it for unusual read-only exploration or to prepare an unusual change set.',
+  parameters: {
+    type: 'object',
+    properties: {
+      operations: {
+        type: 'array',
+        description:
+          'Read-only operations to run: [{ tool, args }]. Allowed tools: read_file, list_files, search_text, semantic_search, find_references, go_to_definition, document_symbols, find_symbol, hover, incoming_calls, outgoing_calls, inspect_file_context, investigate_issue.',
+        items: {
+          type: 'object',
+          properties: {
+            tool: { type: 'string', description: 'Read-only tool name (whitelisted).' },
+            args: { type: 'object', description: 'Arguments for that tool.' },
+          },
+          required: ['tool', 'args'],
+        },
+      },
+      maxOperations: {
+        type: 'number',
+        description: 'Maximum operations to run (optional, default 6, hard cap 8).',
+      },
+      proposedChanges: {
+        type: 'array',
+        description:
+          'Changes to validate only (never written): each must be { path, oldText, newText } with oldText occurring exactly once in the current file.',
+        items: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Workspace-relative file path.' },
+            oldText: { type: 'string', description: 'Exact text expected once in the current file.' },
+            newText: { type: 'string', description: 'Replacement text.' },
+          },
+          required: ['path', 'oldText', 'newText'],
+        },
+      },
+    },
+    required: ['operations'],
   },
 };
 
@@ -536,5 +641,5 @@ export const mutatingCompoundTools: ToolDef[] = [
 ];
 
 export function readOnlyCompoundTools(): ToolDef[] {
-  return [investigateIssueTool, verifyChangeTools().executor, inspectFileContextTool];
+  return [investigateIssueTool, verifyChangeTools().executor, inspectFileContextTool, boundedInvestigationTool];
 }

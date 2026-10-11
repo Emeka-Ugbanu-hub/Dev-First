@@ -9,6 +9,7 @@ import {
   toolIcon,
 } from './tools';
 import { ToolBox } from './ToolBox';
+import { parseCompoundResult } from './compoundResult';
 import { PromptFamily, buildExecutorSpec, buildExecutorSystemPrompt } from '../planner/prompts';
 import { chatWithRetry } from '../llm/retry';
 import { DoomLoopDetector } from './doomloop';
@@ -451,6 +452,13 @@ function contextNudge(
 function mutationPaths(call: ToolCall, result: string): string[] {
   if (result.startsWith('Error:') || result.startsWith('Error in')) {
     return [];
+  }
+  const compound = parseCompoundResult(result);
+  if (compound) {
+    const applied = compound.status === 'verified' || (compound.status === 'needs_input' && compound.rollbackAvailable);
+    if (!applied) {
+      return [];
+    }
   }
   if (call.name === 'write_file' || call.name === 'edit_file') {
     const path = String(toolCallArgs(call).path ?? '');
