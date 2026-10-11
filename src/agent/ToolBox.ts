@@ -271,6 +271,7 @@ export interface ToolExecutionContext {
   askUser?(request: QuestionRequest): Promise<string>;
   signal?: AbortSignal;
   planning?: boolean;
+  planCheckRequirement?: VerifyCheckKind;
 }
 
 export interface ToolBoxOptions {
@@ -2935,6 +2936,7 @@ export class ToolBox {
     }
     const touched = this.touchedSymbolsOrImports(name, result);
     const pending = this.pendingRepairChecks(changes);
+    const planRequiresCheck = context.planCheckRequirement ?? this.options.planCheckRequirement;
     const input: VerificationPolicyInput = {
       changes,
       touchedSymbolsOrImports: touched,
@@ -2942,7 +2944,7 @@ export class ToolBox {
       priorCheckFailed: pending.size > 0,
       packageRootCount: await this.packageRootCount(),
       resolverConfident: true,
-      ...(this.options.planCheckRequirement ? { planRequiresCheck: this.options.planCheckRequirement } : {}),
+      ...(planRequiresCheck ? { planRequiresCheck } : {}),
     };
     let plan = planVerification(input);
     if (plan.level === 3 && plan.commandKind && pending.size === 0) {

@@ -5,6 +5,7 @@ import {
   RISK_PATH_SEGMENTS,
   diagnosticsCacheKey,
   matchesRiskPath,
+  planCheckRequirementFromSteps,
   planVerification,
 } from '../src/agent/verificationPolicy';
 import type { VerificationPolicyInput } from '../src/agent/verificationPolicy';
@@ -131,6 +132,60 @@ describe('verification policy', () => {
     const plan = planVerification(input({ changes: [edit('src/a.ts')], priorCheckFailed: true }));
     expect(plan.level).toBe(3);
     expect(plan.reasons).toContain('previous check failed');
+  });
+});
+
+describe('plan check requirement from steps', () => {
+  it.each([
+    ['npm run test', 'test'],
+    ['pnpm run test', 'test'],
+    ['yarn run test', 'test'],
+    ['bun run test', 'test'],
+    ['npm test', 'test'],
+    ['pnpm test', 'test'],
+    ['Run `cargo test --all` before finishing', 'test'],
+    ['go test ./...', 'test'],
+    ['pytest -q tests/', 'test'],
+    ['vitest run', 'test'],
+    ['npx jest --watch=false', 'test'],
+    ['npm run typecheck', 'typecheck'],
+    ['pnpm run type-check', 'typecheck'],
+    ['yarn run tsc', 'typecheck'],
+    ['bun run typecheck', 'typecheck'],
+    ['tsc --noEmit', 'typecheck'],
+    ['cargo check', 'typecheck'],
+    ['go vet ./...', 'typecheck'],
+    ['pyright src', 'typecheck'],
+    ['mypy .', 'typecheck'],
+    ['npm run lint', 'lint'],
+    ['pnpm run lint', 'lint'],
+    ['eslint src --max-warnings=0', 'lint'],
+    ['ruff check .', 'lint'],
+    ['cargo clippy -- -D warnings', 'lint'],
+    ['npm run build', 'build'],
+    ['yarn run build', 'build'],
+    ['cargo build --release', 'build'],
+    ['go build ./...', 'build'],
+  ])('maps %j to %s', (step, expected) => {
+    expect(planCheckRequirementFromSteps([step])).toBe(expected);
+  });
+
+  it('prefers the strongest kind when several appear', () => {
+    expect(planCheckRequirementFromSteps(['npm run build', 'npm run lint', 'npm run test'])).toBe('test');
+    expect(planCheckRequirementFromSteps(['go build ./...', 'tsc --noEmit', 'eslint .'])).toBe('typecheck');
+    expect(planCheckRequirementFromSteps(['npm run build', 'cargo clippy'])).toBe('lint');
+    expect(planCheckRequirementFromSteps(['npm run build'])).toBe('build');
+  });
+
+  it('ignores generic verification language', () => {
+    expect(planCheckRequirementFromSteps(['verify the implementation'])).toBeUndefined();
+    expect(planCheckRequirementFromSteps(['run the tests'])).toBeUndefined();
+    expect(planCheckRequirementFromSteps(['check the change', 'make sure it works'])).toBeUndefined();
+  });
+
+  it('returns undefined for missing or empty steps', () => {
+    expect(planCheckRequirementFromSteps(undefined)).toBeUndefined();
+    expect(planCheckRequirementFromSteps([])).toBeUndefined();
   });
 });
 

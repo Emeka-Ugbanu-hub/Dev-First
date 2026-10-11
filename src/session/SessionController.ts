@@ -102,6 +102,7 @@ import { listWorkspaceFiles } from '../util/fsWalk';
 import { ActivityMeta, executionTools, plannerTools, subagentTools } from '../agent/tools';
 import { attachToolPreflights } from '../agent/compoundPreflight';
 import type { ToolPreflight } from '../agent/compoundPreflight';
+import { planCheckRequirementFromSteps } from '../agent/verificationPolicy';
 import { ApprovalMemory, ExternalDirectoryConsent } from '../agent/approvals';
 import { runSubagent } from '../agent/subagent';
 import { SemanticIndex } from '../indexing/SemanticIndex';
@@ -2155,6 +2156,7 @@ export class SessionController {
         onUsageExact: (usage) => this.reportExactUsage(usage),
         onCompaction: (info) => this.addCompactionMessage(info),
         takePendingUserMessage: () => this.takePendingUserMessage(),
+        planCheckRequirement: planCheckRequirementFromSteps(this.plan?.steps),
       });
       if (result.files?.length) {
         this.diffManager.setFileSummaries(result.files);

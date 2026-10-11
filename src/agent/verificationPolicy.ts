@@ -199,3 +199,58 @@ export function planVerification(input: VerificationPolicyInput): VerificationPl
   }
   return plan;
 }
+
+const PLAN_CHECK_PATTERNS: Array<{ kind: VerifyCheckKind; patterns: RegExp[] }> = [
+  {
+    kind: 'test',
+    patterns: [
+      /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b/i,
+      /\bcargo\s+test\b/i,
+      /\bgo\s+test\b/i,
+      /\bpytest\b/i,
+      /\bvitest\s+run\b/i,
+      /\bjest\b/i,
+    ],
+  },
+  {
+    kind: 'typecheck',
+    patterns: [
+      /\b(?:npm|pnpm|yarn|bun)\s+run\s+(?:typecheck|type-check|tsc)\b/i,
+      /\btsc\s+--noEmit\b/i,
+      /\bcargo\s+check\b/i,
+      /\bgo\s+vet\b/i,
+      /\bpyright\b/i,
+      /\bmypy\b/i,
+    ],
+  },
+  {
+    kind: 'lint',
+    patterns: [
+      /\b(?:npm|pnpm|yarn|bun)\s+run\s+lint\b/i,
+      /\beslint\b/i,
+      /\bruff\s+check\b/i,
+      /\bcargo\s+clippy\b/i,
+    ],
+  },
+  {
+    kind: 'build',
+    patterns: [
+      /\b(?:npm|pnpm|yarn|bun)\s+run\s+build\b/i,
+      /\bcargo\s+build\b/i,
+      /\bgo\s+build\b/i,
+    ],
+  },
+];
+
+export function planCheckRequirementFromSteps(steps: string[] | undefined): VerifyCheckKind | undefined {
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return undefined;
+  }
+  const text = steps.join('\n');
+  for (const entry of PLAN_CHECK_PATTERNS) {
+    if (entry.patterns.some((pattern) => pattern.test(text))) {
+      return entry.kind;
+    }
+  }
+  return undefined;
+}

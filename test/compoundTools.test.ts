@@ -1006,6 +1006,22 @@ describe('adaptive verification', () => {
     expect(terminal.calls).toEqual(['npm run test']);
   });
 
+  it('honors a context plan check requirement over the toolbox options', async () => {
+    await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run' } }), 'utf-8');
+    await fs.writeFile(path.join(root, 'solo.ts'), 'const a = 1;\n', 'utf-8');
+    const result = await toolbox().execute(
+      'fix_in_file',
+      JSON.stringify({ path: 'solo.ts', content: 'const a = 2;\n' }),
+      { requestTerminalApproval: async () => 'allow' as const, planCheckRequirement: 'test' },
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.policyLevel).toBe(3);
+    expect(parsed.reasons).toContain('plan requires test check');
+    expect(parsed.verification.checks).toContain('project-command');
+    expect(terminal.calls).toEqual(['npm run test']);
+  });
+
   it('allows one repair and reruns only the failed check', async () => {
     await fs.writeFile(
       path.join(root, 'package.json'),

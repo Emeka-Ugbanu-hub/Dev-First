@@ -9,6 +9,7 @@ import {
   toolIcon,
 } from './tools';
 import { ToolBox } from './ToolBox';
+import type { VerifyCheckKind } from './verificationPolicy';
 import { parseCompoundResult } from './compoundResult';
 import { PromptFamily, buildExecutorSpec, buildExecutorSystemPrompt } from '../planner/prompts';
 import { chatWithRetry } from '../llm/retry';
@@ -78,6 +79,7 @@ export interface AgentCallbacks {
     messagesAfter: number;
   }): void;
   takePendingUserMessage?(): string | undefined;
+  planCheckRequirement?: VerifyCheckKind;
 }
 
 export interface AgentResult {
@@ -283,6 +285,7 @@ export class AgentService {
               requestExternalDirectoryApproval: callbacks.requestExternalDirectoryApproval,
               askUser: callbacks.askUser,
               signal,
+              planCheckRequirement: callbacks.planCheckRequirement,
             });
           } catch (error) {
             result = `Error: ${error instanceof Error ? error.message : String(error)}`;
