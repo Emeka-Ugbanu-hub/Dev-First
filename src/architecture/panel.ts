@@ -4,7 +4,7 @@ import { existsSync, readFileSync, statSync } from 'fs';
 import * as path from 'path';
 import type { FileFacts } from '../scan/duplication';
 import type { ArchitectureScanCoverage } from '../scan/duplication';
-import type { LLMProvider, ToolCall, ToolDef } from '../llm/types';
+import type { ChatOptions, LLMProvider, ToolCall, ToolDef } from '../llm/types';
 import { buildMapDigest } from './mapDigest';
 import { buildMermaidMap, mapPathsOf, parseStructuredMap } from './mapValidate';
 import { buildLevelView } from './mapLevels';
@@ -25,6 +25,7 @@ export interface ArchitecturePanelDeps {
   getFacts: () => Promise<FileFacts[]>;
   getCoverage: () => Promise<ArchitectureScanCoverage>;
   getActive: () => Promise<{ provider: LLMProvider; model: string } | undefined>;
+  getReasoning?: () => ChatOptions['reasoning'] | Promise<ChatOptions['reasoning']>;
   getTools: () => Promise<ToolDef[]>;
   executeTool: (call: ToolCall) => Promise<string>;
 }
@@ -250,6 +251,7 @@ export class ArchitecturePanel {
       const raw = await generateArchitectureMap(digest, {
         provider: active.provider,
         model: active.model,
+        reasoning: await this.deps.getReasoning?.(),
         tools,
         executeTool: this.deps.executeTool,
         signal: controller.signal,

@@ -18,7 +18,7 @@ export interface StoredSession {
   contextTokens: number;
   queued?: QueuedPromptRecord[];
   pending?: PendingDecisionRecord;
-  archived?: { count: number; files: string[] };
+  archived?: { count: number; files: string[]; uiCount?: number };
   archiveUnavailable?: boolean;
 }
 
@@ -39,10 +39,12 @@ export interface SessionArchiveFile {
   sessionId: string;
   createdAt: number;
   conversation?: ChatMessage[];
+  uiMessages?: UiMessage[];
   contextIndex?: SessionContextEntry[];
 }
 
 const SESSION_CONVERSATION_FLOOR = 4;
+const SESSION_UI_FLOOR = 20;
 
 interface IndexEntry {
   id: string;
@@ -94,6 +96,16 @@ export class SessionStore {
     return messages;
   }
 
+  async loadArchiveUi(sessionId: string): Promise<UiMessage[]> {
+    const files = await this.archiveFiles(sessionId);
+    const messages: UiMessage[] = [];
+    for (const entry of files) {
+      const archive = await this.readArchive(entry.file);
+      if (archive?.uiMessages?.length) messages.push(...archive.uiMessages);
+    }
+    return messages;
+  }
+
   async loadContext(sessionId: string): Promise<{ active: SessionContextEntry[]; archived: SessionContextEntry[] }> {
     const files = await this.archiveFiles(sessionId);
     const archived: SessionContextEntry[] = [];
@@ -130,16 +142,28 @@ export class SessionStore {
     let active: StoredSession = session;
     let activeEntries = contextIndex;
     if (JSON.stringify(session).length > this.archiveThreshold) {
-      const conversation = session.conversation ?? [];
+      const archivedUi = await this.loadArchiveUi(session.id);
+      const uiSkip = this.archivedUiPrefixLength(session.messages, archivedUi);
+      const uiPending: StoredSession = { ...session, messages: session.messages.slice(uiSkip) };
+      const uiSplit = this.splitUiForArchive(uiPending);
+      if (uiSplit) {
+        try {
+          const archived = await this.archiveUiOverflow(session.id, uiSplit.older);
+          active = { ...uiSplit.active, archived: { count: 0, files: archived.files, uiCount: archived.count } };
+        } catch {
+          active = { ...session, archiveUnavailable: true };
+        }
+      }
+      const conversation = active.conversation ?? [];
       const archivedMessages = await this.loadArchive(session.id);
       const skip = this.archivedPrefixLength(conversation, archivedMessages);
-      const pending: StoredSession = { ...session, conversation: conversation.slice(skip) };
+      const pending: StoredSession = { ...active, conversation: conversation.slice(skip) };
       const pendingEntries = contextIndex.length === conversation.length ? contextIndex.slice(skip) : contextIndex;
       const split = this.splitForArchive(pending, pendingEntries);
       if (split) {
         try {
           const archived = await this.archiveOverflow(session.id, split.older, split.entries);
-          active = { ...split.active, archived: { count: archived.count, files: archived.files } };
+          active = { ...split.active, archived: { ...(active.archived ?? { count: 0, files: [] }), count: archived.count, files: archived.files } };
           activeEntries = split.activeEntries;
         } catch {
           active = { ...session, archiveUnavailable: true };
@@ -169,6 +193,27 @@ export class SessionStore {
       skip++;
     }
     return skip;
+  }
+
+  private archivedUiPrefixLength(messages: UiMessage[], archived: UiMessage[]): number {
+    let skip = 0;
+    while (skip < messages.length && skip < archived.length && messages[skip].id === archived[skip].id) skip++;
+    return skip;
+  }
+
+  private splitUiForArchive(session: StoredSession): { older: UiMessage[]; active: StoredSession } | undefined {
+    const messages = session.messages ?? [];
+    const minActive = Math.min(SESSION_UI_FLOOR, messages.length);
+    if (messages.length <= minActive) return undefined;
+    const base = { ...session, messages: [], archived: undefined, archiveUnavailable: undefined };
+    const baseSize = JSON.stringify(base).length;
+    const sizes = messages.map((message) => JSON.stringify(message).length + 1);
+    let remove = 0;
+    let remaining = sizes.reduce((total, size) => total + size, 0);
+    while (remove < messages.length - minActive && baseSize + remaining > this.archiveThreshold) {
+      remaining -= sizes[remove++];
+    }
+    return remove > 0 ? { older: messages.slice(0, remove), active: { ...session, messages: messages.slice(remove) } } : undefined;
   }
 
   private splitForArchive(
@@ -221,6 +266,7 @@ export class SessionStore {
         createdAt: Date.now(),
         conversation: [...(current?.conversation ?? []), ...older],
         contextIndex: [...(current?.contextIndex ?? []), ...entries],
+        ...(current?.uiMessages ? { uiMessages: current.uiMessages } : {}),
       };
       if (JSON.stringify(merged).length <= this.archiveFileLimit) {
         await this.writeAtomic(newest.file, JSON.stringify(merged), true);
@@ -234,6 +280,33 @@ export class SessionStore {
       JSON.stringify({ sessionId, createdAt: Date.now(), conversation: older, contextIndex: entries }),
       true,
     );
+    return { files: [...files.map((entry) => entry.file), file].reverse(), count };
+  }
+
+  private async archiveUiOverflow(
+    sessionId: string,
+    older: UiMessage[],
+  ): Promise<{ files: string[]; count: number }> {
+    const files = await this.archiveFiles(sessionId);
+    const count = (await this.loadArchiveUi(sessionId)).length + older.length;
+    const newest = files[files.length - 1];
+    if (newest) {
+      const current = await this.readArchive(newest.file);
+      const merged: SessionArchiveFile = {
+        sessionId,
+        createdAt: Date.now(),
+        ...(current?.conversation ? { conversation: current.conversation } : {}),
+        ...(current?.contextIndex ? { contextIndex: current.contextIndex } : {}),
+        uiMessages: [...(current?.uiMessages ?? []), ...older],
+      };
+      if (JSON.stringify(merged).length <= this.archiveFileLimit) {
+        await this.writeAtomic(newest.file, JSON.stringify(merged), true);
+        return { files: files.map((entry) => entry.file).reverse(), count };
+      }
+    }
+    const seq = newest ? newest.seq + 1 : 0;
+    const file = this.archiveFile(sessionId, seq);
+    await this.writeAtomic(file, JSON.stringify({ sessionId, createdAt: Date.now(), uiMessages: older }), true);
     return { files: [...files.map((entry) => entry.file), file].reverse(), count };
   }
 
@@ -335,7 +408,7 @@ export class SessionStore {
       try {
         const raw = await fs.readFile(candidate, 'utf-8');
         const parsed = JSON.parse(raw) as SessionArchiveFile;
-        if (parsed && (parsed.conversation || parsed.contextIndex)) {
+        if (parsed && (parsed.conversation || parsed.contextIndex || parsed.uiMessages)) {
           return parsed;
         }
       } catch {

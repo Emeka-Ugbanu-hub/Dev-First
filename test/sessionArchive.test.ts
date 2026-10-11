@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, stat, mkdir } from 'fs/promises';
 import { tmpdir } from 'os';
 import * as path from 'path';
 import type { ChatMessage } from '../src/llm/types';
+import type { UiMessage } from '../src/shared/protocol';
 import { SessionStore, StoredSession } from '../src/session/SessionStore';
 
 function session(id: string, conversation: ChatMessage[]): StoredSession {
@@ -118,6 +119,25 @@ describe('SessionStore archive rotation', () => {
       const active = await store.load('a');
       expect(active?.conversation).toHaveLength(conversation.length);
       expect(active?.archived).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('archives old UI cards when visible history is what makes the session large', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'df-archive-'));
+    try {
+      const store = new SessionStore(dir, 1000);
+      const uiMessages: UiMessage[] = Array.from({ length: 30 }, (_, index) => ({
+        id: `ui-${index}`,
+        role: 'assistant',
+        text: `card ${index} ${'x'.repeat(200)}`,
+      }));
+      await store.save({ ...session('ui', messages(2)), messages: uiMessages });
+      const active = await store.load('ui');
+      expect(active!.messages.length).toBeLessThan(uiMessages.length);
+      expect(active!.archived?.uiCount).toBeGreaterThan(0);
+      expect(await store.loadArchiveUi('ui')).toHaveLength(active!.archived!.uiCount);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -54,6 +54,12 @@ export interface DevFirstConfig {
   scanMaxFiles: number;
   scanIgnore: string[];
   scanAiModel: string;
+  scanPreset: string;
+  scanModel: string;
+  scanReasoningEffort: ReasoningEffortSetting | '';
+  architecturePreset: string;
+  architectureModel: string;
+  architectureReasoningEffort: ReasoningEffortSetting | '';
   architecture: boolean;
   pasteFileLines: number;
   typecheckCommand: string;
@@ -115,6 +121,12 @@ export function getConfig(): DevFirstConfig {
       .map((entry) => entry.trim())
       .filter(Boolean),
     scanAiModel: config.get<string>('scanAiModel', ''),
+    scanPreset: config.get<string>('scanPreset', ''),
+    scanModel: config.get<string>('scanModel', ''),
+    scanReasoningEffort: config.get<ReasoningEffortSetting | ''>('scanReasoningEffort', ''),
+    architecturePreset: config.get<string>('architecturePreset', ''),
+    architectureModel: config.get<string>('architectureModel', ''),
+    architectureReasoningEffort: config.get<ReasoningEffortSetting | ''>('architectureReasoningEffort', ''),
     architecture: config.get<boolean>('architecture', true),
     pasteFileLines: Math.max(20, config.get<number>('pasteFileLines', 120)),
     typecheckCommand: config.get<string>('typecheckCommand', '').trim(),

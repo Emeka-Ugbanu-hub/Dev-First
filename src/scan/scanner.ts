@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import type { Tree } from '@vscode/tree-sitter-wasm/wasm/web-tree-sitter';
 import { getConfig } from '../config';
 import type { DevFirstConfig } from '../config';
-import { activeProvider } from '../llm/activeProvider';
+import { roleProvider } from '../llm/activeProvider';
 import type { LLMProvider, ToolCall, ToolDef } from '../llm/types';
 import { matchGlob } from '../util/glob';
 import { isSuppressed } from './engine';
@@ -29,6 +29,7 @@ import type { Convention } from './conventions';
 import { ConventionPhraser } from './conventionPhraser';
 import { ProjectModel } from './projectModel';
 import type { ProjectModelState } from './projectModel';
+import { reasoningLevelsFor } from '../llm/catalog';
 
 export { matchGlob };
 
@@ -81,13 +82,17 @@ export class ScanRunner implements vscode.Disposable {
     this.aiScanner = new AiScanner({
       getConfig: () => {
         const config = getConfig();
+        const selectedModel = config.scanModel.trim() || config.scanAiModel.trim() || config.model;
+        const selectedEffort = config.scanReasoningEffort || config.reasoningEffort;
+        const supportedLevels = reasoningLevelsFor(config.scanPreset || config.preset, selectedModel);
         return {
           ...config,
           scanAi: true,
+          model: selectedModel,
           reasoning:
-            config.reasoningEffort === 'off'
+            selectedEffort === 'off' || (supportedLevels.length > 0 && !supportedLevels.includes(selectedEffort))
               ? undefined
-              : { enabled: true, effort: config.reasoningEffort as 'low' | 'medium' | 'high' },
+              : { enabled: true, effort: selectedEffort as 'low' | 'medium' | 'high' },
         };
       },
       buildProvider: () => this.buildScanProvider(),
@@ -97,6 +102,7 @@ export class ScanRunner implements vscode.Disposable {
     this.crossFileAi = new CrossFileAi({
       getConfig: () => ({
         ...getConfig(),
+        model: getConfig().scanModel.trim() || getConfig().scanAiModel.trim() || getConfig().model,
         scanAi: true,
         scanAiCrossFile: true,
         scanAiCrossFileMaxPairs: CROSS_FILE_PAIRS,
@@ -122,7 +128,7 @@ export class ScanRunner implements vscode.Disposable {
       context.globalStorageUri.fsPath,
     );
     this.conventionPhraser = new ConventionPhraser({
-      getModel: () => getConfig().scanAiModel.trim() || getConfig().model,
+      getModel: () => getConfig().scanModel.trim() || getConfig().scanAiModel.trim() || getConfig().model,
       buildProvider: () => this.buildScanProvider(),
     });
     this.projectModel = new ProjectModel({
@@ -134,7 +140,7 @@ export class ScanRunner implements vscode.Disposable {
       getFacts: () => this.duplication.getFacts(),
       getHashes: () => this.duplication.getFileHashes(),
       buildProvider: () => this.buildScanProvider(),
-      getModel: () => getConfig().scanAiModel.trim() || getConfig().model,
+      getModel: () => getConfig().scanModel.trim() || getConfig().scanAiModel.trim() || getConfig().model,
     });
     this.diagnostics = vscode.languages.createDiagnosticCollection('dev-first-scan');
     this.aiStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 89);
@@ -520,7 +526,7 @@ export class ScanRunner implements vscode.Disposable {
   }
 
   private async buildScanProvider(): Promise<LLMProvider | undefined> {
-    const active = await activeProvider(this.context);
+    const active = await roleProvider(this.context, 'scanner');
     return active?.provider;
   }
 

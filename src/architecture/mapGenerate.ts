@@ -4,6 +4,7 @@ import type {
   ToolCall,
   ToolDef,
 } from '../llm/types';
+import type { ChatOptions } from '../llm/types';
 import { describeToolCall } from '../agent/tools';
 import { normalizeToolArguments } from '../util/toolArgs';
 import { errorMessage } from '../util/errors';
@@ -11,6 +12,7 @@ import { errorMessage } from '../util/errors';
 export interface MapGenerateDeps {
   provider: LLMProvider;
   model: string;
+  reasoning?: ChatOptions['reasoning'];
   tools: ToolDef[];
   executeTool: (call: ToolCall) => Promise<string>;
   signal: AbortSignal;
@@ -59,6 +61,7 @@ async function runTurn(
     model: deps.model,
     tools: deps.tools.length > 0 ? deps.tools : undefined,
     signal: deps.signal,
+    reasoning: deps.reasoning,
   })) {
     if (event.type === 'text') {
       text += event.text;

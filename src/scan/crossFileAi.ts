@@ -311,7 +311,7 @@ export class CrossFileAi {
     this.cancel(uri);
     const controller = new AbortController();
     this.controllers.set(uri, controller);
-    const model = config.scanAiModel.trim() || config.model;
+    const model = config.model;
     const findings: CrossFileFinding[] = [];
     try {
       for (const candidate of selected) {

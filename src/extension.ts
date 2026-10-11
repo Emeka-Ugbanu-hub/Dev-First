@@ -15,7 +15,7 @@ import {
 } from './editor/prompts';
 import { ChatViewProvider } from './webview/ChatViewProvider';
 import { getConfig, promptForApiKey, workspaceRoot } from './config';
-import { activeProvider } from './llm/activeProvider';
+import { activeProvider, roleProvider } from './llm/activeProvider';
 import { PRESETS, findPreset } from './llm/presets';
 import { cleanupStaleTemps } from './util/atomicWrite';
 import { WorktreeManager } from './worktree/WorktreeManager';
@@ -603,7 +603,17 @@ export function activate(context: vscode.ExtensionContext): void {
         state: context.globalState,
         getFacts: () => scanRunner.getArchitectureFacts(),
         getCoverage: () => scanRunner.getArchitectureCoverage(),
-        getActive: () => activeProvider(context),
+        getActive: () => roleProvider(context, 'architecture'),
+        getReasoning: async () => {
+          const config = getConfig();
+          const effort = config.architectureReasoningEffort || config.reasoningEffort;
+          if (!effort || effort === 'off') return undefined;
+          const role = await roleProvider(context, 'architecture');
+          if (role?.reasoningLevels?.length && !role.reasoningLevels.includes(effort)) {
+            return undefined;
+          }
+          return { enabled: true, effort: effort as 'low' | 'medium' | 'high' };
+        },
         getTools: () => session.plannerToolDefs(),
         executeTool:
           executeTool ?? (() => Promise.resolve('Error: read-only tools are unavailable.')),

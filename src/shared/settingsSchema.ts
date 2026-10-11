@@ -356,6 +356,34 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     type: 'string',
   },
   {
+    key: 'scanPreset', tab: 'provider', group: 'Task models', label: 'Scanner provider',
+    description: 'Provider used for scanner operations. Empty inherits the main connection.', type: 'enum',
+    options: ['', 'openai', 'anthropic', 'gemini', 'openrouter', 'groq', 'deepseek', 'ollama', 'lmstudio', 'custom'],
+  },
+  {
+    key: 'scanModel', tab: 'provider', group: 'Task models', label: 'Scanner model',
+    description: 'Model ID for scanner operations. Empty uses the selected scanner connection model.', type: 'string',
+  },
+  {
+    key: 'scanReasoningEffort', tab: 'provider', group: 'Task models', label: 'Scanner reasoning effort',
+    description: 'Effort for the selected scanner model. Empty inherits the main setting; unsupported levels are ignored.', type: 'enum',
+    options: ['', 'off', 'low', 'medium', 'high', 'max'],
+  },
+  {
+    key: 'architecturePreset', tab: 'provider', group: 'Task models', label: 'Architecture provider',
+    description: 'Provider used for architecture mapping. Empty inherits the main connection.', type: 'enum',
+    options: ['', 'openai', 'anthropic', 'gemini', 'openrouter', 'groq', 'deepseek', 'ollama', 'lmstudio', 'custom'],
+  },
+  {
+    key: 'architectureModel', tab: 'provider', group: 'Task models', label: 'Architecture model',
+    description: 'Model ID for architecture mapping. Empty uses the selected architecture connection model.', type: 'string',
+  },
+  {
+    key: 'architectureReasoningEffort', tab: 'provider', group: 'Task models', label: 'Architecture reasoning effort',
+    description: 'Effort for the selected architecture model. Empty inherits the main setting; unsupported levels are ignored.', type: 'enum',
+    options: ['', 'off', 'low', 'medium', 'high', 'max'],
+  },
+  {
     key: 'architecture',
     tab: 'display',
     group: 'Chat',

@@ -64,13 +64,19 @@ export function SettingsPanel({
       case 'boolean':
         return <Switch checked={Boolean(current)} onChange={(value) => update(def.key, value)} />;
       case 'enum':
-        return (
-          <SelectInput
-            value={String(current ?? def.options?.[0] ?? '')}
-            options={def.options ?? []}
-            onChange={(value) => update(def.key, value)}
-          />
-        );
+        {
+          const roleProvider = def.key === 'scanPreset' || def.key === 'architecturePreset';
+          const options = roleProvider
+            ? ['', ...connections.map((connection) => connection.preset)]
+            : (def.options ?? []);
+          return (
+            <SelectInput
+              value={String(current ?? options[0] ?? '')}
+              options={options}
+              onChange={(value) => update(def.key, value)}
+            />
+          );
+        }
       case 'number':
         return (
           <NumberInput

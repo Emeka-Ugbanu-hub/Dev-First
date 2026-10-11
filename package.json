@@ -621,6 +621,36 @@
           "default": "",
           "markdownDescription": "Model used for the AI scan. Empty uses `#devFirst.model#`."
         },
+        "devFirst.scanPreset": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Provider preset for scanner operations. Empty inherits the main connection."
+        },
+        "devFirst.scanModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model ID for scanner operations. Empty uses the selected scanner connection model."
+        },
+        "devFirst.scanReasoningEffort": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Reasoning effort for scanner operations. Empty inherits the main setting."
+        },
+        "devFirst.architecturePreset": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Provider preset for architecture mapping. Empty inherits the main connection."
+        },
+        "devFirst.architectureModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model ID for architecture mapping. Empty uses the selected architecture connection model."
+        },
+        "devFirst.architectureReasoningEffort": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Reasoning effort for architecture mapping. Empty inherits the main setting."
+        },
         "devFirst.architecture": {
           "type": "boolean",
           "default": true,
