@@ -1,10 +1,20 @@
 import { ToolCall, ToolDef } from '../llm/types';
 import { parseJsonLoose } from '../util/json';
+import {
+  inspectFileContextTool,
+  investigateIssueTool,
+  mutatingCompoundTools,
+  readOnlyCompoundTools,
+  verifyChangeTools,
+} from './compoundTools';
+
+const FALLBACK_SUFFIX = ' Fallback: use only when no compound tool fits.';
 
 export const readFileTool: ToolDef = {
   name: 'read_file',
   description:
-    'Read a text file from the workspace. Returns numbered lines. For large files, read in ranges using start_line and end_line.',
+    'Read a text file from the workspace. Returns numbered lines. For large files, read in ranges using start_line and end_line.' +
+    FALLBACK_SUFFIX,
   parameters: {
     type: 'object',
     properties: {
@@ -32,7 +42,8 @@ export const listFilesTool: ToolDef = {
 export const searchTextTool: ToolDef = {
   name: 'search_text',
   description:
-    'Search file contents for a text query (or a regular expression when is_regex is true). Returns matching lines with file:line prefixes.',
+    'Search file contents for a text query (or a regular expression when is_regex is true). Returns matching lines with file:line prefixes.' +
+    FALLBACK_SUFFIX,
   parameters: {
     type: 'object',
     properties: {
@@ -209,7 +220,8 @@ export const webSearchTool: ToolDef = {
 export const writeFileTool: ToolDef = {
   name: 'write_file',
   description:
-    'Create a new file or replace the entire contents of an existing file. Prefer edit_file for small changes.',
+    'Create a new file or replace the entire contents of an existing file. Prefer edit_file for small changes.' +
+    FALLBACK_SUFFIX,
   parameters: {
     type: 'object',
     properties: {
@@ -223,7 +235,8 @@ export const writeFileTool: ToolDef = {
 export const editFileTool: ToolDef = {
   name: 'edit_file',
   description:
-    'Replace old_text with new_text in a file. old_text must match the file exactly, including whitespace and indentation. Include enough surrounding lines to be unique. Use replace_all to change every occurrence.',
+    'Replace old_text with new_text in a file. old_text must match the file exactly, including whitespace and indentation. Include enough surrounding lines to be unique. Use replace_all to change every occurrence.' +
+    FALLBACK_SUFFIX,
   parameters: {
     type: 'object',
     properties: {
@@ -239,7 +252,8 @@ export const editFileTool: ToolDef = {
 export const applyPatchTool: ToolDef = {
   name: 'apply_patch',
   description:
-    'Apply a multi-file patch using the *** Begin Patch format. Sections: "*** Add File: path" (lines prefixed +), "*** Update File: path" (hunks starting with @@; context lines prefixed with a space, removals with -, additions with +), "*** Delete File: path". End with "*** End Patch". Best for batch edits across several files.',
+    'Apply a multi-file patch using the *** Begin Patch format. Sections: "*** Add File: path" (lines prefixed +), "*** Update File: path" (hunks starting with @@; context lines prefixed with a space, removals with -, additions with +), "*** Delete File: path". End with "*** End Patch". Best for batch edits across several files.' +
+    FALLBACK_SUFFIX,
   parameters: {
     type: 'object',
     properties: {
@@ -252,7 +266,8 @@ export const applyPatchTool: ToolDef = {
 export const runTerminalTool: ToolDef = {
   name: 'run_terminal_command',
   description:
-    'Run a shell command in the workspace root and return its combined output. Use for builds, tests, git, package installs. The developer approves each command.',
+    'Run a shell command in the workspace root and return its combined output. Use for builds, tests, git, package installs. The developer approves each command.' +
+    FALLBACK_SUFFIX,
   parameters: {
     type: 'object',
     properties: {
@@ -660,7 +675,13 @@ export function plannerToolSet(tools: ToolDef[], options: PlannerToolSetOptions 
 }
 
 export function plannerTools(options: ToolRegistryOptions = {}): ToolDef[] {
-  return [...readOnlyTools(options), runTerminalTool];
+  return [
+    ...readOnlyTools(options),
+    inspectFileContextTool,
+    investigateIssueTool,
+    verifyChangeTools().planner,
+    runTerminalTool,
+  ];
 }
 
 export function useSkillTool(names: string[]): ToolDef {
@@ -719,6 +740,8 @@ export function readOnlyTools(options: ToolRegistryOptions = {}): ToolDef[] {
 
 export function executionTools(options: ToolRegistryOptions = {}): ToolDef[] {
   const tools: ToolDef[] = [
+    ...mutatingCompoundTools,
+    ...readOnlyCompoundTools(),
     ...readOnlyTools(options),
     writeFileTool,
     editFileTool,
@@ -800,6 +823,26 @@ export function describeToolCall(call: ToolCall): string {
       return `Edit ${shortPath(args.path)}`;
     case 'apply_patch':
       return `Apply patch (${countPatchFiles(String(args.patch ?? ''))} file${countPatchFiles(String(args.patch ?? '')) === 1 ? '' : 's'})`;
+    case 'apply_change_set':
+      return `Change set (${Array.isArray(args.changes) ? args.changes.length : 0} file${Array.isArray(args.changes) && args.changes.length === 1 ? '' : 's'})`;
+    case 'fix_in_file':
+      return `Fix ${shortPath(args.path)}`;
+    case 'fix_diagnostic':
+      return `Fix diagnostic ${shortPath(args.path)}:${args.line ?? ''}`;
+    case 'rename_symbol':
+      return `Rename to ${truncate(String(args.newName ?? ''), 30)}`;
+    case 'add_import_and_use':
+      return `Import ${truncate(String(args.symbol ?? ''), 30)}`;
+    case 'update_related_files':
+      return `Update related: ${truncate(String(args.symbol_or_pattern ?? ''), 30)}`;
+    case 'refactor_symbol':
+      return `${String(args.operation ?? 'refactor')} ${truncate(String(args.name ?? ''), 30)}`;
+    case 'inspect_file_context':
+      return `Inspect ${shortPath(args.path)}`;
+    case 'investigate_issue':
+      return `Investigate ${shortPath(args.path)}${args.line ? `:${args.line}` : ''}`;
+    case 'verify_change':
+      return `Verify ${Array.isArray(args.paths) ? args.paths.length : 0} file(s)`;
     case 'run_terminal_command':
       return `Run: ${truncate(String(args.command ?? ''), 60)}`;
     case 'todo_write':
@@ -895,6 +938,26 @@ export function toolIcon(name: string): string {
       return 'edit';
     case 'apply_patch':
       return 'diff';
+    case 'apply_change_set':
+      return 'diff';
+    case 'fix_in_file':
+      return 'edit';
+    case 'fix_diagnostic':
+      return 'warning';
+    case 'rename_symbol':
+      return 'symbol-method';
+    case 'add_import_and_use':
+      return 'references';
+    case 'update_related_files':
+      return 'references';
+    case 'refactor_symbol':
+      return 'symbol-method';
+    case 'inspect_file_context':
+      return 'file';
+    case 'investigate_issue':
+      return 'search';
+    case 'verify_change':
+      return 'check';
     case 'run_terminal_command':
       return 'terminal';
     case 'todo_write':

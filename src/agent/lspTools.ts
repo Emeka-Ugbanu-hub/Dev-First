@@ -3,18 +3,18 @@ import { promises as fs } from 'fs';
 
 const MAX_RESULTS = 60;
 
-export async function documentSymbols(absolutePath: string): Promise<string> {
+export async function documentSymbolLines(absolutePath: string, max = MAX_RESULTS): Promise<string[]> {
   const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
     'vscode.executeDocumentSymbolProvider',
     vscode.Uri.file(absolutePath),
   );
   if (!symbols?.length) {
-    return 'No symbols found for this file.';
+    return [];
   }
   const lines: string[] = [];
   const walk = (items: vscode.DocumentSymbol[], depth: number) => {
     for (const symbol of items) {
-      if (lines.length >= MAX_RESULTS) {
+      if (lines.length >= max) {
         return;
       }
       lines.push(
@@ -26,7 +26,175 @@ export async function documentSymbols(absolutePath: string): Promise<string> {
     }
   };
   walk(symbols, 0);
+  return lines;
+}
+
+export async function documentSymbols(absolutePath: string): Promise<string> {
+  const lines = await documentSymbolLines(absolutePath);
+  if (lines.length === 0) {
+    return 'No symbols found for this file.';
+  }
   return lines.join('\n');
+}
+
+export interface SymbolLocation {
+  name: string;
+  kind: string;
+  path: string;
+  absolute: string;
+  line: number;
+  character: number;
+}
+
+export async function workspaceSymbolLocations(query: string): Promise<SymbolLocation[]> {
+  const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+    'vscode.executeWorkspaceSymbolProvider',
+    query,
+  );
+  if (!symbols?.length) {
+    return [];
+  }
+  return symbols.slice(0, MAX_RESULTS).map((symbol) => ({
+    name: symbol.name,
+    kind: vscode.SymbolKind[symbol.kind],
+    path: vscode.workspace.asRelativePath(symbol.location.uri),
+    absolute: symbol.location.uri.fsPath,
+    line: symbol.location.range.start.line + 1,
+    character: symbol.location.range.start.character + 1,
+  }));
+}
+
+export interface ReferenceLocation {
+  path: string;
+  absolute: string;
+  line: number;
+  character: number;
+}
+
+export async function referenceLocationsAt(
+  absolutePath: string,
+  line: unknown,
+  character: unknown,
+): Promise<ReferenceLocation[]> {
+  const position = positionFrom(line, character);
+  if (typeof position === 'string') {
+    return [];
+  }
+  let locations: vscode.Location[] | undefined;
+  try {
+    locations = await vscode.commands.executeCommand<vscode.Location[]>(
+      'vscode.executeReferenceProvider',
+      vscode.Uri.file(absolutePath),
+      position,
+    );
+  } catch {
+    return [];
+  }
+  if (!locations?.length) {
+    return [];
+  }
+  return locations.slice(0, MAX_RESULTS).map((location) => ({
+    path: vscode.workspace.asRelativePath(location.uri),
+    absolute: location.uri.fsPath,
+    line: location.range.start.line + 1,
+    character: location.range.start.character + 1,
+  }));
+}
+
+export async function referenceFilesAt(
+  absolutePath: string,
+  line: unknown,
+  character: unknown,
+): Promise<string[]> {
+  const locations = await referenceLocationsAt(absolutePath, line, character);
+  return [...new Set(locations.map((location) => location.path))];
+}
+
+export interface EditProviderResult {
+  status: 'edit' | 'unavailable' | 'none';
+  edit?: vscode.WorkspaceEdit;
+  message?: string;
+}
+
+export async function documentRenameEdit(
+  absolutePath: string,
+  line: unknown,
+  character: unknown,
+  newName: string,
+): Promise<EditProviderResult> {
+  const position = positionFrom(line, character);
+  if (typeof position === 'string') {
+    return { status: 'unavailable', message: position };
+  }
+  const problem = await providerProblem('vscode.executeDocumentRenameProvider', absolutePath);
+  if (problem) {
+    return { status: 'unavailable', message: problem };
+  }
+  let edit: vscode.WorkspaceEdit | null | undefined;
+  try {
+    edit = await vscode.commands.executeCommand<vscode.WorkspaceEdit | null>(
+      'vscode.executeDocumentRenameProvider',
+      vscode.Uri.file(absolutePath),
+      position,
+      newName,
+    );
+  } catch {
+    return { status: 'unavailable', message: 'The language server rename provider failed.' };
+  }
+  if (!edit) {
+    return { status: 'none' };
+  }
+  return { status: 'edit', edit };
+}
+
+export async function addImportCodeActionEdit(
+  absolutePath: string,
+  line: unknown,
+  character: unknown,
+  symbol: string,
+): Promise<EditProviderResult> {
+  const position = positionFrom(line, character);
+  if (typeof position === 'string') {
+    return { status: 'unavailable', message: position };
+  }
+  const problem = await providerProblem('vscode.executeCodeActionProvider', absolutePath);
+  if (problem) {
+    return { status: 'unavailable', message: problem };
+  }
+  let actions: Array<vscode.CodeAction | vscode.Command> | undefined;
+  try {
+    actions = await vscode.commands.executeCommand<Array<vscode.CodeAction | vscode.Command>>(
+      'vscode.executeCodeActionProvider',
+      vscode.Uri.file(absolutePath),
+      new vscode.Range(position, position),
+      vscode.CodeActionKind.QuickFix,
+    );
+  } catch {
+    return { status: 'unavailable', message: 'The language server code action provider failed.' };
+  }
+  if (!actions?.length) {
+    return { status: 'none' };
+  }
+  const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const matcher = new RegExp(`\\b(import|${escaped})\\b`, 'i');
+  for (const action of actions) {
+    if (!('edit' in action) || !action.edit) {
+      continue;
+    }
+    if (!matcher.test(action.title)) {
+      continue;
+    }
+    return { status: 'edit', edit: action.edit };
+  }
+  return { status: 'none' };
+}
+
+export async function applyWorkspaceEdit(edit: vscode.WorkspaceEdit): Promise<boolean> {
+  try {
+    return await vscode.workspace.applyEdit(edit);
+  } catch {
+    return false;
+  }
 }
 
 export async function workspaceSymbols(query: string): Promise<string> {

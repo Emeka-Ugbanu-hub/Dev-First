@@ -1,6 +1,7 @@
 import { createReadStream, promises as fs } from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
+import * as vscode from 'vscode';
 import { DiffManager } from '../diff/DiffManager';
 import { errorMessage } from '../util/errors';
 import { toolCallArgs } from './tools';
@@ -51,8 +52,47 @@ import {
 } from './fileRead';
 import { initOutputStore, spillOutput } from './outputStore';
 import { runTerminalCommand } from './terminal';
-import { collectDiagnostics, diagnosticsSection } from './diagnostics';
-import { documentSymbols, findReferences, goToDefinition, goToImplementation, hoverAt, incomingCalls, outgoingCalls, workspaceSymbols } from './lspTools';
+import { collectDiagnostics, collectFileDiagnostics, diagnosticLines, diagnosticsSection } from './diagnostics';
+import type { FileDiagnostic } from './diagnostics';
+import {
+  addImportCodeActionEdit,
+  applyWorkspaceEdit,
+  documentRenameEdit,
+  documentSymbolLines,
+  documentSymbols,
+  findReferences,
+  goToDefinition,
+  goToImplementation,
+  hoverAt,
+  incomingCalls,
+  outgoingCalls,
+  toZeroBased,
+  workspaceSymbols,
+} from './lspTools';
+import {
+  ChangeSetAction,
+  ChangeSetEntry,
+  UPDATE_CONFIRM_THRESHOLD,
+  UPDATE_MAX_FILES,
+  appendSnippet,
+  buildImportStatement,
+  detectVerifyCommand,
+  insertImport,
+  isWorkspaceIdentifier,
+  mutatingCompoundTools,
+  parseRefactorRange,
+  patchHunksFor,
+  rangeText,
+  readOnlyCompoundTools,
+  removeRange,
+  renameInContent,
+  replaceRange,
+  symbolAtLine,
+  symbolNameFromEntry,
+  validateChangeSet,
+  wordAtPosition,
+} from './compoundTools';
+import { discoverRelatedTargets, searchTargets } from './compoundPreflight';
 import {
   IGNORED_DIRS,
   TEXT_EXTENSIONS,
@@ -121,6 +161,8 @@ for (const definition of [
   browserScreenshotTool,
   useSkillSchema,
   taskTool,
+  ...mutatingCompoundTools,
+  ...readOnlyCompoundTools(),
 ]) {
   TOOL_SCHEMAS.set(definition.name, definition);
 }
@@ -153,6 +195,7 @@ export interface ToolBoxOptions {
   runTask?: (request: SubagentRequest, signal?: AbortSignal) => Promise<string>;
   approvalMemory?: ApprovalMemory;
   externalDirectories?: ExternalDirectoryConsent;
+  recentRunOperations?: (filePath: string) => string[];
 }
 
 export class ToolBox {
@@ -210,6 +253,26 @@ export class ToolBox {
         return { text: await incomingCalls(await this.resolvePath(args.path, context), args.line, args.character) };
       case 'outgoing_calls':
         return { text: await outgoingCalls(await this.resolvePath(args.path, context), args.line, args.character) };
+      case 'inspect_file_context':
+        return { text: await this.inspectFileContext(args, context) };
+      case 'investigate_issue':
+        return { text: await this.investigateIssue(args, context) };
+      case 'verify_change':
+        return { text: await this.verifyChange(args, context) };
+      case 'apply_change_set':
+        return { text: await this.applyChangeSet(args, context) };
+      case 'fix_in_file':
+        return { text: await this.fixInFile(args, context) };
+      case 'fix_diagnostic':
+        return { text: await this.fixDiagnostic(args, context) };
+      case 'add_import_and_use':
+        return { text: await this.addImportAndUse(args, context) };
+      case 'rename_symbol':
+        return { text: await this.renameSymbol(args, context) };
+      case 'update_related_files':
+        return { text: await this.updateRelatedFiles(args, context) };
+      case 'refactor_symbol':
+        return { text: await this.refactorSymbol(args, context) };
       case 'task':
         return { text: await this.runTask(args, context) };
       case 'write_file':
@@ -936,6 +999,579 @@ export class ToolBox {
     return this.options.browser.screenshot(path.join(this.options.root, '.dev-first', 'screenshots'));
   }
 
+  private async inspectFileContext(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const display = String(args.path ?? '');
+    const absolute = await this.resolvePath(args.path, context);
+    const content = await this.readTextIfExists(absolute);
+    if (content === undefined) {
+      return `Error: ${display} does not exist.`;
+    }
+    const sections: string[] = [`# ${display}`];
+    const allLines = content.replace(/\r\n/g, '\n').split('\n');
+    const endLine = budgetEndLine(allLines, 1, Math.min(200, allLines.length), MAX_READ_BYTES);
+    const lines = allLines.slice(0, endLine);
+    sections.push(
+      `## Content (first ${lines.length} lines)\n${lines.map((line, index) => `${index + 1} | ${truncateLine(line)}`).join('\n') || '(empty file)'}`,
+    );
+    let symbols: string[] = [];
+    try {
+      symbols = await documentSymbolLines(absolute, 30);
+    } catch {}
+    sections.push(`## Symbols\n${symbols.join('\n') || '(none)'}`);
+    const diagnostics = await this.safeDiagnostics([absolute]);
+    sections.push(`## Diagnostics\n${diagnosticLines(diagnostics.slice(0, 20)).join('\n') || '(none)'}`);
+    sections.push(`## Imports\n${importLines(content, 20).join('\n') || '(none)'}`);
+    if (args.includeReferences) {
+      const symbol = symbols[0] ? symbolNameFromEntry(symbols[0]) : undefined;
+      if (symbol) {
+        let references = '';
+        try {
+          references = await findReferences(absolute, symbol);
+        } catch {}
+        sections.push(`## References to ${symbol} (capped)\n${capLines(references, 20)}`);
+      } else {
+        sections.push('## References\n(no symbol found to reference)');
+      }
+    }
+    return sections.join('\n\n');
+  }
+
+  private async investigateIssue(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const display = String(args.path ?? '');
+    const absolute = await this.resolvePath(args.path, context);
+    const content = await this.readTextIfExists(absolute);
+    if (content === undefined) {
+      return `Error: ${display} does not exist.`;
+    }
+    const line = clampInt(args.line, 1, Number.MAX_SAFE_INTEGER);
+    const symbol = line ? symbolAtLine(content, line) : undefined;
+    const sections: string[] = [`# Investigation: ${display}${line ? `:${line}` : ''}`];
+    const diagnostics = await this.safeDiagnostics([absolute]);
+    const nearby = line ? diagnostics.filter((item) => Math.abs(item.line - line) <= 5) : diagnostics;
+    sections.push(
+      `## Diagnostics ${line ? `near line ${line}` : 'for the file'}\n${diagnosticLines(nearby.slice(0, 20)).join('\n') || '(none)'}`,
+    );
+    if (symbol) {
+      let references = '';
+      try {
+        references = await findReferences(absolute, symbol);
+      } catch (error) {
+        references = `Error: ${errorMessage(error)}`;
+      }
+      sections.push(`## Related files (references to ${symbol})\n${capLines(references, 20)}`);
+    } else {
+      sections.push('## Related files\n(no symbol detected; pass line to enable reference lookup)');
+    }
+    sections.push(`## Imports\n${importLines(content, 20).join('\n') || '(none)'}`);
+    const runLines = this.options.recentRunOperations?.(display) ?? [];
+    sections.push(`## Recent run journal\n${runLines.slice(0, 5).join('\n') || 'No active run operations for this file.'}`);
+    if (symbol) {
+      const matches = await this.searchText({ query: symbol, max_results: 10 }, context);
+      sections.push(`## Symbol search: ${symbol}\n${capLines(matches, 20)}`);
+    }
+    return sections.join('\n\n');
+  }
+
+  private async verifyChange(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const rawPaths = Array.isArray(args.paths)
+      ? args.paths.filter((entry: unknown): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+      : [];
+    if (rawPaths.length === 0) {
+      return 'Error: paths must be a non-empty array of workspace-relative file paths.';
+    }
+    const absolutes: string[] = [];
+    for (const entry of rawPaths) {
+      absolutes.push(await this.resolvePath(entry, context));
+    }
+    const unique = [...new Set(absolutes)];
+    const mode = context.planning || args.mode !== 'auto' ? 'diagnostics' : 'auto';
+    const before = await this.safeDiagnostics(unique);
+    const sections: string[] = [`# verify_change (${mode})`];
+    sections.push(`## Diagnostics before\n${diagnosticLines(before).join('\n') || '(none)'}`);
+    let after = before;
+    if (mode === 'auto') {
+      const detection = await this.detectVerificationCommand();
+      if (!detection) {
+        sections.push('## Command\nNo verification script found in package.json (looked for typecheck, test, build).');
+      } else {
+        const outcome = await this.runCommand({ command: detection.command }, context);
+        after = await this.safeDiagnostics(unique);
+        const status = /^Exit code: 0\b/m.test(outcome.text) ? 'passed' : 'failed';
+        sections.push(`## Command\n${detection.command} — ${status}\n${capLines(outcome.text, 30)}`);
+      }
+    }
+    sections.push(`## Diagnostics after\n${diagnosticLines(after).join('\n') || '(none)'}`);
+    const resolved = before.filter((item) => !after.some((candidate) => sameDiagnostic(candidate, item)));
+    const added = after.filter((item) => !before.some((candidate) => sameDiagnostic(candidate, item)));
+    sections.push(`## Summary\n${resolved.length} resolved, ${added.length} new`);
+    return sections.join('\n\n');
+  }
+
+  private async applyChangeSet(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const validation = validateChangeSet(args);
+    if (!validation.ok) {
+      return `Error: ${validation.error}`;
+    }
+    const resolved: Array<{ entry: ChangeSetEntry; absolute: string; relative: string }> = [];
+    for (const entry of validation.changes) {
+      resolved.push({
+        entry,
+        absolute: await this.resolvePath(entry.path, context),
+        relative: entry.path,
+      });
+    }
+    if (!(await this.editApproved('apply_change_set', resolved.map((item) => item.relative).join(', '), context))) {
+      return 'The developer denied this edit. Do not retry it unless asked.';
+    }
+    const originals = new Map<string, string | undefined>();
+    for (const { absolute } of resolved) {
+      originals.set(absolute, await this.readTextIfExists(absolute));
+    }
+    const applied: Array<{ absolute: string; relative: string }> = [];
+    const results: string[] = [];
+    for (const { entry, absolute, relative } of resolved) {
+      try {
+        await this.applyChangeSetEntry(entry, absolute, originals.get(absolute));
+        applied.push({ absolute, relative });
+        results.push(`- ${relative} [${entry.action}] ok`);
+      } catch (error) {
+        const rolledBack = await this.rollbackFiles(applied, originals);
+        results.push(`- ${relative} [${entry.action}] failed: ${errorMessage(error)}`);
+        const suffix = rolledBack.length > 0 ? `\nRolled back: ${rolledBack.join(', ')}.` : '\nNothing needed rollback.';
+        return `Error: change set failed at ${relative} — ${errorMessage(error)}.${suffix}\n${results.join('\n')}`;
+      }
+    }
+    const diagnostics = await this.safeDiagnostics([...new Set(resolved.map((item) => item.absolute))]);
+    const diagnosticText = diagnosticLines(diagnostics).join('\n');
+    return `Applied ${resolved.length} change${resolved.length === 1 ? '' : 's'}:\n${results.join('\n')}${
+      diagnosticText ? `\n\nDiagnostics:\n${diagnosticText}` : '\n\nDiagnostics: none'
+    }`;
+  }
+
+  private async applyChangeSetEntry(
+    entry: ChangeSetEntry,
+    absolute: string,
+    original: string | undefined,
+  ): Promise<void> {
+    if (entry.action === 'create') {
+      await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, entry.content ?? ''));
+      return;
+    }
+    if (original === undefined) {
+      throw new Error('does not exist; use action create');
+    }
+    if (entry.action === 'delete') {
+      await withFileLock(absolute, () => this.options.diffManager.applyDeletion(absolute));
+      return;
+    }
+    let next: string;
+    if (entry.patch) {
+      const hunks = patchHunksFor(entry.patch);
+      if (hunks.length === 0) {
+        throw new Error('patch has no hunks');
+      }
+      const outcome = applyHunks(original, hunks);
+      if (!outcome.ok) {
+        throw new Error(outcome.error);
+      }
+      next = outcome.content;
+    } else {
+      next = entry.content ?? '';
+    }
+    await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, next));
+  }
+
+  private async rollbackFiles(
+    applied: Array<{ absolute: string; relative: string }>,
+    originals: Map<string, string | undefined>,
+  ): Promise<string[]> {
+    const rolledBack: string[] = [];
+    for (const item of [...applied].reverse()) {
+      const original = originals.get(item.absolute);
+      try {
+        if (original === undefined) {
+          if (await this.pathExists(item.absolute)) {
+            await withFileLock(item.absolute, () => this.options.diffManager.applyDeletion(item.absolute));
+          }
+        } else {
+          await withFileLock(item.absolute, () => this.options.diffManager.applyChange(item.absolute, original));
+        }
+        rolledBack.push(item.relative);
+      } catch {}
+    }
+    return rolledBack;
+  }
+
+  private async fixInFile(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const display = String(args.path ?? '');
+    const absolute = await this.resolvePath(args.path, context);
+    const patch = typeof args.patch === 'string' && args.patch.trim() ? args.patch : undefined;
+    const content = typeof args.content === 'string' ? args.content : undefined;
+    if (!patch && content === undefined) {
+      return 'Error: provide patch or content.';
+    }
+    if (patch && content !== undefined) {
+      return 'Error: provide either patch or content, not both.';
+    }
+    if (!(await this.editApproved('fix_in_file', display, context))) {
+      return 'The developer denied this edit. Do not retry it unless asked.';
+    }
+    const before = await this.safeDiagnostics([absolute]);
+    const outcome = await this.applySingleFileChange(absolute, patch, content);
+    if (!outcome.ok) {
+      return `Error: ${outcome.message}`;
+    }
+    const after = await this.safeDiagnostics([absolute]);
+    return `${outcome.message}\n\nDiagnostics before:\n${diagnosticLines(before).join('\n') || '(none)'}\n\nDiagnostics after:\n${
+      diagnosticLines(after).join('\n') || '(none)'
+    }${changeSummary(before, after)}`;
+  }
+
+  private async fixDiagnostic(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const display = String(args.path ?? '');
+    const absolute = await this.resolvePath(args.path, context);
+    const line = clampInt(args.line, 1, Number.MAX_SAFE_INTEGER);
+    if (!line) {
+      return 'Error: line is required (1-based number).';
+    }
+    const patch = typeof args.patch === 'string' && args.patch.trim() ? args.patch : undefined;
+    const content = typeof args.content === 'string' ? args.content : undefined;
+    if (!patch && content === undefined) {
+      return 'Error: provide patch or content for the fix.';
+    }
+    const before = await this.safeDiagnostics([absolute]);
+    const target = closestDiagnostic(before, line, 3);
+    if (!target) {
+      return `No diagnostic found at or near ${display}:${line}.\n${diagnosticLines(before).join('\n') || '(none)'}`;
+    }
+    if (!(await this.editApproved('fix_diagnostic', display, context))) {
+      return 'The developer denied this edit. Do not retry it unless asked.';
+    }
+    const outcome = await this.applySingleFileChange(absolute, patch, content);
+    if (!outcome.ok) {
+      return `Error: ${outcome.message}`;
+    }
+    const after = await this.safeDiagnostics([absolute]);
+    const cleared = !after.some((item) => sameDiagnostic(item, target));
+    const added = after.filter((item) => !before.some((candidate) => sameDiagnostic(candidate, item)));
+    return `${outcome.message}\nTarget diagnostic at ${target.path}:${target.line} ${
+      cleared ? 'cleared' : 'is still present'
+    }.\nNew diagnostics: ${added.length}${
+      added.length > 0 ? `\n${diagnosticLines(added).join('\n')}` : ''
+    }${changeSummary(before, after)}`;
+  }
+
+  private async addImportAndUse(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const display = String(args.path ?? '');
+    const absolute = await this.resolvePath(args.path, context);
+    const symbol = typeof args.symbol === 'string' ? args.symbol.trim() : '';
+    if (!symbol) {
+      return 'Error: symbol is required.';
+    }
+    const content = await this.readTextIfExists(absolute);
+    if (content === undefined) {
+      return `Error: ${display} does not exist.`;
+    }
+    const before = await this.safeDiagnostics([absolute]);
+    if (!(await this.editApproved('add_import_and_use', display, context))) {
+      return 'The developer denied this edit. Do not retry it unless asked.';
+    }
+    const parts: string[] = [];
+    const zeroBased = toZeroBased(args.line, args.character);
+    let importAdded = false;
+    if (zeroBased) {
+      const action = await addImportCodeActionEdit(absolute, args.line, args.character, symbol);
+      if (action.status === 'edit' && action.edit) {
+        importAdded = await applyWorkspaceEdit(action.edit);
+        if (importAdded) {
+          parts.push('Inserted the import with a language-server code action.');
+        } else {
+          parts.push('The language-server code action could not be applied.');
+        }
+      } else if (action.status === 'unavailable' && action.message) {
+        parts.push(action.message);
+      }
+    }
+    if (!importAdded) {
+      const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const alreadyImported = new RegExp(`\\bimport\\b[^\\n]*\\b${escaped}\\b`).test(content);
+      if (alreadyImported) {
+        parts.push(`"${symbol}" is already imported.`);
+      } else {
+        const source = typeof args.source === 'string' ? args.source.trim() : '';
+        if (!source) {
+          return 'Error: no code action inserted the import and no source was provided to insert it textually.';
+        }
+        const statement = buildImportStatement(symbol, source, content);
+        await withFileLock(absolute, () =>
+          this.options.diffManager.applyChange(absolute, insertImport(content, statement)),
+        );
+        importAdded = true;
+        parts.push(`Inserted: ${statement}`);
+      }
+    }
+    const patch = typeof args.patch === 'string' && args.patch.trim() ? args.patch : undefined;
+    const replacement = typeof args.content === 'string' ? args.content : undefined;
+    if (patch || replacement !== undefined) {
+      const outcome = await this.applySingleFileChange(absolute, patch, replacement);
+      if (!outcome.ok) {
+        return `Error: import step finished, but the use-site edit failed — ${outcome.message}`;
+      }
+      parts.push(outcome.message);
+    }
+    const after = await this.safeDiagnostics([absolute]);
+    const added = after.filter((item) => !before.some((candidate) => sameDiagnostic(candidate, item)));
+    return `${parts.join('\n')}\nNew diagnostics: ${added.length}${
+      added.length > 0 ? `\n${diagnosticLines(added).join('\n')}` : ''
+    }`;
+  }
+
+  private async renameSymbol(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const display = String(args.path ?? '');
+    const absolute = await this.resolvePath(args.path, context);
+    const newName = typeof args.newName === 'string' ? args.newName.trim() : '';
+    if (!isWorkspaceIdentifier(newName)) {
+      return 'Error: newName must be a valid identifier.';
+    }
+    const content = await this.readTextIfExists(absolute);
+    if (content === undefined) {
+      return `Error: ${display} does not exist.`;
+    }
+    if (!(await this.editApproved('rename_symbol', display, context))) {
+      return 'The developer denied this edit. Do not retry it unless asked.';
+    }
+    const changed = new Map<string, number>();
+    let warning = '';
+    const outcome = await documentRenameEdit(absolute, args.line, args.character, newName);
+    let applied = false;
+    if (outcome.status === 'edit' && outcome.edit) {
+      applied = await applyWorkspaceEdit(outcome.edit);
+      if (applied) {
+        try {
+          for (const [uri, edits] of outcome.edit.entries()) {
+            const relative = vscode.workspace.asRelativePath(uri);
+            changed.set(relative, (changed.get(relative) ?? 0) + edits.length);
+          }
+        } catch {}
+      } else {
+        warning = 'The language-server rename edit could not be applied; ';
+      }
+    } else if (outcome.message) {
+      warning = `${outcome.message} `;
+    }
+    if (!applied) {
+      const oldName = wordAtPosition(content, args.line, args.character);
+      if (!oldName) {
+        return `Error: no symbol found at ${display}:${args.line}:${args.character}.`;
+      }
+      const candidates = await searchTargets(this.options.root, oldName);
+      let total = 0;
+      for (const candidate of candidates.slice(0, UPDATE_MAX_FILES)) {
+        const text = await this.readTextIfExists(candidate.absolute);
+        if (text === undefined) {
+          continue;
+        }
+        const renamed = renameInContent(text, oldName, newName);
+        if (renamed.count === 0) {
+          continue;
+        }
+        await withFileLock(candidate.absolute, () =>
+          this.options.diffManager.applyChange(candidate.absolute, renamed.content),
+        );
+        changed.set(candidate.path, (changed.get(candidate.path) ?? 0) + renamed.count);
+        total += renamed.count;
+      }
+      if (changed.size === 0) {
+        return `No occurrences of "${oldName}" found to rename.`;
+      }
+      warning = `${warning}Note: a language server rename was unavailable; applied a word-boundary textual rename (${total} occurrence${total === 1 ? '' : 's'}).`;
+    }
+    const files = [...changed.entries()];
+    const lines = files.map(([file, count]) => `- ${file} (${count} edit${count === 1 ? '' : 's'})`);
+    return `Renamed symbol to ${newName}.${warning ? `\n${warning.trim()}` : ''}\nChanged files (${files.length}):\n${lines.join('\n')}`;
+  }
+
+  private async updateRelatedFiles(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const query = typeof args.symbol_or_pattern === 'string' ? args.symbol_or_pattern.trim() : '';
+    if (!query) {
+      return 'Error: symbol_or_pattern is required.';
+    }
+    const template = typeof args.patchTemplate === 'string' ? args.patchTemplate : '';
+    if (!template.trim()) {
+      return 'Error: patchTemplate is required.';
+    }
+    const candidates = await discoverRelatedTargets(query);
+    if (candidates.length === 0) {
+      return `No related files found for "${query}".`;
+    }
+    if (candidates.length > UPDATE_CONFIRM_THRESHOLD && args.confirm !== true) {
+      const listing = candidates.slice(0, 30).map((candidate) => `- ${candidate.path}`).join('\n');
+      const extra = candidates.length > 30 ? `\n... and ${candidates.length - 30} more` : '';
+      return `Found ${candidates.length} candidate files (more than ${UPDATE_CONFIRM_THRESHOLD}). Re-call with confirm: true to apply, or narrow the search.\n${listing}${extra}`;
+    }
+    const selected = candidates.slice(0, UPDATE_MAX_FILES);
+    if (!(await this.editApproved('update_related_files', query, context))) {
+      return 'The developer denied this edit. Do not retry it unless asked.';
+    }
+    const results: string[] = [];
+    const changed: string[] = [];
+    for (const candidate of selected) {
+      const content = await this.readTextIfExists(candidate.absolute);
+      if (content === undefined) {
+        results.push(`- ${candidate.path} skipped: file not found`);
+        continue;
+      }
+      const hunks = patchHunksFor(template);
+      if (hunks.length === 0) {
+        return 'Error: patchTemplate has no hunks.';
+      }
+      const outcome = applyHunks(content, hunks);
+      if (!outcome.ok) {
+        results.push(`- ${candidate.path} failed: ${outcome.error}`);
+        continue;
+      }
+      await withFileLock(candidate.absolute, () =>
+        this.options.diffManager.applyChange(candidate.absolute, outcome.content),
+      );
+      changed.push(candidate.path);
+      results.push(`- ${candidate.path} ok`);
+    }
+    const diagnostics = await this.safeDiagnostics(
+      selected.filter((candidate) => changed.includes(candidate.path)).map((candidate) => candidate.absolute),
+    );
+    const diagnosticText = diagnosticLines(diagnostics).join('\n');
+    const applyNote =
+      candidates.length > selected.length ? `\n(${candidates.length - selected.length} candidates beyond the ${UPDATE_MAX_FILES}-file limit were not applied.)` : '';
+    return `Updated ${changed.length}/${selected.length} files for "${query}":\n${results.join('\n')}${applyNote}${
+      diagnosticText ? `\n\nDiagnostics:\n${diagnosticText}` : '\n\nDiagnostics: none'
+    }`;
+  }
+
+  private async refactorSymbol(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const display = String(args.path ?? '');
+    const absolute = await this.resolvePath(args.path, context);
+    const operation = args.operation === 'extract' || args.operation === 'move' ? args.operation : undefined;
+    if (!operation) {
+      return 'Error: operation must be extract or move.';
+    }
+    const range = parseRefactorRange(args.range);
+    if (!range) {
+      return 'Error: range must provide 1-based startLine, startChar, endLine, endChar.';
+    }
+    const original = await this.readTextIfExists(absolute);
+    if (original === undefined) {
+      return `Error: ${display} does not exist.`;
+    }
+    const eol = original.includes('\r\n') ? '\r\n' : '\n';
+    if (operation === 'extract') {
+      const extracted = typeof args.extractedCode === 'string' ? args.extractedCode.trim() : '';
+      const call = typeof args.callCode === 'string' ? args.callCode : '';
+      if (!extracted) {
+        return 'Error: extract requires extractedCode.';
+      }
+      if (!call.trim()) {
+        return 'Error: extract requires callCode to replace the range.';
+      }
+      if (!(await this.editApproved('refactor_symbol', display, context))) {
+        return 'The developer denied this edit. Do not retry it unless asked.';
+      }
+      const updated = appendSnippet(replaceRange(original, range, call), extracted, eol);
+      await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, updated));
+      const diagnostics = await this.safeDiagnostics([absolute]);
+      return `Extracted ${String(args.name ?? 'symbol')} in ${display}.\nDiagnostics:\n${
+        diagnosticLines(diagnostics).join('\n') || 'none'
+      }`;
+    }
+    const targetPath = typeof args.targetPath === 'string' ? args.targetPath.trim() : '';
+    if (!targetPath) {
+      return 'Error: move requires targetPath.';
+    }
+    const targetAbsolute = await this.resolvePath(targetPath, context);
+    const targetOriginal = await this.readTextIfExists(targetAbsolute);
+    const removed = rangeText(original, range);
+    if (!removed.trim()) {
+      return 'Error: the range does not contain symbol text to move.';
+    }
+    if (!(await this.editApproved('refactor_symbol', `${display} -> ${targetPath}`, context))) {
+      return 'The developer denied this edit. Do not retry it unless asked.';
+    }
+    const header = String(args.targetHeader ?? args.callCode ?? '').trim();
+    const headerAndSymbol = [header, removed.trimEnd()].filter(Boolean).join('\n');
+    const targetContent = targetOriginal
+      ? `${targetOriginal.trimEnd()}\n\n${headerAndSymbol}\n`
+      : `${headerAndSymbol}\n`;
+    const sourceContent = removeRange(original, range);
+    await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, sourceContent));
+    try {
+      await withFileLock(targetAbsolute, () =>
+        this.options.diffManager.applyChange(targetAbsolute, targetContent),
+      );
+    } catch (error) {
+      await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, original));
+      return `Error: move failed at ${targetPath} — ${errorMessage(error)}. The source change was rolled back.`;
+    }
+    const diagnostics = await this.safeDiagnostics([absolute, targetAbsolute]);
+    return `Moved ${String(args.name ?? 'symbol')} from ${display} to ${targetPath}.\nDiagnostics:\n${
+      diagnosticLines(diagnostics).join('\n') || 'none'
+    }`;
+  }
+
+  private async applySingleFileChange(
+    absolute: string,
+    patch: string | undefined,
+    content: string | undefined,
+  ): Promise<{ ok: boolean; message: string }> {
+    if (patch) {
+      const current = await this.readTextIfExists(absolute);
+      if (current === undefined) {
+        return { ok: false, message: `${path.basename(absolute)} does not exist.` };
+      }
+      const hunks = patchHunksFor(patch);
+      if (hunks.length === 0) {
+        return { ok: false, message: 'patch has no hunks.' };
+      }
+      const applied = applyHunks(current, hunks);
+      if (!applied.ok) {
+        return { ok: false, message: applied.error };
+      }
+      const message = await withFileLock(absolute, () =>
+        this.options.diffManager.applyChange(absolute, applied.content),
+      );
+      return { ok: true, message };
+    }
+    if (content === undefined) {
+      return { ok: false, message: 'provide patch or content.' };
+    }
+    const message = await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, content));
+    return { ok: true, message };
+  }
+
+  private async detectVerificationCommand(): Promise<{ script: string; command: string } | undefined> {
+    try {
+      const raw = await fs.readFile(path.join(this.options.root, 'package.json'), 'utf-8');
+      return detectVerifyCommand(raw);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async safeDiagnostics(paths: string[]): Promise<FileDiagnostic[]> {
+    try {
+      return await collectFileDiagnostics(paths);
+    } catch {
+      return [];
+    }
+  }
+
+  private async pathExists(absolute: string): Promise<boolean> {
+    try {
+      await fs.stat(absolute);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async diagnosticsFor(paths: string[]): Promise<string> {
     if (!this.options.checkDiagnostics || paths.length === 0) {
       return '';
@@ -943,6 +1579,49 @@ export class ToolBox {
     const diagnostics = await collectDiagnostics(paths);
     return diagnosticsSection(diagnostics);
   }
+}
+
+function importLines(content: string, max: number): string[] {
+  return content
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .filter((line) =>
+      /^\s*(import\b|from\s+\S+\s+import\b|const\s+[^=]+\s*=\s*require\(|require\()/.test(line),
+    )
+    .slice(0, max)
+    .map((line) => truncateLine(line.trim(), 200));
+}
+
+function capLines(text: string, max: number): string {
+  const lines = text.split('\n');
+  if (lines.length <= max) {
+    return text;
+  }
+  return `${lines.slice(0, max).join('\n')}\n... [${lines.length - max} more lines omitted]`;
+}
+
+function sameDiagnostic(a: FileDiagnostic, b: FileDiagnostic): boolean {
+  return a.path === b.path && a.line === b.line && a.message === b.message;
+}
+
+function closestDiagnostic(items: FileDiagnostic[], line: number, tolerance: number): FileDiagnostic | undefined {
+  let best: FileDiagnostic | undefined;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const item of items) {
+    const distance = Math.abs(item.line - line);
+    if (distance > tolerance || distance >= bestDistance) {
+      continue;
+    }
+    best = item;
+    bestDistance = distance;
+  }
+  return best;
+}
+
+function changeSummary(before: FileDiagnostic[], after: FileDiagnostic[]): string {
+  const resolved = before.filter((item) => !after.some((candidate) => sameDiagnostic(candidate, item)));
+  const added = after.filter((item) => !before.some((candidate) => sameDiagnostic(candidate, item)));
+  return `\n\nSummary: ${resolved.length} resolved, ${added.length} new.`;
 }
 
 const SAFE_COMMANDS = new Set([

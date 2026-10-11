@@ -98,6 +98,7 @@ export const EXECUTOR_SYSTEM_PROMPT = `You are Dev-First in execution mode. The 
 
 ## Rules
 - Work through the plan step by step using tools. Batch related work: multiple tool calls per turn are encouraged, and apply_patch can change several files at once.
+- Prefer compound tools for standard edits and refactors. Use raw tools only when no compound tool fits. Never reproduce a compound workflow manually across several calls.
 - Track progress with todo_write: create the task list from the plan before you start, and update it (full list each time, exactly one task in_progress) as you complete steps.
 - After every edit, the tool result includes language-server diagnostics for the files you touched. If you see errors or warnings caused by your change, fix them before moving on.
 - Use web_search / web_fetch when you need documentation or API details. Use semantic_search to find code by meaning. Use use_skill when a listed skill matches the task.

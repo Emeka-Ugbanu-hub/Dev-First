@@ -262,6 +262,31 @@ describe('mutationTargets', () => {
     expect(mutationTargets('read_file', JSON.stringify({ path: 'a.ts' }))).toEqual([]);
     expect(mutationTargets('write_file', 'not json')).toEqual([]);
   });
+
+  it('covers the compound tools', () => {
+    expect(mutationTargets('fix_in_file', JSON.stringify({ path: 'a.ts', content: 'x' }))).toEqual(['a.ts']);
+    expect(mutationTargets('fix_diagnostic', JSON.stringify({ path: 'a.ts', line: 3 }))).toEqual(['a.ts']);
+    expect(mutationTargets('add_import_and_use', JSON.stringify({ path: 'a.ts', symbol: 'X' }))).toEqual(['a.ts']);
+    expect(
+      mutationTargets('rename_symbol', JSON.stringify({ path: 'a.ts', line: 1, character: 1, newName: 'b' })),
+    ).toEqual(['a.ts']);
+    const changes = JSON.stringify({
+      changes: [
+        { path: 'a.ts', action: 'edit', content: 'x' },
+        { path: 'b.ts', action: 'delete' },
+        { path: 'c.ts', action: 'create', content: 'y' },
+        { bad: true },
+      ],
+    });
+    expect(mutationTargets('apply_change_set', changes)).toEqual(['a.ts', 'b.ts', 'c.ts']);
+    expect(
+      mutationTargets('refactor_symbol', JSON.stringify({ path: 'a.ts', targetPath: 'b.ts', operation: 'move' })),
+    ).toEqual(['a.ts', 'b.ts']);
+    expect(mutationTargets('update_related_files', JSON.stringify({ symbol_or_pattern: 'X' }))).toEqual([]);
+    expect(mutationTargets('inspect_file_context', JSON.stringify({ path: 'a.ts' }))).toEqual([]);
+    expect(mutationTargets('verify_change', JSON.stringify({ paths: ['a.ts'] }))).toEqual([]);
+    expect(mutationTargets('investigate_issue', JSON.stringify({ path: 'a.ts' }))).toEqual([]);
+  });
 });
 
 describe('operationAfterHash', () => {

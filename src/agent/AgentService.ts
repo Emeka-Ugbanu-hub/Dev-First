@@ -461,6 +461,38 @@ function mutationPaths(call: ToolCall, result: string): string[] {
     const matches = patch.match(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$/gm) ?? [];
     return matches.map((line) => line.replace(/^\*\*\* (?:Add|Update|Delete) File:\s*/, '').trim());
   }
+  if (call.name === 'apply_change_set') {
+    const changes = toolCallArgs(call).changes;
+    if (!Array.isArray(changes)) {
+      return [];
+    }
+    const paths: string[] = [];
+    for (const entry of changes) {
+      if (entry && typeof entry === 'object' && typeof (entry as { path?: unknown }).path === 'string') {
+        paths.push(String((entry as { path: string }).path));
+      }
+    }
+    return paths;
+  }
+  if (
+    call.name === 'fix_in_file' ||
+    call.name === 'fix_diagnostic' ||
+    call.name === 'add_import_and_use' ||
+    call.name === 'rename_symbol'
+  ) {
+    const path = String(toolCallArgs(call).path ?? '');
+    return path ? [path] : [];
+  }
+  if (call.name === 'refactor_symbol') {
+    const args = toolCallArgs(call);
+    const paths: string[] = [];
+    for (const key of ['path', 'targetPath'] as const) {
+      if (typeof args[key] === 'string' && args[key]) {
+        paths.push(String(args[key]));
+      }
+    }
+    return paths;
+  }
   return [];
 }
 

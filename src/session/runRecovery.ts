@@ -227,6 +227,38 @@ export function mutationTargets(tool: string, argsJson: string): string[] {
     const patch = typeof args.patch === 'string' ? args.patch : '';
     return parsePatch(patch).map((entry) => entry.path);
   }
+  if (tool === 'apply_change_set') {
+    const changes = Array.isArray(args.changes) ? args.changes : [];
+    const paths: string[] = [];
+    for (const entry of changes) {
+      if (!entry || typeof entry !== 'object') {
+        continue;
+      }
+      const target = (entry as { path?: unknown }).path;
+      if (typeof target === 'string' && target.trim()) {
+        paths.push(target.trim());
+      }
+    }
+    return paths;
+  }
+  if (tool === 'refactor_symbol') {
+    const paths: string[] = [];
+    for (const key of ['path', 'targetPath'] as const) {
+      const value = args[key];
+      if (typeof value === 'string' && value.trim()) {
+        paths.push(value.trim());
+      }
+    }
+    return paths;
+  }
+  if (
+    tool === 'fix_in_file' ||
+    tool === 'fix_diagnostic' ||
+    tool === 'add_import_and_use' ||
+    tool === 'rename_symbol'
+  ) {
+    return typeof args.path === 'string' && args.path.trim() ? [args.path.trim()] : [];
+  }
   return [];
 }
 

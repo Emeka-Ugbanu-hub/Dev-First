@@ -100,6 +100,8 @@ import { BackgroundProcesses } from '../agent/BackgroundProcesses';
 import { OriginalContentProvider } from '../diff/OriginalContentProvider';
 import { listWorkspaceFiles } from '../util/fsWalk';
 import { ActivityMeta, executionTools, plannerTools, subagentTools } from '../agent/tools';
+import { attachToolPreflights } from '../agent/compoundPreflight';
+import type { ToolPreflight } from '../agent/compoundPreflight';
 import { ApprovalMemory, ExternalDirectoryConsent } from '../agent/approvals';
 import { runSubagent } from '../agent/subagent';
 import { SemanticIndex } from '../indexing/SemanticIndex';
@@ -287,6 +289,7 @@ export class SessionController {
   private recoveryRun: RunRecord | undefined;
   private recoveryDrift = false;
   private stepHashChain: Promise<void> = Promise.resolve();
+  private readonly toolPreflights = new Map<string, ToolPreflight>();
   private runningQueued: { id: string; text: string; createdAt: number } | undefined;
   private disposed = false;
 
@@ -2420,9 +2423,18 @@ export class SessionController {
     await this.mcp.ensureLoaded(root);
     const mcpTools = this.mcp.tools();
     const reasoningSwitch = this.reasoningSwitchEnabled();
+    const executor = attachToolPreflights(
+      executionTools({ skills: skillNames, semanticSearch, memory, mcpTools, reasoningSwitch, task: true }),
+    );
+    this.toolPreflights.clear();
+    for (const definition of executor) {
+      if (definition.preflight) {
+        this.toolPreflights.set(definition.name, definition.preflight);
+      }
+    }
     return {
       planner: plannerTools({ skills: skillNames, semanticSearch, memory }),
-      executor: executionTools({ skills: skillNames, semanticSearch, memory, mcpTools, reasoningSwitch, task: true }),
+      executor,
     };
   }
 
@@ -2523,7 +2535,30 @@ export class SessionController {
       ...(allowTask ? { runTask: (request, signal) => this.runTask(request, signal) } : {}),
       approvalMemory: this.approvalMemory,
       externalDirectories: this.externalDirectories,
+      recentRunOperations: (filePath) => this.recentRunOperations(filePath),
     });
+  }
+
+  private recentRunOperations(filePath: string): string[] {
+    const run = this.currentRun;
+    if (!run) {
+      return [];
+    }
+    const lines: string[] = [];
+    for (let index = run.operations.length - 1; index >= 0 && lines.length < 5; index--) {
+      const operation = run.operations[index];
+      const targets = new Set<string>();
+      if (operation.target) {
+        targets.add(operation.target);
+      }
+      for (const expectation of parseOperationExpectations(operation)) {
+        targets.add(expectation.path);
+      }
+      if (targets.has(filePath)) {
+        lines.push(`${operation.tool} — ${operation.status}${operation.finishedAt ? '' : ' (in progress)'}`);
+      }
+    }
+    return lines;
   }
 
   private async runTask(
@@ -3284,6 +3319,15 @@ export class SessionController {
 
   private async captureRunTargets(run: RunRecord, tool: string, argsJson: string, root: string): Promise<void> {
     const targets = mutationTargets(tool, argsJson);
+    const preflight = this.toolPreflights.get(tool);
+    if (preflight) {
+      try {
+        const parsed = JSON.parse(argsJson) as Record<string, any>;
+        if (parsed && typeof parsed === 'object') {
+          targets.push(...(await preflight(parsed)));
+        }
+      } catch {}
+    }
     if (targets.length === 0) {
       return;
     }

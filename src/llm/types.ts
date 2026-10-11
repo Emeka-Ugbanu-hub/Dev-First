@@ -8,6 +8,7 @@ export interface ToolDef {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+  preflight?: (args: Record<string, any>) => Promise<string[]>;
 }
 
 export interface ChatMessage {
