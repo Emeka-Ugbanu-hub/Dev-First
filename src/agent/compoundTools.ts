@@ -1,6 +1,7 @@
 import * as path from 'path';
 import { ToolDef } from '../llm/types';
 import { PatchHunk, parsePatch } from './patch';
+import { nodeCandidates, selectProjectCommand } from './projectCommands';
 
 export const MAX_CHANGE_SET_FILES = 50;
 export const UPDATE_CONFIRM_THRESHOLD = 10;
@@ -77,26 +78,16 @@ export function validateChangeSet(args: Record<string, any>): ChangeSetValidatio
 }
 
 export function detectVerifyCommand(packageJsonText: string): { script: string; command: string } | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(packageJsonText);
-  } catch {
+  const candidates = nodeCandidates(packageJsonText, 'npm').filter((candidate) => candidate.kind !== 'lint');
+  const selected = selectProjectCommand(candidates).selected;
+  if (!selected) {
     return undefined;
   }
-  if (!parsed || typeof parsed !== 'object') {
-    return undefined;
-  }
-  const scripts = (parsed as { scripts?: unknown }).scripts;
-  if (!scripts || typeof scripts !== 'object') {
-    return undefined;
-  }
-  const table = scripts as Record<string, unknown>;
-  for (const name of ['typecheck', 'test', 'build']) {
-    if (typeof table[name] === 'string' && table[name].trim()) {
-      return { script: name, command: `npm run ${name}` };
-    }
-  }
-  return undefined;
+  const prefix = 'npm run ';
+  return {
+    script: selected.command.startsWith(prefix) ? selected.command.slice(prefix.length) : selected.command,
+    command: selected.command,
+  };
 }
 
 export function parseHunks(text: string): PatchHunk[] {
@@ -182,6 +173,75 @@ export function renameInContent(content: string, name: string, newName: string):
   const regex = new RegExp(`\\b${escaped}\\b`, 'g');
   const count = content.match(regex)?.length ?? 0;
   return { content: content.replace(regex, newName), count };
+}
+
+export function textualRenameHazards(content: string, name: string): string[] {
+  const reasons = new Set<string>();
+  const normalized = content.replace(/\r\n/g, '\n');
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const word = new RegExp(`\\b${escaped}\\b`);
+  const stringLiteral = /(['"`])(?:\\.|(?!\1).)*\1/g;
+  let inBlockComment = false;
+  for (const line of normalized.split('\n')) {
+    let code = line;
+    let comment = '';
+    if (inBlockComment) {
+      const end = code.indexOf('*/');
+      if (end === -1) {
+        comment = code;
+        code = '';
+      } else {
+        comment = code.slice(0, end + 2);
+        code = code.slice(end + 2);
+        inBlockComment = false;
+      }
+    }
+    if (code && /^\s*#/.test(code)) {
+      comment += code;
+      code = '';
+    }
+    if (code) {
+      const blockStart = code.indexOf('/*');
+      const slash = code.indexOf('//');
+      if (blockStart >= 0 && (slash < 0 || blockStart < slash)) {
+        const blockEnd = code.indexOf('*/', blockStart + 2);
+        if (blockEnd === -1) {
+          inBlockComment = true;
+          comment += code.slice(blockStart);
+          code = code.slice(0, blockStart);
+        } else {
+          comment += code.slice(blockStart, blockEnd + 2);
+          code = `${code.slice(0, blockStart)}${code.slice(blockEnd + 2)}`;
+        }
+      } else if (slash >= 0) {
+        comment += code.slice(slash);
+        code = code.slice(0, slash);
+      }
+    }
+    if (comment && word.test(comment)) {
+      reasons.add('identifier appears in a comment');
+    }
+    if (!code) {
+      continue;
+    }
+    stringLiteral.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = stringLiteral.exec(code)) !== null) {
+      if (word.test(match[0])) {
+        reasons.add('identifier appears in a string literal');
+      }
+    }
+  }
+  return [...reasons];
+}
+
+export function declarationCandidateCount(content: string, name: string): number {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regex = new RegExp(
+    `^\\s*(?:export\\s+)?(?:declare\\s+)?(?:const|let|var|function|class|interface|type|enum|def|func|struct|trait|impl)\\s+${escaped}\\b`,
+    'gm',
+  );
+  return (content.match(regex) ?? []).length;
 }
 
 export function buildImportStatement(symbol: string, source: string, existingContent: string): string {
@@ -377,7 +437,7 @@ export function verifyChangeTools(): { planner: ToolDef; executor: ToolDef } {
           type: 'string',
           enum: ['diagnostics', 'auto'],
           description:
-            "diagnostics checks language-server diagnostics only; auto (default) also runs the package.json verification script, preferring typecheck, then test, then build.",
+            "diagnostics checks language-server diagnostics only; auto (default) also runs the resolved project command from settings or manifests (package.json, Cargo.toml, go.mod, pyproject.toml, requirements.txt), preferring typecheck, then test, then lint, then build.",
         },
       },
       required: ['paths'],
@@ -480,6 +540,11 @@ export const addImportAndUseTool: ToolDef = {
       content: { type: 'string', description: 'Full replacement contents for the use site (alternative to patch).' },
       line: { type: 'number', description: '1-based line of the use site, for a language-server code action (optional).' },
       character: { type: 'number', description: '1-based column of the use site (optional).' },
+      allowTextual: {
+        type: 'boolean',
+        description:
+          'Allow textual import insertion when no language server code action is available. The result is partial verification. Default false.',
+      },
       allowGenerated: {
         type: 'boolean',
         description: 'Allow editing generated or read-only files (dist, out, build, lockfiles, *.min.*, *.generated.*). Default false.',
@@ -508,6 +573,11 @@ export const renameSymbolTool: ToolDef = {
         type: 'array',
         description: 'Additional workspace-relative paths to check diagnostics on after the rename.',
         items: { type: 'string' },
+      },
+      allowTextual: {
+        type: 'boolean',
+        description:
+          'Allow a word-boundary textual rename when no language server rename is available. The result is partial verification. Default false.',
       },
       allowGenerated: {
         type: 'boolean',

@@ -52,6 +52,10 @@ export interface DevFirstConfig {
   scanAiModel: string;
   architecture: boolean;
   pasteFileLines: number;
+  typecheckCommand: string;
+  testCommand: string;
+  lintCommand: string;
+  buildCommand: string;
 }
 
 const DEFAULT_SCAN_IGNORE =
@@ -107,6 +111,10 @@ export function getConfig(): DevFirstConfig {
     scanAiModel: config.get<string>('scanAiModel', ''),
     architecture: config.get<boolean>('architecture', true),
     pasteFileLines: Math.max(20, config.get<number>('pasteFileLines', 120)),
+    typecheckCommand: config.get<string>('typecheckCommand', '').trim(),
+    testCommand: config.get<string>('testCommand', '').trim(),
+    lintCommand: config.get<string>('lintCommand', '').trim(),
+    buildCommand: config.get<string>('buildCommand', '').trim(),
   };
 }
 

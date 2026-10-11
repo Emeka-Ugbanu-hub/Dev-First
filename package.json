@@ -412,6 +412,26 @@
           "default": true,
           "description": "After each edit, feed language-server errors and warnings for the touched files back to the agent."
         },
+        "devFirst.typecheckCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Command verify_change runs to typecheck. Empty auto-detects from package.json, Cargo.toml, go.mod, pyproject.toml, requirements.txt, and lockfiles."
+        },
+        "devFirst.testCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Command verify_change runs to test. Empty auto-detects from package.json, Cargo.toml, go.mod, pyproject.toml, requirements.txt, and lockfiles."
+        },
+        "devFirst.lintCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Command verify_change runs to lint. Empty auto-detects from package.json, Cargo.toml, go.mod, pyproject.toml, requirements.txt, and lockfiles."
+        },
+        "devFirst.buildCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Command verify_change runs to build. Empty auto-detects from package.json, Cargo.toml, go.mod, pyproject.toml, requirements.txt, and lockfiles."
+        },
         "devFirst.autoCompact": {
           "type": "boolean",
           "default": true,

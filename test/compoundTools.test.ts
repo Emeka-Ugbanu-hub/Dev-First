@@ -6,6 +6,7 @@ import * as path from 'path';
 
 const env = vi.hoisted(() => ({
   workspace: '',
+  configValues: {} as Record<string, unknown>,
   getDiagnostics: (_uri: unknown): any[] => [],
   executeCommand: async (_command: string, ..._args: unknown[]): Promise<any> => undefined,
   applyEdit: async (_edit: unknown): Promise<boolean> => true,
@@ -14,6 +15,19 @@ const env = vi.hoisted(() => ({
     'vscode.executeCodeActionProvider',
     'vscode.executeReferenceProvider',
   ],
+}));
+
+const terminal = vi.hoisted(() => ({
+  calls: [] as string[],
+  exitCode: 0,
+  output: 'ok',
+}));
+
+vi.mock('../src/agent/terminal', () => ({
+  runTerminalCommand: async (command: string) => {
+    terminal.calls.push(command);
+    return { exitCode: terminal.exitCode, output: terminal.output };
+  },
 }));
 
 vi.mock('vscode', () => {
@@ -31,7 +45,7 @@ vi.mock('vscode', () => {
         return env.workspace ? [{ uri: uri(env.workspace) }] : [];
       },
       getConfiguration: () => ({
-        get: (_key: string, fallback: unknown) => fallback,
+        get: (key: string, fallback: unknown) => (key in env.configValues ? env.configValues[key] : fallback),
         update: async () => undefined,
       }),
       openTextDocument: async () => undefined,
@@ -103,10 +117,12 @@ vi.mock('vscode', () => {
 
 import { ToolBox } from '../src/agent/ToolBox';
 import {
+  declarationCandidateCount,
   detectVerifyCommand,
   isWorkspaceRelativePath,
   parseHunks,
   patchHunksFor,
+  textualRenameHazards,
   validateChangeSet,
 } from '../src/agent/compoundTools';
 import { attachToolPreflights, preflightRenameSymbol } from '../src/agent/compoundPreflight';
@@ -136,9 +152,13 @@ const context = { requestTerminalApproval: async () => 'allow' as const };
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'dev-first-compound-'));
   env.workspace = root;
+  env.configValues = {};
   env.getDiagnostics = () => [];
   env.executeCommand = async () => undefined;
   env.applyEdit = async () => true;
+  terminal.calls = [];
+  terminal.exitCode = 0;
+  terminal.output = 'ok';
   applyChange = vi.fn(async (file: string, content: string) => {
     await fs.writeFile(file, content, 'utf-8');
     return `Applied changes to ${path.basename(file)}.`;
@@ -242,6 +262,23 @@ describe('hunk parsing', () => {
     ]);
     const patch = ['*** Begin Patch', '*** Update File: a.ts', '@@', '-old', '+new', '*** End Patch'].join('\n');
     expect(patchHunksFor(patch)).toEqual([{ lines: ['-old', '+new'] }]);
+  });
+});
+
+describe('textual rename analysis', () => {
+  it('flags identifier occurrences in strings and comments', () => {
+    expect(textualRenameHazards('const value = 1;\n', 'value')).toEqual([]);
+    expect(textualRenameHazards("const label = 'value';\n", 'value')).toContain('identifier appears in a string literal');
+    expect(textualRenameHazards('// value\nconst value = 1;\n', 'value')).toContain('identifier appears in a comment');
+    expect(textualRenameHazards('const value = 1; // value\n', 'value')).toContain('identifier appears in a comment');
+    expect(textualRenameHazards('/* value */\nconst value = 1;\n', 'value')).toContain('identifier appears in a comment');
+    expect(textualRenameHazards('# value\nvalue = 1\n', 'value')).toContain('identifier appears in a comment');
+  });
+
+  it('counts declaration candidates', () => {
+    expect(declarationCandidateCount('const value = 1;\n', 'value')).toBe(1);
+    expect(declarationCandidateCount('export const value = 1;\nfunction value() {\n}\n', 'value')).toBe(2);
+    expect(declarationCandidateCount('return value;\n', 'value')).toBe(0);
   });
 });
 
@@ -482,7 +519,7 @@ describe('fix_in_file', () => {
 });
 
 describe('add_import_and_use', () => {
-  it('falls back to textual import insertion when no code action exists', async () => {
+  it('falls back to textual import insertion with allowTextual and marks it partial', async () => {
     await fs.writeFile(path.join(root, 'use.ts'), 'const result = value;\n', 'utf-8');
     env.executeCommand = async (command: string) => {
       if (command === 'vscode.executeCodeActionProvider') {
@@ -496,6 +533,7 @@ describe('add_import_and_use', () => {
         path: 'use.ts',
         symbol: 'value',
         source: './values',
+        allowTextual: true,
         patch: '@@\n-const result = value;\n+const result = value();',
       }),
       context,
@@ -503,14 +541,36 @@ describe('add_import_and_use', () => {
     const parsed = JSON.parse(result);
     expect(parsed.status).toBe('verified');
     expect(JSON.stringify(parsed.evidence)).toContain("Inserted: import { value } from './values';");
+    expect(parsed.verification.level).toBe('partial');
+    expect(parsed.verification.checks).toContain('textual');
     const content = await fs.readFile(path.join(root, 'use.ts'), 'utf-8');
     expect(content.startsWith("import { value } from './values';\n")).toBe(true);
     expect(content).toContain('const result = value();');
   });
+
+  it('requires allowTextual before inserting an import textually', async () => {
+    await fs.writeFile(path.join(root, 'use.ts'), 'const result = value;\n', 'utf-8');
+    env.executeCommand = async (command: string) => {
+      if (command === 'vscode.executeCodeActionProvider') {
+        return [];
+      }
+      return undefined;
+    };
+    const result = await toolbox().execute(
+      'add_import_and_use',
+      JSON.stringify({ path: 'use.ts', symbol: 'value', source: './values' }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('needs_input');
+    expect(parsed.message).toContain('No language server is available; re-call with allowTextual: true');
+    expect(await fs.readFile(path.join(root, 'use.ts'), 'utf-8')).toBe('const result = value;\n');
+    expect(applyChange).not.toHaveBeenCalled();
+  });
 });
 
 describe('rename_symbol', () => {
-  it('falls back to a word-boundary textual rename with a warning', async () => {
+  it('falls back to a word-boundary textual rename with allowTextual and marks it partial', async () => {
     const target = path.join(root, 'greet.ts');
     await fs.writeFile(target, 'const value = 1;\nreturn value;\n', 'utf-8');
     env.executeCommand = async (command: string) => {
@@ -521,27 +581,79 @@ describe('rename_symbol', () => {
     };
     const result = await toolbox().execute(
       'rename_symbol',
-      JSON.stringify({ path: 'greet.ts', line: 1, character: 7, newName: 'count' }),
+      JSON.stringify({ path: 'greet.ts', line: 1, character: 7, newName: 'count', allowTextual: true }),
       context,
     );
     const parsed = JSON.parse(result);
     expect(parsed.status).toBe('verified');
     expect(parsed.message).toContain('Renamed symbol to count.');
     expect(parsed.message).toContain('language server rename was unavailable');
+    expect(parsed.verification.level).toBe('partial');
+    expect(parsed.verification.checks).toContain('textual');
     const content = await fs.readFile(target, 'utf-8');
     expect(content).toBe('const count = 1;\nreturn count;\n');
+  });
+
+  it('requires allowTextual before falling back to a textual rename', async () => {
+    const target = path.join(root, 'greet.ts');
+    await fs.writeFile(target, 'const value = 1;\nreturn value;\n', 'utf-8');
+    env.executeCommand = async () => undefined;
+    const result = await toolbox().execute(
+      'rename_symbol',
+      JSON.stringify({ path: 'greet.ts', line: 1, character: 7, newName: 'count' }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('needs_input');
+    expect(parsed.message).toContain('No language server is available; re-call with allowTextual: true');
+    expect(await fs.readFile(target, 'utf-8')).toBe('const value = 1;\nreturn value;\n');
+  });
+
+  it('refuses a textual rename when the identifier appears in a string literal', async () => {
+    const target = path.join(root, 'greet.ts');
+    await fs.writeFile(target, "const value = 1;\nconst label = 'value';\n", 'utf-8');
+    env.executeCommand = async () => undefined;
+    const result = await toolbox().execute(
+      'rename_symbol',
+      JSON.stringify({ path: 'greet.ts', line: 1, character: 7, newName: 'count', allowTextual: true }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('needs_input');
+    expect(parsed.message).toContain('ambiguous');
+    expect(parsed.message).toContain('string literal');
+    expect(await fs.readFile(target, 'utf-8')).toBe("const value = 1;\nconst label = 'value';\n");
+    expect(applyChange).not.toHaveBeenCalled();
+  });
+
+  it('refuses a textual rename with multiple declaration candidates', async () => {
+    await fs.writeFile(path.join(root, 'a.ts'), 'export const value = 1;\n', 'utf-8');
+    await fs.writeFile(path.join(root, 'b.ts'), 'const value = 2;\n', 'utf-8');
+    const result = await toolbox().execute(
+      'rename_symbol',
+      JSON.stringify({ instruction: 'rename value to total', allowTextual: true }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('needs_input');
+    expect(parsed.message).toContain('multiple declaration candidates');
+    expect(await fs.readFile(path.join(root, 'a.ts'), 'utf-8')).toBe('export const value = 1;\n');
+    expect(await fs.readFile(path.join(root, 'b.ts'), 'utf-8')).toBe('const value = 2;\n');
+    expect(applyChange).not.toHaveBeenCalled();
   });
 
   it('accepts a deterministic rename instruction without a position', async () => {
     await fs.writeFile(path.join(root, 'a.ts'), 'export const value = 1;\n', 'utf-8');
     const result = await toolbox().execute(
       'rename_symbol',
-      JSON.stringify({ instruction: 'rename value to total' }),
+      JSON.stringify({ instruction: 'rename value to total', allowTextual: true }),
       context,
     );
     const parsed = JSON.parse(result);
     expect(parsed.status).toBe('verified');
     expect(parsed.files).toContain('a.ts');
+    expect(parsed.verification.level).toBe('partial');
+    expect(parsed.verification.checks).toContain('textual');
     expect(await fs.readFile(path.join(root, 'a.ts'), 'utf-8')).toBe('export const total = 1;\n');
   });
 });
@@ -700,6 +812,84 @@ describe('verify_change', () => {
     expect(parsed.verification.level).toBe('partial');
     expect(parsed.verification.checks).toContain('diagnostics');
     expect(parsed.message).not.toContain('npm run typecheck');
+  });
+
+  it('runs the resolved command and reports the kind, command, and source', async () => {
+    await fs.writeFile(path.join(root, 'a.ts'), 'const a = 1;\n', 'utf-8');
+    await fs.writeFile(
+      path.join(root, 'package.json'),
+      JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' } }),
+      'utf-8',
+    );
+    const result = await toolbox().execute('verify_change', JSON.stringify({ paths: ['a.ts'], mode: 'auto' }), context);
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.verification.level).toBe('full');
+    expect(parsed.verification.checks).toContain('typecheck:npm run typecheck');
+    expect(parsed.message).toContain('Verified with typecheck: npm run typecheck');
+    expect(JSON.stringify(parsed.evidence)).toContain('manifest');
+    expect(terminal.calls).toEqual(['npm run typecheck']);
+  });
+
+  it('uses a configured command over a detected one', async () => {
+    await fs.writeFile(path.join(root, 'a.ts'), 'const a = 1;\n', 'utf-8');
+    await fs.writeFile(
+      path.join(root, 'package.json'),
+      JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' } }),
+      'utf-8',
+    );
+    env.configValues = { typecheckCommand: 'custom-check' };
+    const result = await toolbox().execute('verify_change', JSON.stringify({ paths: ['a.ts'], mode: 'auto' }), context);
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.verification.checks).toContain('typecheck:custom-check');
+    expect(terminal.calls).toEqual(['custom-check']);
+  });
+
+  it('asks the developer to configure a command when none is detected', async () => {
+    await fs.writeFile(path.join(root, 'a.ts'), 'const a = 1;\n', 'utf-8');
+    const result = await toolbox().execute('verify_change', JSON.stringify({ paths: ['a.ts'], mode: 'auto' }), context);
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('needs_input');
+    expect(parsed.verification.level).toBe('partial');
+    expect(parsed.verification.checks).toContain('diagnostics');
+    expect(parsed.message).toContain('devFirst.typecheckCommand');
+    expect(terminal.calls).toEqual([]);
+  });
+
+  it('asks the developer to pick a command when candidates are ambiguous', async () => {
+    await fs.writeFile(path.join(root, 'a.ts'), 'const a = 1;\n', 'utf-8');
+    await fs.writeFile(
+      path.join(root, 'package.json'),
+      JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' } }),
+      'utf-8',
+    );
+    await fs.writeFile(path.join(root, 'Cargo.toml'), '[package]\nname = "x"\n', 'utf-8');
+    const result = await toolbox().execute('verify_change', JSON.stringify({ paths: ['a.ts'], mode: 'auto' }), context);
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('needs_input');
+    expect(parsed.verification.level).toBe('partial');
+    expect(parsed.message).toContain('npm run typecheck');
+    expect(parsed.message).toContain('cargo check');
+    expect(parsed.message).toContain('devFirst.typecheckCommand');
+    expect(terminal.calls).toEqual([]);
+  });
+
+  it('reports a failed check when the command exits non-zero', async () => {
+    await fs.writeFile(path.join(root, 'a.ts'), 'const a = 1;\n', 'utf-8');
+    await fs.writeFile(
+      path.join(root, 'package.json'),
+      JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' } }),
+      'utf-8',
+    );
+    terminal.exitCode = 2;
+    terminal.output = 'error TS1005';
+    const result = await toolbox().execute('verify_change', JSON.stringify({ paths: ['a.ts'], mode: 'auto' }), context);
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('failed');
+    expect(parsed.verification.level).toBe('none');
+    expect(parsed.verification.checks).toContain('typecheck:npm run typecheck');
+    expect(parsed.message).toContain('npm run typecheck failed');
   });
 });
 

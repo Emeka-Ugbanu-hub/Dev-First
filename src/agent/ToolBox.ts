@@ -77,7 +77,7 @@ import {
   appendSnippet,
   boundedInvestigationTool,
   buildImportStatement,
-  detectVerifyCommand,
+  declarationCandidateCount,
   insertImport,
   isWorkspaceIdentifier,
   mutatingCompoundTools,
@@ -90,6 +90,7 @@ import {
   replaceRange,
   symbolAtLine,
   symbolNameFromEntry,
+  textualRenameHazards,
   validateChangeSet,
   wordAtPosition,
 } from './compoundTools';
@@ -140,6 +141,8 @@ import { SemanticIndex } from '../indexing/SemanticIndex';
 import { McpManager } from '../mcp/McpManager';
 import { BrowserSession } from '../browser/BrowserSession';
 import { SandboxMode } from './sandbox';
+import { describeCandidate, resolveProjectCommands } from './projectCommands';
+import { getConfig } from '../config';
 import { QuestionItem, QuestionRequest, TerminalApprovalDecision, TodoItem } from '../shared/protocol';
 import { randomId } from '../util/id';
 import { sha1Of } from '../util/atomicWrite';
@@ -1290,10 +1293,17 @@ export class ToolBox {
       });
     }
     if (mode === 'auto') {
-      const detection = await this.detectVerificationCommand();
-      if (!detection) {
+      const config = getConfig();
+      const resolution = await resolveProjectCommands(this.options.root, {
+        typecheck: config.typecheckCommand,
+        test: config.testCommand,
+        lint: config.lintCommand,
+        build: config.buildCommand,
+      });
+      if (resolution.ambiguous) {
+        const listing = resolution.candidates.map((candidate) => `- ${describeCandidate(candidate)}`).join('\n');
         return this.needsInput(
-          'No verification script was found in package.json (looked for typecheck, test, build); no check ran.',
+          `Multiple verification candidates were found:\n${listing}\nSet devFirst.typecheckCommand, devFirst.testCommand, devFirst.lintCommand, or devFirst.buildCommand to choose one; no check ran.`,
           {
             files,
             diagnostics: compoundDiagnostics(diagnostics),
@@ -1302,7 +1312,20 @@ export class ToolBox {
           },
         );
       }
-      const outcome = await this.runCommand({ command: detection.command }, context);
+      const selected = resolution.selected;
+      if (!selected) {
+        return this.needsInput(
+          'No verification command was found from settings, project manifests, or lockfiles; no check ran. Set devFirst.typecheckCommand, devFirst.testCommand, devFirst.lintCommand, or devFirst.buildCommand to define one.',
+          {
+            files,
+            diagnostics: compoundDiagnostics(diagnostics),
+            evidence: [this.diagnosticsEvidence(diagnostics)],
+            verification: { level: 'partial', checks: ['diagnostics'] },
+          },
+        );
+      }
+      const check = `${selected.kind}:${selected.command}`;
+      const outcome = await this.runCommand({ command: selected.command }, context);
       const passed = /^Exit code: 0\b/m.test(outcome.text);
       if (passed) {
         return compoundResult({
@@ -1311,20 +1334,21 @@ export class ToolBox {
           diagnostics: compoundDiagnostics(diagnostics),
           evidence: [
             this.diagnosticsEvidence(diagnostics),
-            { kind: 'command', summary: `${detection.command} — passed` },
+            { kind: 'command', summary: `${selected.kind} ${selected.command} (${selected.source}: ${selected.reason}) — passed` },
           ],
-          verification: { level: 'full', checks: ['diagnostics', detection.script] },
+          message: `Verified with ${selected.kind}: ${selected.command} (${selected.source}: ${selected.reason}).`,
+          verification: { level: 'full', checks: ['diagnostics', check] },
           rollbackAvailable: false,
         });
       }
-      return this.failed(`${detection.command} failed.`, {
+      return this.failed(`${selected.command} failed.`, {
         files,
         diagnostics: compoundDiagnostics(diagnostics),
         evidence: [
           this.diagnosticsEvidence(diagnostics),
           { kind: 'command', summary: capLines(outcome.text, 30) },
         ],
-        verification: { level: 'none', checks: ['diagnostics', detection.script] },
+        verification: { level: 'none', checks: ['diagnostics', check] },
       });
     }
     if (diagnostics.length === 0) {
@@ -2054,6 +2078,7 @@ export class ToolBox {
     const notes: string[] = [];
     let previousText = read.text;
     let importAdded = false;
+    let textualImport = false;
     const zeroBased = toZeroBased(args.line, args.character);
     if (zeroBased) {
       const action = await addImportCodeActionEdit(target.absolute, args.line, args.character, symbol);
@@ -2074,6 +2099,12 @@ export class ToolBox {
       if (alreadyImported) {
         notes.push(`"${symbol}" is already imported.`);
       } else {
+        if (args.allowTextual !== true) {
+          return this.needsInput(
+            'No language server is available; re-call with allowTextual: true to add the import textually (partial verification).',
+            { files: [target.relative] },
+          );
+        }
         const source = typeof args.source === 'string' ? args.source.trim() : '';
         if (!source) {
           return this.needsInput(
@@ -2092,6 +2123,7 @@ export class ToolBox {
         }
         previousText = next;
         importAdded = true;
+        textualImport = true;
         notes.push(`Inserted: ${statement}`);
       }
     }
@@ -2130,6 +2162,7 @@ export class ToolBox {
       ...notes.map((summary) => ({ kind: 'change', summary, file: target.relative })),
       this.diagnosticsEvidence(after),
     ];
+    const checks = textualImport ? ['textual', 'stale-guard', 'diagnostics'] : ['stale-guard', 'diagnostics'];
     if (addedErrors.length > 0) {
       return this.needsInput(
         `Import step finished, but ${addedErrors.length} new error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
@@ -2138,7 +2171,7 @@ export class ToolBox {
           diff,
           diagnostics: compoundDiagnostics(after),
           evidence,
-          verification: { level: 'partial', checks: ['stale-guard', 'diagnostics'] },
+          verification: { level: 'partial', checks },
           rollbackAvailable: true,
         },
       );
@@ -2149,7 +2182,7 @@ export class ToolBox {
       diff,
       diagnostics: compoundDiagnostics(after),
       evidence,
-      verification: { level: 'full', checks: ['stale-guard', 'diagnostics'] },
+      verification: { level: textualImport ? 'partial' : 'full', checks },
       rollbackAvailable: true,
     });
   }
@@ -2157,6 +2190,7 @@ export class ToolBox {
   private async renameSymbol(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     const display = String(args.path ?? '');
     const allowGenerated = Boolean(args.allowGenerated);
+    const allowTextual = args.allowTextual === true;
     const hasInstruction = typeof args.instruction === 'string' && args.instruction.trim().length > 0;
     let newName = typeof args.newName === 'string' ? args.newName.trim() : '';
     let oldNameHint = '';
@@ -2195,7 +2229,14 @@ export class ToolBox {
     const evidence: CompoundEvidence[] = [];
     let warning = '';
     let applied = false;
+    let textualApplied = false;
     let textHash: string | undefined;
+    const textualGate = (): string | undefined =>
+      allowTextual
+        ? undefined
+        : this.needsInput(
+            'No language server is available; re-call with allowTextual: true to rename textually (partial verification).',
+          );
     if (target && args.line !== undefined && args.character !== undefined) {
       const read = await readFileWithHash(this.options.root, target.relative, this.readCache);
       if (!read) {
@@ -2222,6 +2263,10 @@ export class ToolBox {
         warning = `${outcome.message} `;
       }
       if (!applied) {
+        const gate = textualGate();
+        if (gate) {
+          return gate;
+        }
         const oldName = oldNameHint || wordAtPosition(read.text, args.line, args.character);
         if (!oldName) {
           return this.needsInput(`No symbol found at ${display}:${args.line}:${args.character}.`, {
@@ -2229,6 +2274,12 @@ export class ToolBox {
           });
         }
         const textual = await this.textualRename(oldName, newName, allowGenerated);
+        if (textual.ambiguous.length > 0) {
+          return this.needsInput(
+            `Textual rename of "${oldName}" is ambiguous: ${textual.ambiguous.join('; ')}. No changes were applied; rename with a language server or disambiguate the occurrences.`,
+            { files: this.compoundFiles(textual.skipped) },
+          );
+        }
         if (textual.stale.length > 0) {
           await this.rollbackTextualRename(textual.applied);
           return this.needsInput(
@@ -2242,11 +2293,22 @@ export class ToolBox {
         evidence.push(...textual.skipped.map((file) => ({ kind: 'skip', summary: `skipped generated file ${file}`, file })));
         const total = [...textual.changed.values()].reduce((sum, entry) => sum + entry.count, 0);
         if (changed.size > 0) {
+          textualApplied = true;
           warning = `${warning}Note: a language server rename was unavailable; applied a word-boundary textual rename (${total} occurrence${total === 1 ? '' : 's'}).`;
         }
       }
     } else if (oldNameHint) {
+      const gate = textualGate();
+      if (gate) {
+        return gate;
+      }
       const textual = await this.textualRename(oldNameHint, newName, allowGenerated);
+      if (textual.ambiguous.length > 0) {
+        return this.needsInput(
+          `Textual rename of "${oldNameHint}" is ambiguous: ${textual.ambiguous.join('; ')}. No changes were applied; rename with a language server or disambiguate the occurrences.`,
+          { files: this.compoundFiles(textual.skipped) },
+        );
+      }
       if (textual.stale.length > 0) {
         await this.rollbackTextualRename(textual.applied);
         return this.needsInput(`Concurrent edit detected in ${textual.stale.join(', ')}; the rename was aborted.`, {
@@ -2257,6 +2319,9 @@ export class ToolBox {
         changed.set(relative, entry);
       }
       evidence.push(...textual.skipped.map((file) => ({ kind: 'skip', summary: `skipped generated file ${file}`, file })));
+      if (textual.changed.size > 0) {
+        textualApplied = true;
+      }
     }
     if (changed.size === 0) {
       const name = oldNameHint || (target ? display : newName);
@@ -2287,6 +2352,7 @@ export class ToolBox {
       ...changedEntries.map(([relative]) => relative),
       ...verifyPaths,
     ]);
+    const checks = textualApplied ? ['textual', 'stale-guard', 'diagnostics'] : ['stale-guard', 'diagnostics'];
     if (addedErrors.length > 0) {
       return this.needsInput(
         `Renamed to ${newName}, but ${addedErrors.length} error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
@@ -2295,7 +2361,7 @@ export class ToolBox {
           ...(diff ? { diff } : {}),
           diagnostics: compoundDiagnostics(diagnostics),
           evidence: [...evidence, this.diagnosticsEvidence(diagnostics)],
-          verification: { level: 'partial', checks: ['stale-guard', 'diagnostics'] },
+          verification: { level: 'partial', checks },
           rollbackAvailable: true,
         },
       );
@@ -2307,7 +2373,7 @@ export class ToolBox {
       diagnostics: compoundDiagnostics(diagnostics),
       evidence: [...evidence, this.diagnosticsEvidence(diagnostics)],
       message: `Renamed symbol to ${newName}.${warning ? ` ${warning.trim()}` : ''}`,
-      verification: { level: 'full', checks: ['stale-guard', 'diagnostics'] },
+      verification: { level: textualApplied ? 'partial' : 'full', checks },
       rollbackAvailable: true,
     });
   }
@@ -2321,17 +2387,38 @@ export class ToolBox {
     skipped: string[];
     stale: string[];
     applied: Array<{ relative: string; absolute: string; before: string }>;
+    ambiguous: string[];
   }> {
     const changed = new Map<string, { count: number; absolute: string; before: string; after: string }>();
     const skipped: string[] = [];
     const stale: string[] = [];
     const applied: Array<{ relative: string; absolute: string; before: string }> = [];
+    const ambiguous: string[] = [];
     const candidates = await searchTargets(this.options.root, oldName);
+    const readable: Array<{ path: string; absolute: string }> = [];
+    let declarations = 0;
     for (const candidate of candidates.slice(0, UPDATE_MAX_FILES)) {
       if (isGeneratedPath(candidate.path) && !allowGenerated) {
         skipped.push(candidate.path);
         continue;
       }
+      const read = await readFileWithHash(this.options.root, candidate.path, this.readCache);
+      if (!read) {
+        continue;
+      }
+      for (const reason of textualRenameHazards(read.text, oldName)) {
+        ambiguous.push(`${candidate.path}: ${reason}`);
+      }
+      declarations += declarationCandidateCount(read.text, oldName);
+      readable.push(candidate);
+    }
+    if (declarations > 1) {
+      ambiguous.push(`multiple declaration candidates for "${oldName}"`);
+    }
+    if (ambiguous.length > 0) {
+      return { changed, skipped, stale, applied, ambiguous };
+    }
+    for (const candidate of readable) {
       const read = await readFileWithHash(this.options.root, candidate.path, this.readCache);
       if (!read) {
         continue;
@@ -2344,7 +2431,7 @@ export class ToolBox {
       if (!write.ok) {
         if (write.stale) {
           stale.push(...applied.map((item) => item.relative), candidate.path);
-          return { changed, skipped, stale, applied };
+          return { changed, skipped, stale, applied, ambiguous };
         }
         continue;
       }
@@ -2356,7 +2443,7 @@ export class ToolBox {
       });
       applied.push({ relative: candidate.path, absolute: candidate.absolute, before: read.text });
     }
-    return { changed, skipped, stale, applied };
+    return { changed, skipped, stale, applied, ambiguous };
   }
 
   private async rollbackTextualRename(
@@ -2755,15 +2842,6 @@ export class ToolBox {
     }
     const message = await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, content));
     return { ok: true, message };
-  }
-
-  private async detectVerificationCommand(): Promise<{ script: string; command: string } | undefined> {
-    try {
-      const raw = await fs.readFile(path.join(this.options.root, 'package.json'), 'utf-8');
-      return detectVerifyCommand(raw);
-    } catch {
-      return undefined;
-    }
   }
 
   private async safeDiagnostics(paths: string[]): Promise<FileDiagnostic[]> {
