@@ -53,7 +53,7 @@ import {
 } from './fileRead';
 import { initOutputStore, spillOutput } from './outputStore';
 import { runTerminalCommand } from './terminal';
-import { collectDiagnostics, collectFileDiagnostics, diagnosticLines, diagnosticsSection } from './diagnostics';
+import { collectFileDiagnostics, diagnosticLines, diagnosticsSection, formatDiagnostics } from './diagnostics';
 import type { FileDiagnostic } from './diagnostics';
 import {
   addImportCodeActionEdit,
@@ -154,6 +154,7 @@ import {
   VerificationPolicyInput,
   VerifyChangeInfo,
   VerifyCheckKind,
+  planCheckRequirementFromSteps,
   planVerification,
 } from './verificationPolicy';
 import { getConfig } from '../config';
@@ -299,11 +300,20 @@ export interface ToolBoxOptions {
   planCheckRequirement?: VerifyCheckKind;
 }
 
+export interface AdaptiveVerificationSnapshot {
+  diagnosticsAvailable: boolean;
+  newDiagnosticErrors: number;
+  verificationRan: string[];
+}
+
 export class ToolBox {
   private readonly externalDirectories: ExternalDirectoryConsent;
   private readonly readCache: FileReadCache;
   private readonly adaptiveDiagnostics = new DiagnosticsCache();
   private readonly repairStates = new Map<string, { attempts: number; hash: string; checkId: string }>();
+  private readonly verificationRan: string[] = [];
+  private readonly diagnosticStats = new Map<string, { baseline: number; latest: number }>();
+  private diagnosticsObserved = false;
   private packageRootsCache?: number;
 
   constructor(private readonly options: ToolBoxOptions) {
@@ -314,6 +324,58 @@ export class ToolBox {
 
   resetReadCache(): void {
     this.readCache.clear();
+  }
+
+  adaptiveVerificationSnapshot(): AdaptiveVerificationSnapshot {
+    let newDiagnosticErrors = 0;
+    for (const stat of this.diagnosticStats.values()) {
+      newDiagnosticErrors += Math.max(0, stat.latest - stat.baseline);
+    }
+    return {
+      diagnosticsAvailable: this.options.checkDiagnostics && this.diagnosticsObserved,
+      newDiagnosticErrors,
+      verificationRan: [...this.verificationRan],
+    };
+  }
+
+  private recordVerification(check: string): void {
+    if (!check || this.verificationRan.includes(check)) {
+      return;
+    }
+    this.verificationRan.push(check);
+  }
+
+  private recordDiagnostics(paths: string[], items: FileDiagnostic[]): void {
+    for (const absolute of new Set(paths)) {
+      const errors = items.filter(
+        (item) => item.absolute === absolute && item.severity === 'error',
+      ).length;
+      const stat = this.diagnosticStats.get(absolute);
+      if (stat) {
+        stat.latest = errors;
+      } else {
+        this.diagnosticStats.set(absolute, { baseline: errors, latest: errors });
+      }
+      if (items.some((item) => item.absolute === absolute)) {
+        this.diagnosticsObserved = true;
+      }
+    }
+  }
+
+  private captureDiagnosticBaseline(absolute: string): void {
+    if (this.diagnosticStats.has(absolute)) {
+      return;
+    }
+    try {
+      const diagnostics = vscode.languages.getDiagnostics(vscode.Uri.file(absolute));
+      const errors = diagnostics.filter((item) => item.severity === vscode.DiagnosticSeverity.Error).length;
+      this.diagnosticStats.set(absolute, { baseline: errors, latest: errors });
+      if (diagnostics.length > 0) {
+        this.diagnosticsObserved = true;
+      }
+    } catch {
+      return;
+    }
   }
 
   async execute(name: string, argsJson: string, context: ToolExecutionContext): Promise<string> {
@@ -496,6 +558,7 @@ export class ToolBox {
     if (!stat.isFile()) {
       return `Error: ${display} is not a file.`;
     }
+    this.captureDiagnosticBaseline(absolute);
     const kind = await sniffFileKind(absolute, stat.size);
     if (kind) {
       return `${display} ${kind} (${formatBytes(stat.size)}) and cannot be read as text.`;
@@ -850,6 +913,12 @@ export class ToolBox {
     const result = await runTerminalCommand(command, this.options.root, timeout, context.signal, sandbox, {
       background: this.options.backgroundProcesses,
     });
+    if (!planning) {
+      const kind = planCheckRequirementFromSteps([command]);
+      if (kind) {
+        this.recordVerification(`${kind}:${command}`);
+      }
+    }
     const parts: string[] = [];
     if (sandbox === 'off' && this.options.sandbox !== 'off') {
       parts.push('Note: the developer approved running this command without the sandbox.');
@@ -2895,7 +2964,9 @@ export class ToolBox {
 
   private async safeDiagnostics(paths: string[]): Promise<FileDiagnostic[]> {
     try {
-      return await collectFileDiagnostics(paths);
+      const items = await collectFileDiagnostics(paths);
+      this.recordDiagnostics(paths, items);
+      return items;
     } catch {
       return [];
     }
@@ -3385,6 +3456,9 @@ export class ToolBox {
         }
       }
     }
+    for (const check of performed) {
+      this.recordVerification(check);
+    }
     return { performed, skipped, ...(failure ? { failure } : {}), evidence };
   }
 
@@ -3401,8 +3475,8 @@ export class ToolBox {
     if (!this.options.checkDiagnostics || paths.length === 0) {
       return '';
     }
-    const diagnostics = await collectDiagnostics(paths);
-    return diagnosticsSection(diagnostics);
+    const items = await this.safeDiagnostics(paths);
+    return diagnosticsSection(formatDiagnostics(items));
   }
 }
 

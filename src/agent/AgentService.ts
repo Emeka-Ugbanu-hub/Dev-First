@@ -10,6 +10,7 @@ import {
 } from './tools';
 import { ToolBox } from './ToolBox';
 import type { VerifyCheckKind } from './verificationPolicy';
+import type { FinishGateResult } from './finishGate';
 import { parseCompoundResult } from './compoundResult';
 import { PromptFamily, buildExecutorSpec, buildExecutorSystemPrompt } from '../planner/prompts';
 import { chatWithRetry } from '../llm/retry';
@@ -90,6 +91,15 @@ export interface AgentResult {
   reachedLimit: boolean;
   stoppedByLoop?: boolean;
   stoppedByMistakes?: boolean;
+  incomplete?: { issues: string[]; compact: string };
+}
+
+export interface FinishCheckSummary {
+  changedFiles: Array<{ path: string; delivered: boolean }>;
+  recentToolFailures: string[];
+  newDiagnosticErrors: number;
+  diagnosticsAvailable: boolean;
+  verificationRan: string[];
 }
 
 export interface AgentOptions {
@@ -105,6 +115,7 @@ export interface AgentOptions {
   planFilePath?: string;
   contextProfile?: ContextProfile;
   profileReasoning?: boolean;
+  finishCheck?: (summary: FinishCheckSummary) => FinishGateResult | Promise<FinishGateResult>;
 }
 
 export class AgentService {
@@ -136,6 +147,10 @@ export class AgentService {
     let latestUsage: UsageTotals | undefined;
     let lastNudgeTurn = -CONTEXT_NUDGE_TURN_GAP;
     let compressedRecently = false;
+    const runChangedPaths = new Set<string>();
+    const recentToolFailures: string[] = [];
+    let finishContinuations = 0;
+    let finishRejected = false;
 
     for (let step = 0; step < this.options.maxSteps; step++) {
       if (shouldPrune(estimateTokens(messages), contextLimit, profile)) {
@@ -247,6 +262,32 @@ export class AgentService {
         if (call.name === 'finish') {
           const args = toolCallArgs(call);
           const summary = String(args.summary ?? '').trim() || 'Done.';
+          const gate = this.options.finishCheck
+            ? await this.options.finishCheck(this.finishCheckSummary(runChangedPaths, recentToolFailures))
+            : undefined;
+          if (gate && !gate.ok) {
+            const firstIssue = gate.issues[0] ?? 'finish check failed';
+            if (finishContinuations >= 1) {
+              callbacks.onNotice?.(`Run ended incomplete — ${firstIssue}`);
+              return {
+                summary,
+                files: parseFinishFiles(args),
+                reachedLimit: false,
+                incomplete: { issues: gate.issues, compact: gate.compact },
+              };
+            }
+            finishContinuations += 1;
+            for (const pending of normalizedCalls) {
+              messages.push({
+                role: 'tool',
+                toolCallId: pending.id,
+                toolName: pending.name,
+                content: pending.id === call.id ? gate.compact : 'Error: tool did not run.',
+              });
+            }
+            finishRejected = true;
+            break;
+          }
           return { summary, files: parseFinishFiles(args), reachedLimit: false };
         }
         const loopCheck = this.doomLoop.record(call);
@@ -256,6 +297,10 @@ export class AgentService {
           );
           return { reachedLimit: false, stoppedByLoop: true };
         }
+      }
+      if (finishRejected) {
+        finishRejected = false;
+        continue;
       }
 
       const results = new Map<string, string>();
@@ -325,6 +370,13 @@ export class AgentService {
         const result = results.get(call.id) ?? 'Error: tool did not run.';
         messages.push({ role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
 
+        if (result.startsWith('Error:') || result.startsWith('Error in')) {
+          recentToolFailures.push(`${call.name}: ${toolFailureSummary(result)}`);
+          if (recentToolFailures.length > 4) {
+            recentToolFailures.shift();
+          }
+        }
+
         if (call.name === 'read_file') {
           const path = String(toolCallArgs(call).path ?? '');
           if (path) {
@@ -334,6 +386,9 @@ export class AgentService {
         }
 
         const changedPaths = mutationPaths(call, result);
+        for (const changedPath of changedPaths) {
+          runChangedPaths.add(changedPath);
+        }
         if (changedPaths.length > 0) {
           const rewritten = rewriteStaleReads(messages, changedPaths, readCallPaths, readMessageIndex);
           if (rewritten > 0) {
@@ -429,6 +484,20 @@ export class AgentService {
     }
     return messages;
   }
+
+  private finishCheckSummary(
+    runChangedPaths: Set<string>,
+    recentToolFailures: string[],
+  ): FinishCheckSummary {
+    const snapshot = this.toolbox.adaptiveVerificationSnapshot?.();
+    return {
+      changedFiles: [...runChangedPaths].map((path) => ({ path, delivered: true })),
+      recentToolFailures: [...recentToolFailures],
+      newDiagnosticErrors: snapshot?.newDiagnosticErrors ?? 0,
+      diagnosticsAvailable: snapshot?.diagnosticsAvailable ?? false,
+      verificationRan: snapshot?.verificationRan ?? [],
+    };
+  }
 }
 
 function assistantTurns(messages: ChatMessage[]): number {
@@ -439,6 +508,12 @@ function assistantTurns(messages: ChatMessage[]): number {
     }
   }
   return count;
+}
+
+function toolFailureSummary(result: string): string {
+  const line = result.split('\n').find((entry) => entry.trim()) ?? result;
+  const text = line.replace(/^Error:?\s*/i, '').trim();
+  return text.slice(0, 120) || 'failed';
 }
 
 function contextNudge(

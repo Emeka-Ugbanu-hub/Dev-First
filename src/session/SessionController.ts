@@ -3,6 +3,7 @@ import * as path from 'path';
 import { existsSync, promises as fs } from 'fs';
 import { DiffManager } from '../diff/DiffManager';
 import { AgentService } from '../agent/AgentService';
+import type { FinishCheckSummary } from '../agent/AgentService';
 import { ToolBox, ToolExecutionContext } from '../agent/ToolBox';
 import { PlannerService } from '../planner/PlannerService';
 import { ChatMessage, LLMProvider, ToolCall, ToolDef, UsageTotals } from '../llm/types';
@@ -105,6 +106,8 @@ import { ActivityMeta, executionTools, plannerTools, subagentTools } from '../ag
 import { attachToolPreflights } from '../agent/compoundPreflight';
 import type { ToolPreflight } from '../agent/compoundPreflight';
 import { planCheckRequirementFromSteps } from '../agent/verificationPolicy';
+import { checkFinish } from '../agent/finishGate';
+import type { FinishGateResult } from '../agent/finishGate';
 import { ApprovalMemory, ExternalDirectoryConsent } from '../agent/approvals';
 import { runSubagent } from '../agent/subagent';
 import { SemanticIndex } from '../indexing/SemanticIndex';
@@ -2075,6 +2078,54 @@ export class SessionController {
     await this.startExecution(this.plan, provider, true);
   }
 
+  private async checkRunFinish(summary: FinishCheckSummary): Promise<FinishGateResult> {
+    const plan = this.plan;
+    const steps = plan?.steps ?? [];
+    const completed = new Set<number>(this.currentRun?.completedSteps ?? []);
+    for (let index = 0; index < steps.length; index++) {
+      const text = steps[index].trim();
+      if (this.todos.some((todo) => todo.status === 'done' && todo.text.trim() === text)) {
+        completed.add(index);
+      }
+    }
+    const root = workspaceRoot() ?? process.cwd();
+    const run = this.currentRun;
+    let snapshots = new Map<string, FileSnapshotEntry>();
+    if (run) {
+      try {
+        snapshots = new Map((await this.fileSnapshots.index(run.id)).map((entry) => [entry.path, entry]));
+      } catch {}
+    }
+    const changedFiles: Array<{ path: string; delivered: boolean }> = [];
+    let baselinesAvailable = false;
+    for (const file of summary.changedFiles) {
+      const entry = snapshots.get(file.path);
+      if (!entry) {
+        changedFiles.push({ path: file.path, delivered: true });
+        continue;
+      }
+      baselinesAvailable = true;
+      const current = await sha1File(absoluteWorkspacePath(root, file.path));
+      const delivered = entry.absent ? current !== undefined : current !== entry.hash;
+      changedFiles.push({ path: file.path, delivered });
+    }
+    const planRequiredCheck = planCheckRequirementFromSteps(plan?.steps);
+    return checkFinish({
+      planSteps: steps,
+      completedSteps: [...completed],
+      skippedSteps: plan?.skippedSteps ?? [],
+      todos: this.todos.map((todo) => ({ text: todo.text, status: todo.status })),
+      expectedFiles: (plan?.expectedFiles ?? []).map((file) => ({ path: file.path, action: file.action })),
+      changedFiles,
+      recentToolFailures: summary.recentToolFailures,
+      newDiagnosticErrors: summary.newDiagnosticErrors,
+      diagnosticsAvailable: summary.diagnosticsAvailable,
+      verificationRan: summary.verificationRan,
+      ...(planRequiredCheck ? { planRequiredCheck } : {}),
+      baselinesAvailable,
+    });
+  }
+
   private async startExecution(plan: Plan, provider: LLMProvider, approve: boolean): Promise<void> {
     const config = getConfig();
     const root = workspaceRoot() ?? process.cwd();
@@ -2155,6 +2206,7 @@ export class SessionController {
       planFilePath: plan.filePath,
       contextProfile,
       profileReasoning: executorReasoningSupported,
+      finishCheck: (summary) => this.checkRunFinish(summary),
     });
 
     try {
@@ -2180,8 +2232,11 @@ export class SessionController {
       }
       const planSnapshot = this.completePlan(plan);
       if (result.summary) {
+        const summaryText = result.incomplete
+          ? `${result.summary}\n\nRun ended incomplete — ${result.incomplete.issues[0] ?? 'finish check failed'}`
+          : result.summary;
         const runId = this.diffManager.getCurrentRunId();
-        this.addCompletionMessage(result.summary, planSnapshot, runId, runId ? this.diffManager.runFiles(runId) : []);
+        this.addCompletionMessage(summaryText, planSnapshot, runId, runId ? this.diffManager.runFiles(runId) : []);
       }
       if (result.reachedLimit) {
         this.addNotice(

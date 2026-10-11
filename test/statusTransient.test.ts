@@ -140,6 +140,7 @@ describe('transient status messages', () => {
     stubFetch([
       new Response('rate limited', { status: 429, statusText: 'Too Many Requests' }),
       new Response(finishSse(), { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+      new Response(finishSse(), { status: 200, headers: { 'content-type': 'text/event-stream' } }),
     ]);
     const posted: HostMessage[] = [];
     const controller = createController(posted);
