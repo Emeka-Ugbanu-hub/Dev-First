@@ -273,6 +273,8 @@ export interface ConnectionState {
 export interface ModelMetadata {
   id: string;
   name?: string;
+  /** Provider-reported context window in tokens, when available. */
+  contextWindow?: number;
   supportsVision?: boolean;
   reasoningLevels?: string[];
   reasoningDefault?: string;

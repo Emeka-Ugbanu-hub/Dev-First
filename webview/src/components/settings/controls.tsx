@@ -26,7 +26,7 @@ export function SelectInput({
     <select className="df-select" value={value} onChange={(event) => onChange(event.target.value)}>
       {options.map((option) => (
         <option key={option} value={option}>
-          {option}
+          {option || 'Auto (inherit main setting)'}
         </option>
       ))}
     </select>

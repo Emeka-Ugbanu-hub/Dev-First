@@ -2167,6 +2167,9 @@ export class SessionController {
     this.lastRequest = llmText;
     this.addUserMessage(effective, attachment, llmText, quote, cappedImages);
     this.setPhase('planning');
+    // Create the assistant bubble immediately so the user sees Thinking…
+    // while the provider is still preparing its first streamed event.
+    this.ensureStreamingMessage();
 
     const plannerReasoningSupported =
       Boolean(catalogInfo?.reasoning) || (registryInfo?.supportsReasoning ?? false) ||
@@ -3223,9 +3226,11 @@ export class SessionController {
     const vision = live?.supportsVision
       ?? (catalogVisionKnown ? catalog!.capabilities!.includes('vision') : registry?.supportsVision);
     const reasoningLevels = live?.reasoningLevels ?? reasoningLevelsFor(presetId, modelId);
+    const contextWindow = live?.contextWindow ?? catalog?.contextWindow ?? registry?.contextWindow;
     return {
       id: modelId,
       ...(live?.name ? { name: live.name } : {}),
+      ...(contextWindow && contextWindow > 0 ? { contextWindow } : {}),
       ...(vision !== undefined ? { supportsVision: vision } : {}),
       ...(reasoningLevels.length ? { reasoningLevels } : {}),
       ...(live?.reasoningDefault ? { reasoningDefault: live.reasoningDefault } : {}),
@@ -3635,8 +3640,10 @@ export class SessionController {
   }
 
   private effectiveContextLimit(): number {
-    const { catalog, registry } = this.resolvedModelInfo();
-    return catalog?.contextWindow || registry?.contextWindow || getConfig().contextLimitTokens;
+    const config = getConfig();
+    const preset = findPreset(config.preset) ?? PRESETS[0];
+    const metadata = this.selectedModelMetadata(preset.id, config.model, preset.provider);
+    return metadata.contextWindow || config.contextLimitTokens;
   }
 
   private reservedOutputTokens(): number {

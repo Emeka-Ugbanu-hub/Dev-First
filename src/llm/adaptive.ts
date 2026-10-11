@@ -9,6 +9,7 @@ export const ANTHROPIC_ADAPTIVE_MODEL_PATTERNS: readonly RegExp[] = [
 export interface OllamaCapability {
   capabilities: string[];
   thinking: boolean;
+  contextWindow?: number;
   reasoningLevels?: string[];
   reasoningDefault?: string;
 }
@@ -94,7 +95,9 @@ export async function fetchOllamaCapability(
     const json = (await response.json()) as {
       capabilities?: unknown;
       thinking?: { values?: unknown; default?: unknown };
+      model_info?: unknown;
     };
+    const contextWindow = findContextWindow(json.model_info);
     const capabilities = Array.isArray(json.capabilities)
       ? json.capabilities.filter((item): item is string => typeof item === 'string')
       : [];
@@ -108,6 +111,7 @@ export async function fetchOllamaCapability(
     const info: OllamaCapability = {
       capabilities,
       thinking: advertised || (mapped?.length ?? 0) > 0,
+      ...(contextWindow ? { contextWindow } : {}),
       ...(levels ? { reasoningLevels: levels } : {}),
       ...(typeof defaultValue === 'boolean'
         ? { reasoningDefault: defaultValue ? 'on' : 'off' }
@@ -118,4 +122,22 @@ export async function fetchOllamaCapability(
   } catch {
     return undefined;
   }
+}
+
+/** Read only an explicitly advertised context length; never infer it from a model name. */
+function findContextWindow(value: unknown): number | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  for (const [key, entry] of Object.entries(value)) {
+    const normalized = key.toLowerCase().replace(/[-.]/g, '_');
+    const leaf = normalized.split('_').pop() === 'length' ? normalized.slice(normalized.lastIndexOf('_') + 1) : normalized;
+    if ((normalized === 'context_length' || normalized.endsWith('_context_length')
+      || normalized === 'context_window' || normalized.endsWith('_context_window')
+      || leaf === 'num_ctx' || leaf === 'n_ctx')
+      && typeof entry === 'number' && Number.isFinite(entry) && entry > 0) {
+      return Math.floor(entry);
+    }
+    const nested = findContextWindow(entry);
+    if (nested) return nested;
+  }
+  return undefined;
 }

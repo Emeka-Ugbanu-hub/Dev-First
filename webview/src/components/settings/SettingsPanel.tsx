@@ -60,6 +60,13 @@ export function SettingsPanel({
 
   const renderControl = (def: SettingDef) => {
     const current = local[def.key];
+    const roleModel = def.key === 'scanModel' || def.key === 'architectureModel';
+    const rolePresetKey = def.key === 'scanModel' ? 'scanPreset' : 'architecturePreset';
+    const inheritedPreset = String(local[rolePresetKey] || local.preset || '');
+    const inheritedConnection =
+      connections.find((connection) => connection.preset === inheritedPreset) ??
+      connections.find((connection) => connection.active) ??
+      connections[0];
     switch (def.type) {
       case 'boolean':
         return <Switch checked={Boolean(current)} onChange={(value) => update(def.key, value)} />;
@@ -90,7 +97,15 @@ export function SettingsPanel({
         return (
           <TextInput
             value={String(current ?? '')}
-            placeholder={def.key === 'autocompleteModel' ? 'auto' : undefined}
+            placeholder={
+              def.key === 'autocompleteModel'
+                ? 'auto'
+                : roleModel
+                  ? inheritedConnection?.model
+                    ? `auto — ${inheritedConnection.model}`
+                    : 'auto — main model'
+                  : undefined
+            }
             onChange={(value) => update(def.key, value)}
           />
         );

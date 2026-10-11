@@ -5,6 +5,10 @@ type LmStudioModel = {
   key?: unknown;
   display_name?: unknown;
   type?: unknown;
+  context_length?: unknown;
+  max_context_length?: unknown;
+  context_window?: unknown;
+  contextWindow?: unknown;
   capabilities?: {
     vision?: unknown;
     reasoning?: { allowed_options?: unknown; default?: unknown };
@@ -46,6 +50,14 @@ export async function fetchModelMetadata(
       details[id] = {
         id,
         ...(typeof model.display_name === 'string' ? { name: model.display_name } : {}),
+        ...((typeof model.context_length === 'number' && model.context_length > 0)
+          ? { contextWindow: Math.floor(model.context_length) }
+          : typeof model.max_context_length === 'number' && model.max_context_length > 0
+            ? { contextWindow: Math.floor(model.max_context_length) }
+          : typeof model.context_window === 'number' && model.context_window > 0
+            ? { contextWindow: Math.floor(model.context_window) }
+            : typeof model.contextWindow === 'number' && model.contextWindow > 0
+              ? { contextWindow: Math.floor(model.contextWindow) } : {}),
         ...(typeof model.capabilities?.vision === 'boolean' ? { supportsVision: model.capabilities.vision } : {}),
         ...(levels && levels.length > 0 ? { reasoningLevels: levels } : {}),
         ...(typeof reasoning?.default === 'string' ? { reasoningDefault: reasoning.default } : {}),
@@ -70,6 +82,7 @@ async function fetchOllamaMetadata(baseUrl: string): Promise<Record<string, Mode
       details[id] = {
         id,
         ...(capability.capabilities.length ? { supportsVision: capability.capabilities.includes('vision') } : {}),
+        ...(capability.contextWindow ? { contextWindow: capability.contextWindow } : {}),
         ...(capability.reasoningLevels?.length ? { reasoningLevels: capability.reasoningLevels } : {}),
         ...(capability.reasoningDefault ? { reasoningDefault: capability.reasoningDefault } : {}),
       };

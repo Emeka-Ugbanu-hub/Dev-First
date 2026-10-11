@@ -10,6 +10,7 @@ describe('fetchModelMetadata', () => {
         type: 'llm',
         key: 'publisher/model-q4',
         display_name: 'Model Q4',
+        context_length: 32768,
         capabilities: { vision: true, reasoning: { allowed_options: ['low', 'high'], default: 'low' } },
       }],
     }), { status: 200 })));
@@ -18,6 +19,7 @@ describe('fetchModelMetadata', () => {
       'publisher/model-q4': {
         id: 'publisher/model-q4',
         name: 'Model Q4',
+        contextWindow: 32768,
         supportsVision: true,
         reasoningLevels: ['low', 'high'],
         reasoningDefault: 'low',
@@ -30,12 +32,14 @@ describe('fetchModelMetadata', () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ models: [{ name: 'qwen3:8b' }] }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         capabilities: ['completion', 'vision'],
+        model_info: { 'qwen2.context_length': 32768 },
         thinking: { values: ['low', 'medium', 'high'], default: 'medium' },
       }), { status: 200 })));
 
     await expect(fetchModelMetadata('ollama', 'http://localhost:11434/v1')).resolves.toEqual({
       'qwen3:8b': {
         id: 'qwen3:8b',
+        contextWindow: 32768,
         supportsVision: true,
         reasoningLevels: ['low', 'medium', 'high'],
         reasoningDefault: 'medium',

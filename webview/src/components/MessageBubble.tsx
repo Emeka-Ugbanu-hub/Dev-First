@@ -126,7 +126,9 @@ function MessageBubbleComponent({
   return (
     <div className="message-row assistant">
       <div className="bubble assistant-bubble">
-        {message.reasoning && <ThinkingRow text={message.reasoning} streaming={Boolean(message.streaming)} />}
+        {(message.reasoning || message.streaming) && (
+          <ThinkingRow text={message.reasoning ?? ''} streaming={Boolean(message.streaming)} />
+        )}
         {message.text && <Markdown text={message.text} streaming={Boolean(message.streaming)} />}
         {message.streaming && <span className="cursor-blink" />}
         {message.interrupted && !interruptedDismissed && (
