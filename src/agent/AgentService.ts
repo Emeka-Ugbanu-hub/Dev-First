@@ -18,6 +18,7 @@ import { MistakeTracker } from './mistakes';
 import { isContextOverflowError } from '../llm/errors';
 import { normalizeToolArguments } from '../util/toolArgs';
 import {
+  ADAPTIVE_RECENT_FLOOR,
   PRESERVE_RECENT_TOKENS,
   buildCompactedMessages,
   checkCompaction,
@@ -27,6 +28,7 @@ import {
   summarizeMessages,
 } from './compaction';
 import { pruneMessages, shouldPrune } from './prune';
+import { ContextProfile, preserveBudgetTokens } from './modelProfile';
 import { mergeUsage, usageTotal } from '../llm/usage';
 
 const CONTEXT_NUDGE_RATIO = 0.5;
@@ -101,6 +103,8 @@ export interface AgentOptions {
   reasoning?: ReasoningOptions;
   resolveReasoning?: () => ReasoningOptions | undefined;
   planFilePath?: string;
+  contextProfile?: ContextProfile;
+  profileReasoning?: boolean;
 }
 
 export class AgentService {
@@ -128,12 +132,13 @@ export class AgentService {
     const readMessageIndex = new Map<string, number>();
     const toolsByName = new Map(this.options.tools.map((tool) => [tool.name, tool]));
     const contextLimit = this.options.contextLimitTokens || DEFAULT_CONTEXT_LIMIT;
+    const profile = this.options.contextProfile;
     let latestUsage: UsageTotals | undefined;
     let lastNudgeTurn = -CONTEXT_NUDGE_TURN_GAP;
     let compressedRecently = false;
 
     for (let step = 0; step < this.options.maxSteps; step++) {
-      if (shouldPrune(estimateTokens(messages), contextLimit)) {
+      if (shouldPrune(estimateTokens(messages), contextLimit, profile)) {
         messages = pruneMessages(messages);
       }
       messages = await this.maybeCompact(messages, signal, callbacks);
@@ -370,9 +375,11 @@ export class AgentService {
     if (!this.options.autoCompact) {
       return messages;
     }
+    const profile = this.options.contextProfile;
     const check = checkCompaction(
       messages,
       this.options.contextLimitTokens || DEFAULT_CONTEXT_LIMIT,
+      profile ? { profile, reasoning: this.options.profileReasoning ?? false } : undefined,
     );
     if (!check.needed || check.recentStart <= 2) {
       return messages;
@@ -400,7 +407,15 @@ export class AgentService {
     signal: AbortSignal,
     callbacks: AgentCallbacks,
   ): Promise<ChatMessage[]> {
-    const recentStart = chooseRecentStart(messages, PRESERVE_RECENT_TOKENS);
+    const profile = this.options.contextProfile;
+    const preserve = profile
+      ? preserveBudgetTokens(
+          profile,
+          this.options.contextLimitTokens || DEFAULT_CONTEXT_LIMIT,
+          this.options.profileReasoning ?? false,
+        )
+      : PRESERVE_RECENT_TOKENS;
+    const recentStart = chooseRecentStart(messages, preserve, profile ? ADAPTIVE_RECENT_FLOOR : undefined);
     if (recentStart <= 2) {
       return messages;
     }

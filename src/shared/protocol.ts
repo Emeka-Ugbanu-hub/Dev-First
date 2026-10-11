@@ -178,10 +178,19 @@ export interface ChangedFile {
   deletions: number;
 }
 
+export interface ContextProfileInfo {
+  tier: 'compact' | 'standard' | 'large';
+  triggerRatio: number;
+  pruneRatio: number;
+  preserveTokens: number;
+  reserveRatio: number;
+}
+
 export interface ContextUsage {
   tokens: number;
   limit: number;
   reserved?: number;
+  profile?: ContextProfileInfo;
 }
 
 export interface CommandInfo {
@@ -425,7 +434,7 @@ export type HostMessage =
   | { type: 'connectResult'; ok: boolean; error?: string; models?: string[]; details?: Record<string, ModelMetadata>; preset?: string; updatedAt?: number }
   | { type: 'models'; models: string[]; details?: Record<string, ModelMetadata>; error?: string; preset?: string; updatedAt?: number; liveFailed?: boolean }
   | { type: 'selection'; selection: SelectionContext | null }
-  | { type: 'usage'; tokens: number; limit: number; reserved?: number }
+  | { type: 'usage'; tokens: number; limit: number; reserved?: number; profile?: ContextProfileInfo }
   | { type: 'commands'; commands: CommandInfo[] }
   | { type: 'files'; files: string[] }
   | { type: 'sessions'; sessions: SessionSummary[]; activeId: string }

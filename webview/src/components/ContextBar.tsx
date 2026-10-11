@@ -13,7 +13,10 @@ export function ContextBar({ usage }: { usage: ContextUsage }) {
   const reserved = Math.max(0, Math.min(usage.reserved ?? FALLBACK_RESERVED_TOKENS, usage.limit - usage.tokens));
   const free = Math.max(0, usage.limit - usage.tokens - reserved);
   const percent = contextPercent(usage.tokens, usage.limit);
-  const title = `${usage.tokens.toLocaleString()} tokens used · ${reserved.toLocaleString()} reserved · ${free.toLocaleString()} free of ${usage.limit.toLocaleString()}`;
+  const profileTitle = usage.profile
+    ? `${usage.profile.tier} · trigger ${Math.round(usage.profile.triggerRatio * 100)}% · preserve ${usage.profile.preserveTokens.toLocaleString()} tokens · reserve ${Math.round(usage.profile.reserveRatio * 100)}%`
+    : '';
+  const title = `${profileTitle ? `${profileTitle} · ` : ''}${usage.tokens.toLocaleString()} tokens used · ${reserved.toLocaleString()} reserved · ${free.toLocaleString()} free of ${usage.limit.toLocaleString()}`;
 
   return (
     <div

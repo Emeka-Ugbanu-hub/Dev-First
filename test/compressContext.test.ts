@@ -38,6 +38,7 @@ import type { ToolBox } from '../src/agent/ToolBox';
 import { AgentService } from '../src/agent/AgentService';
 import { PlannerService } from '../src/planner/PlannerService';
 import {
+  ADAPTIVE_RECENT_FLOOR,
   PRESERVE_RECENT_TOKENS,
   chooseRecentStart,
   type CompressionBlock,
@@ -188,7 +189,7 @@ describe('SessionController compressContext', () => {
     ctrl.conversation = conversation;
     const provider = new ScriptedProvider([[{ type: 'text', text: 'FOLDED SUMMARY' }]]);
     ctrl.buildProvider = async () => provider;
-    const recentStart = chooseRecentStart(conversation, PRESERVE_RECENT_TOKENS);
+    const recentStart = chooseRecentStart(conversation, PRESERVE_RECENT_TOKENS, ADAPTIVE_RECENT_FLOOR);
 
     const result = await ctrl.compressContext('the auth refactor');
 

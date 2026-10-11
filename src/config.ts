@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { ProviderPreset } from './llm/presets';
+import type { ContextProfileTier } from './agent/modelProfile';
 
 export type ProviderId = 'openai' | 'anthropic' | 'gemini';
 
@@ -7,6 +8,7 @@ export type SandboxMode = 'off' | 'workspace-write';
 export type EmbeddingsProvider = 'local' | 'api';
 export type ReasoningEffortSetting = 'off' | 'low' | 'medium' | 'high' | (string & {});
 export type NotifySound = 'off' | 'chime' | 'beep';
+export type ContextProfileSetting = 'auto' | ContextProfileTier;
 
 export interface DevFirstConfig {
   preset: string;
@@ -26,6 +28,7 @@ export interface DevFirstConfig {
   adaptiveVerify: boolean;
   autoCompact: boolean;
   contextLimitTokens: number;
+  contextProfile: ContextProfileSetting;
   semanticIndex: boolean;
   embeddingsProvider: EmbeddingsProvider;
   embeddingsModel: string;
@@ -82,6 +85,7 @@ export function getConfig(): DevFirstConfig {
     adaptiveVerify: config.get<boolean>('adaptiveVerify', true),
     autoCompact: config.get<boolean>('autoCompact', true),
     contextLimitTokens: config.get<number>('contextLimitTokens', 128000),
+    contextProfile: config.get<ContextProfileSetting>('contextProfile', 'auto'),
     semanticIndex: config.get<boolean>('semanticIndex', true),
     embeddingsProvider: config.get<EmbeddingsProvider>('embeddingsProvider', 'local'),
     embeddingsModel: config.get<string>('embeddingsModel', 'text-embedding-3-small'),

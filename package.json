@@ -447,6 +447,23 @@
           "default": 128000,
           "description": "Fallback context window used only when the model is not in the model catalog."
         },
+        "devFirst.contextProfile": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "compact",
+            "standard",
+            "large"
+          ],
+          "enumDescriptions": [
+            "Derive the profile from the model's context window.",
+            "Aggressive compaction for small context windows (<= 32k).",
+            "Balanced compaction for mid-size windows (<= 200k).",
+            "Relaxed compaction for very large windows (> 200k)."
+          ],
+          "default": "auto",
+          "description": "Adaptive context profile controlling compaction and pruning thresholds."
+        },
         "devFirst.semanticIndex": {
           "type": "boolean",
           "default": true,

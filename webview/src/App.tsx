@@ -1008,7 +1008,12 @@ function applyHostMessage(previous: UiState, message: HostMessage): UiState {
     case 'usage':
       return {
         ...previous,
-        contextUsage: { tokens: message.tokens, limit: message.limit, reserved: message.reserved },
+        contextUsage: {
+          tokens: message.tokens,
+          limit: message.limit,
+          reserved: message.reserved,
+          ...(message.profile ? { profile: message.profile } : {}),
+        },
       };
     case 'addMessage':
       return { ...previous, messages: [...previous.messages, message.message] };

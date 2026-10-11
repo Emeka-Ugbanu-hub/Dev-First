@@ -129,9 +129,12 @@ export const COMPACTION_PROMPT = `You are compacting the conversation of a codin
 Include:
 - The original goal and the approved plan
 - What has been completed so far (files created/modified, exact paths)
+- One line per file created or modified with its exact path and current state
 - Key decisions made and why
+- Pending decisions or questions the agent is waiting on
 - Errors encountered and how they were resolved
 - What remains to be done (the pending steps)
+- A compact summary of tool results that still matter (what ran, what it proved)
 - Any important facts the agent must not forget (commands that work, gotchas)
 
 Output only the continuation note, no preamble.`;

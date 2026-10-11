@@ -9,6 +9,7 @@ import { ChatMessage, LLMProvider, ToolCall, ToolDef, UsageTotals } from '../llm
 import {
   ChangedFile,
   ConnectionState,
+  ContextProfileInfo,
   HostMessage,
   MessageAttachment,
   ModelMetadata,
@@ -67,14 +68,15 @@ import {
 import { PromptFamily, promptFamilyFor } from '../planner/prompts';
 import { ReasoningOptions } from '../llm/types';
 import {
+  ADAPTIVE_RECENT_FLOOR,
   CompressionBlock,
   MIN_COMPRESS_MESSAGES,
-  PRESERVE_RECENT_TOKENS,
   chooseRecentStart,
   estimateTokens,
   projectCompressedMessages,
   summarizeMessages,
 } from '../agent/compaction';
+import { ContextProfile, contextProfileFor, preserveBudgetTokens, reserveRatioTotal } from '../agent/modelProfile';
 import { usageTotal } from '../llm/usage';
 import { DevFirstConfig, deleteApiKey, getApiKeyForPreset, getConfig, saveApiKey, workspaceRoot } from '../config';
 import { createProvider } from '../llm';
@@ -346,6 +348,7 @@ export class SessionController {
         tokens: this.exactUsageTotal() ?? this.contextTokens,
         limit: this.effectiveContextLimit(),
         reserved: this.reservedOutputTokens(),
+        profile: this.contextProfileInfo(),
       },
       currentRunId: this.diffManager.getCurrentRunId(),
       viewableRuns: this.diffManager.viewableRunIds?.() ?? [],
@@ -1269,7 +1272,9 @@ export class SessionController {
       return;
     }
     const messages = [{ role: 'system' as const, content: 'compact' }, ...this.conversation];
-    const recentStart = chooseRecentStart(messages, PRESERVE_RECENT_TOKENS);
+    const profile = this.buildContextProfile();
+    const preserve = preserveBudgetTokens(profile, this.effectiveContextLimit(), this.profileSupportsReasoning());
+    const recentStart = chooseRecentStart(messages, preserve, ADAPTIVE_RECENT_FLOOR);
     if (recentStart <= 2) {
       this.addNotice('Nothing to compact yet.');
       return;
@@ -1307,7 +1312,9 @@ export class SessionController {
     const active = this.compressionBlocks.filter((block) => block.active);
     const last = active.length > 0 ? active[active.length - 1] : undefined;
     const startIndex = last ? last.endIndex : 0;
-    const recentStart = chooseRecentStart(this.conversation, PRESERVE_RECENT_TOKENS);
+    const profile = this.buildContextProfile();
+    const preserve = preserveBudgetTokens(profile, this.effectiveContextLimit(), this.profileSupportsReasoning());
+    const recentStart = chooseRecentStart(this.conversation, preserve, ADAPTIVE_RECENT_FLOOR);
     const endIndex = Math.min(recentStart, this.conversation.length);
     const foldable = endIndex - startIndex;
     if (foldable < MIN_COMPRESS_MESSAGES) {
@@ -1382,6 +1389,7 @@ export class SessionController {
         tokens: 0,
         limit: this.effectiveContextLimit(),
         reserved: this.reservedOutputTokens(),
+        profile: this.contextProfileInfo(),
       });
       this.post({ type: 'todos', todos: [] });
       this.post({ type: 'plan', plan: null });
@@ -2084,6 +2092,13 @@ export class SessionController {
     const reasoningLabel = executorReasoning
       ? executorReasoning.effort ?? (executorReasoning.enabled ? 'on' : 'off')
       : undefined;
+    const contextProfile = contextProfileFor({
+      contextWindow: this.effectiveContextLimit(),
+      maxOutput: this.reservedOutputTokens(),
+      supportsTools: registryInfo?.supportsTools ?? true,
+      supportsReasoning: executorReasoningSupported,
+      override: config.contextProfile,
+    });
 
     this.diffManager.setRunContext({
       id: this.lastUserMessageId ?? randomId('run'),
@@ -2138,6 +2153,8 @@ export class SessionController {
       reasoning: executorReasoning,
       resolveReasoning: () => this.reasoningOptions(executorReasoningSupported, preset.id),
       planFilePath: plan.filePath,
+      contextProfile,
+      profileReasoning: executorReasoningSupported,
     });
 
     try {
@@ -3202,6 +3219,33 @@ export class SessionController {
     return 8192;
   }
 
+  private profileSupportsReasoning(): boolean {
+    const { catalog, registry } = this.resolvedModelInfo();
+    return Boolean(catalog?.reasoning) || (registry?.supportsReasoning ?? false);
+  }
+
+  private buildContextProfile(): ContextProfile {
+    const { registry } = this.resolvedModelInfo();
+    return contextProfileFor({
+      contextWindow: this.effectiveContextLimit(),
+      maxOutput: this.reservedOutputTokens(),
+      supportsTools: registry?.supportsTools ?? true,
+      supportsReasoning: this.profileSupportsReasoning(),
+      override: getConfig().contextProfile,
+    });
+  }
+
+  private contextProfileInfo(): ContextProfileInfo {
+    const profile = this.buildContextProfile();
+    return {
+      tier: profile.tier,
+      triggerRatio: profile.triggerRatio,
+      pruneRatio: profile.pruneRatio,
+      preserveTokens: profile.preserveTokens,
+      reserveRatio: reserveRatioTotal(profile, this.effectiveContextLimit(), this.profileSupportsReasoning()),
+    };
+  }
+
   private exactUsageTotal(): number | undefined {
     return this.lastExactUsage ? usageTotal(this.lastExactUsage) : undefined;
   }
@@ -3213,6 +3257,7 @@ export class SessionController {
       tokens: this.contextTokens,
       limit: this.effectiveContextLimit(),
       reserved: this.reservedOutputTokens(),
+      profile: this.contextProfileInfo(),
     });
   }
 
@@ -3224,6 +3269,7 @@ export class SessionController {
       tokens: this.contextTokens,
       limit: this.effectiveContextLimit(),
       reserved: this.reservedOutputTokens(),
+      profile: this.contextProfileInfo(),
     });
   }
 

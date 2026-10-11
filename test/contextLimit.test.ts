@@ -184,6 +184,38 @@ describe('effective context window', () => {
     controller.dispose();
   });
 
+  it('reports the adaptive profile derived from the model window', () => {
+    env.config = { preset: 'anthropic', model: 'claude-opus-4-1', contextLimitTokens: 64_000 };
+    const controller = createController([]);
+
+    const profile = controller.getState().contextUsage.profile;
+    expect(profile).toMatchObject({ tier: 'standard', triggerRatio: 0.6, preserveTokens: 20_000 });
+    controller.dispose();
+  });
+
+  it('honors the contextProfile override in the state and usage payloads', async () => {
+    env.config = {
+      preset: 'anthropic',
+      model: 'claude-opus-4-1',
+      contextLimitTokens: 64_000,
+      contextProfile: 'compact',
+    };
+    const posted: HostMessage[] = [];
+    const controller = createController(posted);
+
+    const profile = controller.getState().contextUsage.profile;
+    expect(profile?.tier).toBe('compact');
+    expect(profile?.triggerRatio).toBe(0.45);
+    expect(profile?.pruneRatio).toBe(0.35);
+    expect(profile?.preserveTokens).toBe(8_000);
+
+    controller.newSession();
+    await vi.waitFor(() => {
+      expect(posts(posted, 'usage').some((message) => message.profile?.tier === 'compact')).toBe(true);
+    });
+    controller.dispose();
+  });
+
   it('drives compaction from the same effective limit as the UI', async () => {
     env.config = { preset: 'anthropic', model: 'claude-fable-5', contextLimitTokens: 128000 };
     stubFetch([anthropicToolSse('submit_plan', { intent: 'plan', trivial: true, steps: ['Do it'] })]);

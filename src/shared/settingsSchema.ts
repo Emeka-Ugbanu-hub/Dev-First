@@ -210,6 +210,16 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     max: 2_000_000,
   },
   {
+    key: 'contextProfile',
+    tab: 'behavior',
+    group: 'Context',
+    label: 'Context profile',
+    description:
+      'Adaptive compaction aggressiveness. Auto derives the tier from the model context window: compact for small windows, standard for mid-size, large for very large ones.',
+    type: 'enum',
+    options: ['auto', 'compact', 'standard', 'large'],
+  },
+  {
     key: 'pasteFileLines',
     tab: 'behavior',
     group: 'Input',

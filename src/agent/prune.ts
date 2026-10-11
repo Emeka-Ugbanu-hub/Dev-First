@@ -1,5 +1,6 @@
 import { ChatMessage } from '../llm/types';
 import { parseJsonLoose } from '../util/json';
+import { ContextProfile } from './modelProfile';
 
 export const KEEP_RECENT_TOOL_RESULTS = 10;
 export const PRUNE_TRIGGER_RATIO = 0.5;
@@ -34,8 +35,9 @@ export interface PruneOptions {
   pruneOldResults?: boolean;
 }
 
-export function shouldPrune(tokens: number, contextLimit: number): boolean {
-  return contextLimit > 0 && tokens > contextLimit * PRUNE_TRIGGER_RATIO;
+export function shouldPrune(tokens: number, contextLimit: number, profile?: ContextProfile): boolean {
+  const ratio = profile?.pruneRatio ?? PRUNE_TRIGGER_RATIO;
+  return contextLimit > 0 && tokens > contextLimit * ratio;
 }
 
 export function pruneMessages(messages: ChatMessage[], options: PruneOptions = {}): ChatMessage[] {

@@ -1,12 +1,31 @@
 import { ChatMessage, LLMProvider } from '../llm/types';
 import { chatWithRetry } from '../llm/retry';
 import { COMPACTION_PROMPT } from '../planner/prompts';
+import { ContextProfile, MIN_RECENT_MESSAGES, effectiveThresholdTokens, preserveBudgetTokens } from './modelProfile';
 
 export const PRESERVE_RECENT_TOKENS = 20_000;
 export const COMPACTION_TRIGGER_RATIO = 0.6;
 export const DEFAULT_CONTEXT_LIMIT = 128_000;
 export const MIN_COMPRESS_MESSAGES = 6;
+export const MIN_RECENT_TOOL_RESULTS = 2;
+export const RECENT_TOOL_BYTES_WINDOW = 10;
 export const COMPRESSED_SECTION_PREFIX = '[Compressed conversation section]';
+
+export interface RecentTailFloor {
+  minRecentMessages: number;
+  minRecentToolResults: number;
+}
+
+export const ADAPTIVE_RECENT_FLOOR: RecentTailFloor = {
+  minRecentMessages: MIN_RECENT_MESSAGES,
+  minRecentToolResults: MIN_RECENT_TOOL_RESULTS,
+};
+
+export interface CompactionOptions {
+  profile?: ContextProfile;
+  reasoning?: boolean;
+  recentToolBytes?: number;
+}
 
 export interface CompressionBlock {
   id: string;
@@ -30,7 +49,11 @@ export function estimateTokens(messages: ChatMessage[]): number {
   return Math.ceil(chars / 4);
 }
 
-export function chooseRecentStart(messages: ChatMessage[], preserveTokens: number): number {
+export function chooseRecentStart(
+  messages: ChatMessage[],
+  preserveTokens: number,
+  floor?: RecentTailFloor,
+): number {
   if (messages.length <= 2) {
     return messages.length;
   }
@@ -44,10 +67,40 @@ export function chooseRecentStart(messages: ChatMessage[], preserveTokens: numbe
     tokens += messageTokens;
     start = index;
   }
+  if (floor) {
+    start = applyRecentFloor(messages, start, floor);
+  }
   while (start > 2 && messages[start].role === 'tool') {
     start--;
   }
   return Math.max(start, 2);
+}
+
+export function applyRecentFloor(messages: ChatMessage[], start: number, floor: RecentTailFloor): number {
+  let capped = Math.min(start, Math.max(2, messages.length - floor.minRecentMessages));
+  const toolIndexes: number[] = [];
+  for (let index = messages.length - 1; index >= 0 && toolIndexes.length < floor.minRecentToolResults; index--) {
+    if (messages[index].role === 'tool') {
+      toolIndexes.push(index);
+    }
+  }
+  if (toolIndexes.length >= floor.minRecentToolResults) {
+    capped = Math.min(capped, toolIndexes[floor.minRecentToolResults - 1]);
+  }
+  return Math.max(2, capped);
+}
+
+export function recentToolResultBytes(messages: ChatMessage[]): number {
+  let bytes = 0;
+  let seen = 0;
+  for (let index = messages.length - 1; index >= 0 && seen < RECENT_TOOL_BYTES_WINDOW; index--) {
+    const message = messages[index];
+    if (message.role === 'tool') {
+      bytes += message.content?.length ?? 0;
+      seen++;
+    }
+  }
+  return bytes;
 }
 
 export function serializeForSummary(messages: ChatMessage[]): string {
@@ -144,13 +197,27 @@ export interface CompactionCheck {
   needed: boolean;
   recentStart: number;
   tokens: number;
+  threshold?: number;
 }
 
-export function checkCompaction(messages: ChatMessage[], contextLimitTokens: number): CompactionCheck {
+export function checkCompaction(
+  messages: ChatMessage[],
+  contextLimitTokens: number,
+  options: CompactionOptions = {},
+): CompactionCheck {
   const tokens = estimateTokens(messages);
-  const needed = tokens > contextLimitTokens * COMPACTION_TRIGGER_RATIO;
-  const recentStart = needed ? chooseRecentStart(messages, PRESERVE_RECENT_TOKENS) : messages.length;
-  return { needed, recentStart, tokens };
+  if (!options.profile) {
+    const needed = tokens > contextLimitTokens * COMPACTION_TRIGGER_RATIO;
+    const recentStart = needed ? chooseRecentStart(messages, PRESERVE_RECENT_TOKENS) : messages.length;
+    return { needed, recentStart, tokens };
+  }
+  const reasoning = options.reasoning ?? false;
+  const recentToolBytes = options.recentToolBytes ?? recentToolResultBytes(messages);
+  const threshold = effectiveThresholdTokens(options.profile, contextLimitTokens, reasoning, recentToolBytes);
+  const needed = tokens > threshold;
+  const preserve = preserveBudgetTokens(options.profile, contextLimitTokens, reasoning);
+  const recentStart = needed ? chooseRecentStart(messages, preserve, ADAPTIVE_RECENT_FLOOR) : messages.length;
+  return { needed, recentStart, tokens, threshold };
 }
 
 function truncate(text: string, max: number): string {
