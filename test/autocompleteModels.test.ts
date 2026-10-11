@@ -18,8 +18,8 @@ describe('resolveAutocompleteModel', () => {
       kind: 'fim',
     });
     expect(resolveAutocompleteModel({ presetId: 'ollama', configured: '  ', chatModel: 'x' })).toEqual({
-      model: 'qwen2.5-coder:7b',
-      kind: 'fim',
+      model: 'x',
+      kind: 'chat',
     });
   });
 
@@ -36,7 +36,7 @@ describe('resolveAutocompleteModel', () => {
 
   it('knows which presets have FIM defaults', () => {
     expect(defaultAutocompleteModel('openrouter')).toBeDefined();
-    expect(defaultAutocompleteModel('ollama')).toBeDefined();
+    expect(defaultAutocompleteModel('ollama')).toBeUndefined();
     expect(defaultAutocompleteModel('openai')).toBeUndefined();
     expect(defaultAutocompleteModel('custom')).toBeUndefined();
   });

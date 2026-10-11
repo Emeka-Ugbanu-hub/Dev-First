@@ -214,17 +214,11 @@ export class OpenAIProvider implements LLMProvider {
     const baseUrl = this.config.baseUrl.replace(/\/v1\/?$/i, '');
     const body: Record<string, unknown> = {
       model: options.model,
-      messages: messages.map((message) => ({
-        role: message.role,
-        content: sanitizeSurrogates(message.content),
-        ...(message.images?.length ? { images: message.images.map(ollamaImageData) } : {}),
-        ...(message.toolCalls?.length ? {
-          tool_calls: message.toolCalls.map((call) => ({
-            function: { name: call.name, arguments: parseJsonLoose(call.arguments) },
-          })),
-        } : {}),
-        ...(message.toolName ? { tool_name: message.toolName } : {}),
-      })),
+      // Ollama's Jinja chat templates require every system message to be the
+      // first message. Planner context and executor nudges can add system
+      // messages later in the transcript, so normalize them into one leading
+      // system message before calling /api/chat.
+      messages: toOllamaMessages(messages),
       stream: true,
       think: reasoning.enabled
         ? reasoning.effort === 'off' ? false : reasoning.effort === 'on' ? true : reasoning.effort ?? true
@@ -328,6 +322,29 @@ function numberOrUndefined(value: unknown): number | undefined {
 function ollamaImageData(dataUrl: string): string {
   const comma = dataUrl.indexOf(',');
   return dataUrl.startsWith('data:') && comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+}
+
+function toOllamaMessages(messages: ChatMessage[]): unknown[] {
+  const system = messages
+    .filter((message) => message.role === 'system')
+    .map((message) => sanitizeSurrogates(message.content))
+    .filter(Boolean)
+    .join('\n\n');
+  const ordered = messages.filter((message) => message.role !== 'system');
+  const normalized: ChatMessage[] = system
+    ? [{ role: 'system', content: system }, ...ordered]
+    : ordered;
+  return normalized.map((message) => ({
+    role: message.role,
+    content: sanitizeSurrogates(message.content),
+    ...(message.images?.length ? { images: message.images.map(ollamaImageData) } : {}),
+    ...(message.toolCalls?.length ? {
+      tool_calls: message.toolCalls.map((call) => ({
+        function: { name: call.name, arguments: parseJsonLoose(call.arguments) },
+      })),
+    } : {}),
+    ...(message.toolName ? { tool_name: message.toolName } : {}),
+  }));
 }
 
 function promptCacheKey(messages: ChatMessage[]): string | undefined {

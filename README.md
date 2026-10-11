@@ -227,7 +227,7 @@ Dev-First adapts compaction to the model's context window instead of using one g
 
 Set `devFirst.autocomplete` to `true` to enable inline ghost-text completions.
 
-- **Model** — `devFirst.autocompleteModel` left empty means *auto*: a FIM model is chosen for the connected provider (Codestral for OpenRouter, `qwen2.5-coder` for Ollama). Set it explicitly to override.
+- **Model** — `devFirst.autocompleteModel` left empty means *auto*: a FIM model is chosen where a provider default exists (Codestral for OpenRouter); otherwise the connected chat model is used. Set it explicitly to override.
 - **Chat fallback** — when no FIM model applies (OpenAI, Anthropic, Gemini, custom), Dev-First asks the connected chat model for the completion. It's throttled to one call per second, uses a small context (~1k chars), caps output at 128 tokens, and skips comments/strings, so token usage stays low. Disable with `devFirst.autocompleteFallback: false`.
 - **First failure** shows a one-time notice with a shortcut to the settings.
 

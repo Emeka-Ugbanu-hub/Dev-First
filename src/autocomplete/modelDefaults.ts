@@ -1,6 +1,5 @@
 const FIM_MODELS: Record<string, string> = {
   openrouter: 'mistralai/codestral-2501',
-  ollama: 'qwen2.5-coder:7b',
 };
 
 export function defaultAutocompleteModel(presetId: string): string | undefined {

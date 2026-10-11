@@ -23,6 +23,10 @@ describe('isSafeCommand', () => {
     expect(isSafeCommand('rg foo src')).toBe(true);
   });
 
+  it('allows harmless stderr suppression for read-only discovery', () => {
+    expect(isSafeCommand("find . -name '*.vsix' 2>/dev/null")).toBe(true);
+  });
+
   it('allows safe command chains and pipes', () => {
     expect(isSafeCommand('ls && pwd')).toBe(true);
     expect(isSafeCommand('cat package.json | grep name')).toBe(true);

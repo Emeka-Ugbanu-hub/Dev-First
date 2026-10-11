@@ -3658,7 +3658,10 @@ const FORBIDDEN_WORDS = new Set(['rm', 'sudo']);
 const SHELL_SEPARATOR = /\s*(?:&&|\|\||;|\|)\s*/;
 
 export function isSafeCommand(command: string): boolean {
-  const trimmed = command.trim();
+  // Planning may suppress harmless permission noise from read-only discovery
+  // commands. Keep redirection narrowly scoped to stderr -> /dev/null; all
+  // other redirection remains blocked because it can write or hide output.
+  const trimmed = command.trim().replace(/\s+2>\s*\/dev\/null\b/g, '').trim();
   if (!trimmed) {
     return false;
   }
