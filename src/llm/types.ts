@@ -12,6 +12,7 @@ export interface ToolDef {
 }
 
 export interface ChatMessage {
+  id?: string;
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   images?: string[];

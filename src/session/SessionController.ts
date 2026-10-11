@@ -51,7 +51,19 @@ import {
 } from '../llm/catalog';
 import { HttpError } from '../llm/errors';
 import { adaptiveKind } from '../llm/adaptive';
-import { SessionStore, StoredSession } from './SessionStore';
+import { SessionStore, SessionContextEntry, StoredSession } from './SessionStore';
+import {
+  ContextMetadataUpdate,
+  buildContextEntry,
+  decisionContextMetadata,
+  diagnosticsContextMetadata,
+  mergeContextMetadata,
+  mergeMetadataUpdates,
+  mutationContextMetadata,
+  planContextMetadata,
+  rebuildContextIndex,
+  toolContextMetadata,
+} from './contextIndex';
 import { RunJournalStore } from './RunJournalStore';
 import {
   FILE_EDIT_TOOLS,
@@ -76,6 +88,8 @@ import {
   ADAPTIVE_RECENT_FLOOR,
   CompressionBlock,
   MIN_COMPRESS_MESSAGES,
+  buildCompactedMessages,
+  checkCompaction,
   chooseRecentStart,
   estimateTokens,
   projectCompressedMessages,
@@ -122,6 +136,8 @@ import { CheckpointManager } from '../checkpoints/CheckpointManager';
 import { FileSnapshotEntry, FileSnapshotStore, SnapshotCaptureResult } from '../checkpoints/FileSnapshotStore';
 import { writeFileAtomic } from '../util/atomicWrite';
 import { architectureFilesHash } from '../architecture/mapStore';
+import { selectPlannerConversation, composePlannerRequest, relevanceBudget } from '../planner/relevance';
+import type { PinnedPlannerContext } from '../planner/relevance';
 import { chatWithRetry } from '../llm/retry';
 import { appendDelta } from '../shared/stream';
 import { ReviewFileDiff } from '../review/changeset';
@@ -306,6 +322,11 @@ export class SessionController {
   private phase: Phase = 'idle';
   private uiMessages: UiMessage[] = [];
   private conversation: ChatMessage[] = [];
+  private contextIndex: SessionContextEntry[] = [];
+  private archivedConversation: ChatMessage[] = [];
+  private archivedContextIndex: SessionContextEntry[] = [];
+  private pendingContextMetadata: ContextMetadataUpdate | undefined;
+  private diagnosticsSummary: string | undefined;
   private plan: Plan | null = null;
   private todos: TodoItem[] = [];
   private planVersion = 0;
@@ -491,6 +512,7 @@ export class SessionController {
       const stored = await this.store.load(target.id);
       if (stored) {
         this.applySession(stored);
+        await this.restoreSessionContext();
         await this.recoverRuns();
         await this.cleanupStaleConnectionNotice();
         this.postSessions(await this.store.list());
@@ -531,6 +553,7 @@ export class SessionController {
       this.lastRequest = legacy.lastRequest ?? '';
       const firstUser = this.uiMessages.find((message) => message.role === 'user');
       this.sessionTitle = firstUser ? firstUser.text.slice(0, 50) : 'Imported session';
+      this.contextIndex = rebuildContextIndex(this.conversation);
       await this.context.workspaceState.update(LEGACY_SESSION_KEY, undefined);
     }
     await this.persistNow();
@@ -544,6 +567,11 @@ export class SessionController {
       .map((message, index) => normalizeStoredMessage(message, index))
       .filter((message): message is UiMessage => message !== undefined);
     this.conversation = stored.conversation ?? [];
+    this.contextIndex = [];
+    this.archivedConversation = [];
+    this.archivedContextIndex = [];
+    this.pendingContextMetadata = undefined;
+    this.diagnosticsSummary = undefined;
     const plan = stored.plan ?? null;
     if (plan && !plan.flow) {
       const legacyFlow = (plan as { howDiagram?: string }).howDiagram;
@@ -592,6 +620,19 @@ export class SessionController {
     this.sessionPending = normalizeStoredPending(stored.pending);
     this.recoveredAnswers.clear();
     void this.context.workspaceState.update(ACTIVE_SESSION_KEY, this.sessionId);
+  }
+
+  private async restoreSessionContext(): Promise<void> {
+    try {
+      const stored = await this.store.loadContext(this.sessionId);
+      this.contextIndex = stored.active;
+      this.archivedContextIndex = stored.archived;
+      this.archivedConversation = await this.store.loadArchive(this.sessionId);
+    } catch {
+      this.contextIndex = rebuildContextIndex(this.conversation);
+      this.archivedContextIndex = [];
+      this.archivedConversation = [];
+    }
   }
 
   private restorablePlan(plan: Plan | null): Plan | null {
@@ -645,6 +686,7 @@ export class SessionController {
       return;
     }
     this.applySession(stored);
+    await this.restoreSessionContext();
     await this.loadRecoveryRun();
     this.pushState();
     this.postSessions();
@@ -658,6 +700,7 @@ export class SessionController {
         const stored = await this.store.load(remaining[0].id);
         if (stored) {
           this.applySession(stored);
+          await this.restoreSessionContext();
         }
       } else {
         this.resetSessionState();
@@ -683,6 +726,11 @@ export class SessionController {
     this.sessionCreatedAt = Date.now();
     this.uiMessages = [];
     this.conversation = [];
+    this.contextIndex = [];
+    this.archivedConversation = [];
+    this.archivedContextIndex = [];
+    this.pendingContextMetadata = undefined;
+    this.diagnosticsSummary = undefined;
     this.plan = null;
     this.todos = [];
     this.planVersion = 0;
@@ -1307,6 +1355,7 @@ export class SessionController {
       this.setRunPending(record);
     } else {
       this.sessionPending = record;
+      this.recordContextMetadata(decisionContextMetadata(record));
       void this.persistNow();
     }
     this.needsInputListener?.('the agent asked you a question');
@@ -1507,9 +1556,11 @@ export class SessionController {
       }
       const recent = this.conversation.slice(recentStart - 2);
       this.conversation = [
-        { role: 'assistant', content: `[Summary of earlier conversation]\n\n${summary}` },
+        { id: randomId('msg'), role: 'assistant', content: `[Summary of earlier conversation]\n\n${summary}` },
         ...recent,
       ];
+      this.contextIndex = rebuildContextIndex(this.conversation);
+      this.pendingContextMetadata = undefined;
       this.compressionBlocks = [];
       this.lastExactUsage = undefined;
       this.addNotice('Conversation compacted.');
@@ -1558,7 +1609,79 @@ export class SessionController {
   }
 
   private projectedConversation(): ChatMessage[] {
-    return projectCompressedMessages(this.conversation, this.compressionBlocks);
+    return selectPlannerConversation(
+      projectCompressedMessages(this.conversation, this.compressionBlocks),
+      relevanceBudget(this.buildContextProfile().tier),
+      this.contextIndex,
+      { archived: this.archivedConversation, archivedContextIndex: this.archivedContextIndex },
+    );
+  }
+
+  private async preparePlannerConversation(provider: LLMProvider): Promise<ChatMessage[]> {
+    const pendingDecisionIds = this.sessionPending ? [this.sessionPending.id] : this.currentRun?.pending ? [this.currentRun.pending.id] : [];
+    const request = composePlannerRequest({
+      conversation: projectCompressedMessages(this.conversation, this.compressionBlocks),
+      contextIndex: this.contextIndex,
+      archived: this.archivedConversation,
+      archivedContextIndex: this.archivedContextIndex,
+      pendingDecisionIds,
+      budget: relevanceBudget(this.buildContextProfile().tier),
+      pinned: this.buildPinnedContext(),
+    });
+    return this.maybeCompactPlanner(request.messages, provider);
+  }
+
+  private async maybeCompactPlanner(messages: ChatMessage[], provider: LLMProvider): Promise<ChatMessage[]> {
+    const profile = this.buildContextProfile();
+    const check = checkCompaction(messages, this.effectiveContextLimit(), {
+      profile,
+      reasoning: this.profileSupportsReasoning(),
+    });
+    if (!check.needed || check.recentStart <= 2) {
+      return messages;
+    }
+    try {
+      const summary = await summarizeMessages(
+        provider,
+        getConfig().model,
+        messages.slice(2, check.recentStart),
+        this.abortController?.signal ?? new AbortController().signal,
+      );
+      if (!summary) {
+        return messages;
+      }
+      return buildCompactedMessages(messages, summary, check.recentStart);
+    } catch {
+      return messages;
+    }
+  }
+
+  private buildPinnedContext(): PinnedPlannerContext {
+    const latest = [...this.conversation].reverse().find((message) => message.role === 'user');
+    const latestText = latest
+      ? typeof latest.content === 'string'
+        ? latest.content
+        : JSON.stringify(latest.content)
+      : this.lastRequest;
+    const pending = this.sessionPending ?? this.currentRun?.pending;
+    const changedFiles = (this.currentRun?.changedFiles ?? []).map((file) => file.path);
+    return {
+      latestUserMessage: latestText,
+      ...(this.plan
+        ? {
+            activePlan: {
+              title: this.plan.title?.trim() || 'Plan',
+              steps: this.plan.steps ?? [],
+              version: this.plan.version,
+              completedSteps: this.currentRun?.completedSteps ?? [],
+              skippedSteps: this.plan.skippedSteps ?? [],
+            },
+          }
+        : {}),
+      ...(pending ? { pending } : {}),
+      changedFiles,
+      ...(this.diagnosticsSummary ? { diagnosticsSummary: this.diagnosticsSummary } : {}),
+    };
   }
 
   private async editMessage(id: string, text: string, restoreWorkspace: boolean): Promise<void> {
@@ -1581,7 +1704,9 @@ export class SessionController {
     this.uiMessages = this.uiMessages.slice(0, index);
     this.conversation = this.uiMessages
       .filter((message) => message.role === 'user' || (message.role === 'assistant' && message.text && !message.kind))
-      .map((message) => ({ role: message.role as 'user' | 'assistant', content: message.text }));
+      .map((message) => ({ id: message.id, role: message.role as 'user' | 'assistant', content: message.text }));
+    this.contextIndex = rebuildContextIndex(this.conversation);
+    this.pendingContextMetadata = undefined;
     this.compressionBlocks = [];
     this.plan = null;
     this.todos = [];
@@ -1621,7 +1746,7 @@ export class SessionController {
     this.disposed = true;
     this.stop();
     clearTimeout(this.persistTimer);
-    void this.store.save(this.snapshotSession()).catch(() => undefined);
+    void this.store.save(this.snapshotSession(), this.contextIndex).catch(() => undefined);
     this.browser?.dispose();
     this.mcp.dispose();
     this.background.dispose();
@@ -2060,7 +2185,7 @@ export class SessionController {
 
     try {
       const result = await planner.plan(
-        this.projectedConversation(),
+        await this.preparePlannerConversation(provider),
         this.plan,
         this.planVersion + 1,
         {
@@ -2081,11 +2206,9 @@ export class SessionController {
       if (result.plan && isExplanationPlan(result.plan)) {
         const markdown = explanationToMarkdown(result.plan);
         const content = markdown || result.text.trim();
+        const message = markdown ? this.addAssistantMessage(markdown) : undefined;
         if (content) {
-          this.conversation.push({ role: 'assistant', content });
-        }
-        if (markdown) {
-          this.addAssistantMessage(markdown);
+          this.appendConversation({ id: message?.id ?? this.streamingMessageId ?? undefined, role: 'assistant', content });
         }
       } else if (result.plan) {
         if (this.isDirectRun(result.plan)) {
@@ -2096,6 +2219,7 @@ export class SessionController {
         } else {
           this.planVersion += 1;
           this.plan = result.plan;
+          this.recordContextMetadata(planContextMetadata(result.plan));
           if (getConfig().memory) {
             const convention = await this.matchStoredConvention(result.plan);
             if (convention) {
@@ -2115,7 +2239,7 @@ export class SessionController {
         this.addNotice(hadDraft ? 'Draft plan discarded — nothing was changed.' : 'There is no draft plan to discard.');
       } else {
         if (result.text.trim()) {
-          this.conversation.push({ role: 'assistant', content: result.text });
+          this.appendConversation({ id: this.streamingMessageId ?? undefined, role: 'assistant', content: result.text });
         }
         if (result.exhausted) {
           this.addNotice('The planner reached its step limit. Try rephrasing or splitting the request.');
@@ -2398,6 +2522,7 @@ export class SessionController {
     await this.saveRunNow();
     if (approve) {
       plan.status = 'approved';
+      this.recordContextMetadata(planContextMetadata(plan));
       this.post({ type: 'plan', plan });
       this.persist();
     }
@@ -2791,10 +2916,12 @@ export class SessionController {
     const controller = this;
     class JournalToolBox extends ToolBox {
       async execute(name: string, argsJson: string, context: ToolExecutionContext): Promise<string> {
+        controller.recordToolCallContext(name, argsJson);
         const operationId = await controller.beginRunOperation(name, argsJson);
         try {
           const result = await super.execute(name, argsJson, context);
           controller.finishRunOperation(operationId, !result.startsWith('Error:'));
+          controller.recordDiagnosticsContext(this.adaptiveVerificationSnapshot());
           return result;
         } catch (error) {
           controller.finishRunOperation(operationId, false);
@@ -3246,6 +3373,7 @@ export class SessionController {
     parsed.skippedSteps = this.plan.skippedSteps;
     parsed.title = this.plan.title;
     this.plan = parsed;
+    this.recordContextMetadata(planContextMetadata(parsed));
     await this.savePlanFile(this.plan, this.lastRequest);
     this.post({ type: 'plan', plan: this.plan });
     this.persist();
@@ -3262,6 +3390,7 @@ export class SessionController {
       skipped.add(index);
     }
     this.plan.skippedSteps = [...skipped].sort((a, b) => a - b);
+    this.recordContextMetadata({ planStepIds: [String(index)] });
     await this.savePlanFile(this.plan, this.lastRequest);
     this.post({ type: 'plan', plan: this.plan });
     this.persist();
@@ -3300,16 +3429,52 @@ export class SessionController {
       this.postSessions();
     }
     this.uiMessages.push(message);
-    this.conversation.push({ role: 'user', content: llmText ?? text, images });
+    this.appendConversation({ id: message.id, role: 'user', content: llmText ?? text, images });
     this.post({ type: 'addMessage', message });
     this.persist();
   }
 
-  private addAssistantMessage(text: string): void {
+  private addAssistantMessage(text: string): UiMessage {
     const message: UiMessage = { id: randomId('msg'), role: 'assistant', text };
     this.uiMessages.push(message);
     this.post({ type: 'addMessage', message });
     this.persist();
+    return message;
+  }
+
+  private appendConversation(message: ChatMessage): SessionContextEntry {
+    if (!message.id) {
+      message.id = randomId('msg');
+    }
+    const index = this.conversation.length;
+    this.conversation.push(message);
+    const entry = buildContextEntry(message, index, this.pendingContextMetadata);
+    this.pendingContextMetadata = undefined;
+    this.contextIndex.push(entry);
+    return entry;
+  }
+
+  private recordContextMetadata(update: ContextMetadataUpdate): void {
+    const entry = this.contextIndex[this.contextIndex.length - 1];
+    if (!entry || entry.index !== this.conversation.length - 1) {
+      this.pendingContextMetadata = mergeMetadataUpdates(this.pendingContextMetadata, update);
+      return;
+    }
+    mergeContextMetadata(entry, update);
+  }
+
+  private recordToolCallContext(name: string, argsJson: string): void {
+    this.recordContextMetadata(toolContextMetadata(name, argsJson));
+  }
+
+  private recordDiagnosticsContext(snapshot: { diagnosticsAvailable: boolean; newDiagnosticErrors: number }): void {
+    const update = diagnosticsContextMetadata(snapshot);
+    if (snapshot.diagnosticsAvailable) {
+      this.diagnosticsSummary = snapshot.newDiagnosticErrors === 1 ? '1 error' : `${snapshot.newDiagnosticErrors} errors`;
+    }
+    if (update.files || update.summary) {
+      this.recordContextMetadata(update);
+    }
   }
 
   private addNotice(text: string, action?: UiMessage['action']): UiMessage {
@@ -3667,6 +3832,9 @@ export class SessionController {
         ...(entry ? { originalHash: entry.hash, captured: true, absent: entry.absent === true } : {}),
       });
     }
+    if (result.captured.length > 0) {
+      this.recordContextMetadata(mutationContextMetadata(result.captured));
+    }
     if (result.skipped.length > 0) {
       const listed = result.skipped.slice(0, 5).join(', ');
       const extra = result.skipped.length > 5 ? ` and ${result.skipped.length - 5} more` : '';
@@ -3745,6 +3913,7 @@ export class SessionController {
       return;
     }
     run.pending = pending;
+    this.recordContextMetadata(decisionContextMetadata(pending));
     if (run.status === 'executing') {
       run.status = 'waiting';
     }
@@ -3948,6 +4117,7 @@ export class SessionController {
         return;
       }
       this.applySession(stored);
+      await this.restoreSessionContext();
       if (stored.plan) {
         this.plan = stored.plan;
       }
@@ -4414,7 +4584,7 @@ export class SessionController {
 
   async persistNow(): Promise<void> {
     try {
-      await this.store.save(this.snapshotSession());
+      await this.store.save(this.snapshotSession(), this.contextIndex);
     } catch {
       // storage failure is non-fatal
     }
