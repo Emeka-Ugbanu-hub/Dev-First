@@ -23,12 +23,25 @@ const terminal = vi.hoisted(() => ({
   output: 'ok',
 }));
 
+const diagnosticsMock = vi.hoisted(() => ({ collectCalls: [] as string[][] }));
+
 vi.mock('../src/agent/terminal', () => ({
   runTerminalCommand: async (command: string) => {
     terminal.calls.push(command);
     return { exitCode: terminal.exitCode, output: terminal.output };
   },
 }));
+
+vi.mock('../src/agent/diagnostics', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/agent/diagnostics')>();
+  return {
+    ...actual,
+    collectFileDiagnostics: async (paths: string[]) => {
+      diagnosticsMock.collectCalls.push([...paths]);
+      return actual.collectFileDiagnostics(paths);
+    },
+  };
+});
 
 vi.mock('vscode', () => {
   const uri = (fsPath: string) => ({ scheme: 'file', fsPath, toString: () => `file://${fsPath}` });
@@ -159,6 +172,7 @@ beforeEach(async () => {
   terminal.calls = [];
   terminal.exitCode = 0;
   terminal.output = 'ok';
+  diagnosticsMock.collectCalls = [];
   applyChange = vi.fn(async (file: string, content: string) => {
     await fs.writeFile(file, content, 'utf-8');
     return `Applied changes to ${path.basename(file)}.`;
@@ -712,8 +726,10 @@ describe('update_related_files', () => {
       context,
     );
     const parsed = JSON.parse(result);
-    expect(parsed.status).toBe('verified');
+    expect(parsed.status).toBe('needs_input');
     expect(parsed.message).toContain('Updated 12/12 files');
+    expect(parsed.policyLevel).toBe(3);
+    expect(parsed.message).toContain('none was resolved and no command ran');
     expect(await fs.readFile(path.join(root, 'file-5.ts'), 'utf-8')).toBe('let marker = 1;\n');
   });
 });
@@ -928,5 +944,149 @@ describe('compound edge cases', () => {
     expect(['blocked', 'needs_input', 'failed']).toContain(parsed.status);
     expect(await fs.readFile(path.join(root, 'keep.ts'), 'utf-8')).toBe('const a = 1;\n');
     expect(await fs.readFile(path.join(root, 'dist', 'out.js'), 'utf-8')).toBe('old\n');
+  });
+});
+
+describe('adaptive verification', () => {
+  it('keeps a trivial single-file fix at level 1 with no command', async () => {
+    await fs.writeFile(path.join(root, 'clean.ts'), 'const a = 1;\n', 'utf-8');
+    const result = await toolbox().execute(
+      'fix_in_file',
+      JSON.stringify({ path: 'clean.ts', content: 'const a = 2;\n' }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.policyLevel).toBe(1);
+    expect(parsed.reasons).toEqual([]);
+    expect(parsed.verification.level).toBe('full');
+    expect(parsed.verification.checks).toEqual(expect.arrayContaining(['write', 'diagnostics', 'diff']));
+    expect(terminal.calls).toEqual([]);
+  });
+
+  it('escalates a symbol rename to level 2 with reference and closest-test checks', async () => {
+    await fs.writeFile(path.join(root, 'greet.ts'), 'const value = 1;\nreturn value;\n', 'utf-8');
+    await fs.writeFile(path.join(root, 'greet.test.ts'), "import { value } from './greet';\n", 'utf-8');
+    env.executeCommand = async (command: string) => {
+      if (command === 'vscode.executeReferenceProvider') {
+        return [
+          { uri: { fsPath: path.join(root, 'greet.ts') }, range: { start: { line: 0, character: 6 } } },
+          { uri: { fsPath: path.join(root, 'greet.test.ts') }, range: { start: { line: 0, character: 9 } } },
+        ];
+      }
+      return undefined;
+    };
+    const result = await toolbox().execute(
+      'rename_symbol',
+      JSON.stringify({ path: 'greet.ts', line: 1, character: 7, newName: 'count', allowTextual: true }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.policyLevel).toBe(2);
+    expect(parsed.verification.checks).toEqual(
+      expect.arrayContaining(['related-diagnostics', 'references', 'closest-test', 'package-typecheck']),
+    );
+    expect(terminal.calls).toEqual([]);
+  });
+
+  it('escalates a five-file change set to level 3 and runs the project test command', async () => {
+    await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run' } }), 'utf-8');
+    const changes = [];
+    for (let index = 0; index < 5; index++) {
+      await fs.writeFile(path.join(root, `part-${index}.ts`), `export const part${index} = ${index};\n`, 'utf-8');
+      changes.push({ path: `part-${index}.ts`, action: 'edit', content: `export const part${index} = ${index + 1};\n` });
+    }
+    const result = await toolbox().execute('apply_change_set', JSON.stringify({ changes }), context);
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.policyLevel).toBe(3);
+    expect(parsed.reasons).toContain('5 files changed');
+    expect(parsed.verification.checks).toContain('project-command');
+    expect(terminal.calls).toEqual(['npm run test']);
+  });
+
+  it('allows one repair and reruns only the failed check', async () => {
+    await fs.writeFile(
+      path.join(root, 'package.json'),
+      JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' } }),
+      'utf-8',
+    );
+    await fs.writeFile(path.join(root, 'check.ts'), 'const a = 1;\n', 'utf-8');
+    const box = toolbox();
+    terminal.exitCode = 2;
+    terminal.output = 'error TS1005';
+    const first = await box.execute(
+      'fix_in_file',
+      JSON.stringify({ path: 'check.ts', content: 'const a = 2;\n' }),
+      context,
+    );
+    const firstParsed = JSON.parse(first);
+    expect(firstParsed.status).toBe('failed');
+    expect(firstParsed.repairAllowed).toBe(true);
+    expect(firstParsed.message).toContain('error TS1005');
+    expect(terminal.calls).toEqual(['npm run typecheck']);
+
+    terminal.exitCode = 0;
+    const second = await box.execute(
+      'fix_in_file',
+      JSON.stringify({ path: 'check.ts', content: 'const a = 3;\n' }),
+      context,
+    );
+    const secondParsed = JSON.parse(second);
+    expect(secondParsed.status).toBe('verified');
+    expect(secondParsed.repairAllowed).toBe(false);
+    expect(secondParsed.policyLevel).toBe(3);
+    expect(secondParsed.verification.level).toBe('full');
+    expect(terminal.calls).toEqual(['npm run typecheck', 'npm run typecheck']);
+  });
+
+  it('stops after the second failure of the same check', async () => {
+    await fs.writeFile(
+      path.join(root, 'package.json'),
+      JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' } }),
+      'utf-8',
+    );
+    await fs.writeFile(path.join(root, 'check.ts'), 'const a = 1;\n', 'utf-8');
+    const box = toolbox();
+    terminal.exitCode = 2;
+    terminal.output = 'error TS1005';
+    await box.execute('fix_in_file', JSON.stringify({ path: 'check.ts', content: 'const a = 2;\n' }), context);
+    terminal.output = 'error TS2322';
+    const second = await box.execute(
+      'fix_in_file',
+      JSON.stringify({ path: 'check.ts', content: 'const a = 3;\n' }),
+      context,
+    );
+    const parsed = JSON.parse(second);
+    expect(parsed.status).toBe('failed');
+    expect(parsed.repairAllowed).toBe(false);
+    expect(parsed.message).toBe('Repair attempt already used; stopping.');
+    expect(terminal.calls).toEqual(['npm run typecheck', 'npm run typecheck']);
+  });
+
+  it('caches diagnostics per unchanged file hash', async () => {
+    const target = path.join(root, 'shared.ts');
+    await fs.writeFile(target, 'export const shared = 1;\n', 'utf-8');
+    const box = toolbox() as any;
+    await box.cachedDiagnostics([target]);
+    await box.cachedDiagnostics([target]);
+    expect(diagnosticsMock.collectCalls.filter((paths) => paths.includes(target)).length).toBe(1);
+  });
+
+  it('skips escalation when adaptiveVerify is false', async () => {
+    env.configValues = { adaptiveVerify: false };
+    await fs.writeFile(path.join(root, 'quiet.ts'), 'const a = 1;\n', 'utf-8');
+    const result = await toolbox().execute(
+      'fix_in_file',
+      JSON.stringify({ path: 'quiet.ts', content: 'const a = 2;\n' }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.policyLevel).toBeUndefined();
+    expect(parsed.repairAllowed).toBeUndefined();
+    expect(parsed.verification.checks).toEqual(['content', 'stale-guard', 'diagnostics']);
+    expect(terminal.calls).toEqual([]);
   });
 });

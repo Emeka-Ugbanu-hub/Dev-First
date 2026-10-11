@@ -23,6 +23,7 @@ export interface DevFirstConfig {
   safeCommandsOnly: boolean;
   yolo: boolean;
   checkDiagnostics: boolean;
+  adaptiveVerify: boolean;
   autoCompact: boolean;
   contextLimitTokens: number;
   semanticIndex: boolean;
@@ -78,6 +79,7 @@ export function getConfig(): DevFirstConfig {
     safeCommandsOnly: config.get<boolean>('safeCommandsOnly', true),
     yolo: config.get<boolean>('yolo', false),
     checkDiagnostics: config.get<boolean>('checkDiagnostics', true),
+    adaptiveVerify: config.get<boolean>('adaptiveVerify', true),
     autoCompact: config.get<boolean>('autoCompact', true),
     contextLimitTokens: config.get<number>('contextLimitTokens', 128000),
     semanticIndex: config.get<boolean>('semanticIndex', true),

@@ -1,6 +1,7 @@
 import { createReadStream, promises as fs } from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
+import { fileURLToPath, pathToFileURL } from 'url';
 import * as vscode from 'vscode';
 import { DiffManager } from '../diff/DiffManager';
 import { errorMessage } from '../util/errors';
@@ -66,6 +67,8 @@ import {
   hoverAt,
   incomingCalls,
   outgoingCalls,
+  referenceFilesAt,
+  referenceLocationsAt,
   toZeroBased,
   workspaceSymbols,
 } from './lspTools';
@@ -119,11 +122,13 @@ import {
 import {
   CompoundDiagnostic,
   CompoundEvidence,
+  CompoundResult,
   CompoundResultPartial,
   ProposedChangeValidation,
   buildCompoundResult,
   compoundDiagnostics,
   compoundResult,
+  parseCompoundResult,
 } from './compoundResult';
 import { discoverRelatedTargets, searchTargets } from './compoundPreflight';
 import {
@@ -142,6 +147,15 @@ import { McpManager } from '../mcp/McpManager';
 import { BrowserSession } from '../browser/BrowserSession';
 import { SandboxMode } from './sandbox';
 import { describeCandidate, resolveProjectCommands } from './projectCommands';
+import type { ProjectCommandCandidate, ProjectCommandKind } from './projectCommands';
+import { adjacentTests, isTestFile, testTargets } from '../scan/crossFile';
+import {
+  DiagnosticsCache,
+  VerificationPolicyInput,
+  VerifyChangeInfo,
+  VerifyCheckKind,
+  planVerification,
+} from './verificationPolicy';
 import { getConfig } from '../config';
 import { QuestionItem, QuestionRequest, TerminalApprovalDecision, TodoItem } from '../shared/protocol';
 import { randomId } from '../util/id';
@@ -173,6 +187,35 @@ const BOUNDED_ALLOWED_TOOLS = new Set([
   'outgoing_calls',
   'inspect_file_context',
   'investigate_issue',
+]);
+
+const ADAPTIVE_COMPOUND_TOOLS = new Set([
+  'apply_change_set',
+  'fix_in_file',
+  'fix_diagnostic',
+  'add_import_and_use',
+  'rename_symbol',
+  'refactor_symbol',
+  'update_related_files',
+]);
+
+const ADAPTIVE_SYMBOL_TOOLS = new Set([
+  'rename_symbol',
+  'add_import_and_use',
+  'refactor_symbol',
+  'update_related_files',
+]);
+
+const MAX_RELATED_DIAGNOSTIC_FILES = 10;
+const MAX_CLOSEST_TESTS = 2;
+const ADAPTIVE_PACKAGE_WALK_LIMIT = 300;
+const ADAPTIVE_PACKAGE_ROOT_CAP = 50;
+const PACKAGE_MANIFEST_FILES = new Set([
+  'package.json',
+  'Cargo.toml',
+  'go.mod',
+  'pyproject.toml',
+  'pnpm-workspace.yaml',
 ]);
 
 const useSkillSchema: ToolDef = {
@@ -252,11 +295,15 @@ export interface ToolBoxOptions {
   externalDirectories?: ExternalDirectoryConsent;
   recentRunOperations?: (filePath: string) => string[];
   readCache?: FileReadCache;
+  planCheckRequirement?: VerifyCheckKind;
 }
 
 export class ToolBox {
   private readonly externalDirectories: ExternalDirectoryConsent;
   private readonly readCache: FileReadCache;
+  private readonly adaptiveDiagnostics = new DiagnosticsCache();
+  private readonly repairStates = new Map<string, { attempts: number; hash: string; checkId: string }>();
+  private packageRootsCache?: number;
 
   constructor(private readonly options: ToolBoxOptions) {
     this.externalDirectories = options.externalDirectories ?? new ExternalDirectoryConsent();
@@ -276,10 +323,11 @@ export class ToolBox {
         return `Error: invalid arguments for ${name} — ${problem}. Re-emit the call with valid JSON matching the schema.`;
       }
       const outcome = await this.dispatch(name, args, context);
+      const text = await this.adaptiveVerification(name, args, context, outcome.text);
       if (outcome.spilled || SKIP_SPILL.has(name)) {
-        return outcome.text;
+        return text;
       }
-      return await spillOutput(outcome.text, name);
+      return await spillOutput(text, name);
     } catch (error) {
       return `Error: ${errorMessage(error)}`;
     }
@@ -2850,6 +2898,492 @@ export class ToolBox {
     } catch {
       return [];
     }
+  }
+
+  private async adaptiveVerification(
+    name: string,
+    args: Record<string, any>,
+    context: ToolExecutionContext,
+    text: string,
+  ): Promise<string> {
+    if (!ADAPTIVE_COMPOUND_TOOLS.has(name)) {
+      return text;
+    }
+    try {
+      return await this.adaptiveVerifyResult(name, args, context, text);
+    } catch {
+      return text;
+    }
+  }
+
+  private async adaptiveVerifyResult(
+    name: string,
+    args: Record<string, any>,
+    context: ToolExecutionContext,
+    text: string,
+  ): Promise<string> {
+    const result = parseCompoundResult(text);
+    if (!result) {
+      return text;
+    }
+    if (!getConfig().adaptiveVerify) {
+      return text;
+    }
+    const changes = this.verificationChanges(name, args, result);
+    if (changes.length === 0) {
+      return text;
+    }
+    const touched = this.touchedSymbolsOrImports(name, result);
+    const pending = this.pendingRepairChecks(changes);
+    const input: VerificationPolicyInput = {
+      changes,
+      touchedSymbolsOrImports: touched,
+      diagnosticsErrors: (result.diagnostics ?? []).filter((item) => item.severity === 'error').length,
+      priorCheckFailed: pending.size > 0,
+      packageRootCount: await this.packageRootCount(),
+      resolverConfident: true,
+      ...(this.options.planCheckRequirement ? { planRequiresCheck: this.options.planCheckRequirement } : {}),
+    };
+    let plan = planVerification(input);
+    if (plan.level === 3 && plan.commandKind && pending.size === 0) {
+      const resolution = await this.commandFor(plan.commandKind);
+      if (!resolution.candidate) {
+        plan = planVerification({ ...input, resolverConfident: false });
+      }
+    }
+    if (result.status !== 'verified') {
+      return compoundResult({
+        ...result,
+        policyLevel: plan.level,
+        reasons: plan.reasons,
+      });
+    }
+    if (plan.needsInput && pending.size === 0) {
+      const note = `Adaptive verification needs a confident ${plan.commandKind} command; none was resolved and no command ran. Set devFirst.${plan.commandKind}Command or add a manifest script.`;
+      return compoundResult({
+        ...result,
+        status: 'needs_input',
+        message: result.message ? `${result.message}\n${note}` : note,
+        verification: { level: 'partial', checks: this.mergeChecks(result.verification?.checks ?? [], plan.checks) },
+        policyLevel: plan.level,
+        reasons: plan.reasons,
+        repairAllowed: false,
+      });
+    }
+    const listedChecks = pending.size > 0 ? [...pending] : plan.checks;
+    const outcome = await this.runVerificationChecks(name, args, context, changes, result, listedChecks, touched, plan.commandKind);
+    const checks = this.mergeChecks(result.verification?.checks ?? [], listedChecks);
+    const evidence = [
+      ...(result.evidence ?? []),
+      ...outcome.evidence,
+      ...outcome.skipped.map((skip) => ({ kind: 'skip', summary: `${skip.check} skipped: ${skip.reason}` })),
+    ];
+    if (outcome.failure) {
+      const key = `${outcome.failure.path}\u0000${outcome.failure.check}`;
+      const prior = this.repairStates.get(key);
+      const attempts = (prior?.attempts ?? 0) + 1;
+      const hash = (await this.fileHash(outcome.failure.path)) ?? '';
+      this.repairStates.set(key, { attempts, hash, checkId: outcome.failure.check });
+      const repairAllowed = attempts < 2;
+      return compoundResult({
+        ...result,
+        status: 'failed',
+        message: repairAllowed ? outcome.failure.message : 'Repair attempt already used; stopping.',
+        verification: { level: 'none', checks },
+        evidence,
+        policyLevel: plan.level,
+        reasons: plan.reasons,
+        repairAllowed,
+      });
+    }
+    this.clearRepairStates(changes);
+    const level =
+      result.verification?.level === 'full' && outcome.skipped.length === 0 ? 'full' : 'partial';
+    return compoundResult({
+      ...result,
+      verification: { level, checks },
+      evidence,
+      policyLevel: plan.level,
+      reasons: plan.reasons,
+      repairAllowed: false,
+    });
+  }
+
+  private verificationChanges(name: string, args: Record<string, any>, result: CompoundResult): VerifyChangeInfo[] {
+    if (name === 'apply_change_set' && Array.isArray(args.changes)) {
+      const changes: VerifyChangeInfo[] = [];
+      for (const entry of args.changes) {
+        if (!entry || typeof entry !== 'object') {
+          continue;
+        }
+        const validation = validateWorkspacePath(this.options.root, entry.path);
+        if (!validation.ok) {
+          continue;
+        }
+        const action = entry.action === 'create' || entry.action === 'delete' ? entry.action : 'edit';
+        changes.push({ path: validation.relative, action });
+      }
+      return changes;
+    }
+    return (result.files ?? []).map((file) => ({ path: file, action: 'edit' as const }));
+  }
+
+  private touchedSymbolsOrImports(name: string, result: CompoundResult): boolean {
+    if (ADAPTIVE_SYMBOL_TOOLS.has(name)) {
+      return true;
+    }
+    return (result.diff ?? '')
+      .split('\n')
+      .some((line) => /^\+\s*(import\b|export\b|declare\b|.*\b(function|class|interface|type|enum|namespace|struct)\b)/.test(line));
+  }
+
+  private verificationPosition(
+    name: string,
+    args: Record<string, any>,
+  ): { absolute: string; line: number; character: number } | undefined {
+    if (!ADAPTIVE_SYMBOL_TOOLS.has(name)) {
+      return undefined;
+    }
+    const target = this.resolveCompoundTarget(args.path);
+    if (!target) {
+      return undefined;
+    }
+    const zeroBased = toZeroBased(args.line, args.character);
+    if (!zeroBased) {
+      return undefined;
+    }
+    return { absolute: target.absolute, line: zeroBased.line, character: zeroBased.character };
+  }
+
+  private mergeChecks(existing: string[], added: string[]): string[] {
+    const merged = [...existing];
+    for (const check of added) {
+      if (!merged.includes(check)) {
+        merged.push(check);
+      }
+    }
+    return merged;
+  }
+
+  private pendingRepairChecks(changes: VerifyChangeInfo[]): Set<string> {
+    const pending = new Set<string>();
+    for (const change of changes) {
+      for (const [key, state] of this.repairStates) {
+        if (key.startsWith(`${change.path}\u0000`)) {
+          pending.add(state.checkId);
+        }
+      }
+    }
+    return pending;
+  }
+
+  private clearRepairStates(changes: VerifyChangeInfo[]): void {
+    for (const change of changes) {
+      for (const key of [...this.repairStates.keys()]) {
+        if (key.startsWith(`${change.path}\u0000`)) {
+          this.repairStates.delete(key);
+        }
+      }
+    }
+  }
+
+  private async fileHash(relative: string): Promise<string | undefined> {
+    const validation = validateWorkspacePath(this.options.root, relative);
+    if (!validation.ok) {
+      return undefined;
+    }
+    const text = await this.readTextIfExists(validation.absolute);
+    return text === undefined ? undefined : sha1Of(text);
+  }
+
+  private async packageRootCount(): Promise<number> {
+    if (this.packageRootsCache !== undefined) {
+      return this.packageRootsCache;
+    }
+    const queue: Array<{ dir: string; depth: number }> = [{ dir: this.options.root, depth: 0 }];
+    let count = 0;
+    let scanned = 0;
+    while (queue.length > 0 && scanned < ADAPTIVE_PACKAGE_WALK_LIMIT) {
+      const current = queue.shift()!;
+      scanned++;
+      let entries: Array<{ name: string; isFile(): boolean; isDirectory(): boolean }>;
+      try {
+        entries = await fs.readdir(current.dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      if (entries.some((entry) => entry.isFile() && PACKAGE_MANIFEST_FILES.has(entry.name))) {
+        count++;
+      }
+      if (current.depth >= 2) {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory() || IGNORED_DIRS.has(entry.name) || entry.name.startsWith('.')) {
+          continue;
+        }
+        queue.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
+      }
+    }
+    this.packageRootsCache = Math.min(count, ADAPTIVE_PACKAGE_ROOT_CAP);
+    return this.packageRootsCache;
+  }
+
+  private async commandFor(
+    kind: ProjectCommandKind,
+  ): Promise<{ candidate?: ProjectCommandCandidate; ambiguous: boolean }> {
+    const config = getConfig();
+    const resolution = await resolveProjectCommands(this.options.root, {
+      typecheck: config.typecheckCommand,
+      test: config.testCommand,
+      lint: config.lintCommand,
+      build: config.buildCommand,
+    });
+    const matches = resolution.candidates.filter((candidate) => candidate.kind === kind);
+    if (matches.length > 1) {
+      return { ambiguous: true };
+    }
+    return { ambiguous: false, candidate: matches[0] };
+  }
+
+  private async cachedDiagnostics(paths: string[]): Promise<FileDiagnostic[]> {
+    const collected: FileDiagnostic[] = [];
+    const misses: Array<{ absolute: string; text: string }> = [];
+    for (const absolute of [...new Set(paths)]) {
+      const text = await this.readTextIfExists(absolute);
+      if (text === undefined) {
+        continue;
+      }
+      const cached = this.adaptiveDiagnostics.get(absolute, text);
+      if (cached) {
+        collected.push(...cached);
+      } else {
+        misses.push({ absolute, text });
+      }
+    }
+    if (misses.length > 0) {
+      const found = await this.safeDiagnostics(misses.map((miss) => miss.absolute));
+      for (const miss of misses) {
+        const own = found.filter((item) => item.absolute === miss.absolute);
+        this.adaptiveDiagnostics.set(miss.absolute, miss.text, own);
+        collected.push(...own);
+      }
+    }
+    return collected;
+  }
+
+  private async closestTestTargets(changes: VerifyChangeInfo[]): Promise<string[]> {
+    const candidates = new Set<string>();
+    for (const change of changes) {
+      const validation = validateWorkspacePath(this.options.root, change.path);
+      if (!validation.ok) {
+        continue;
+      }
+      const uri = pathToFileURL(validation.absolute).toString();
+      for (const target of [...testTargets(uri), ...adjacentTests(uri)]) {
+        if (isTestFile(target)) {
+          candidates.add(target);
+        }
+      }
+    }
+    const found: string[] = [];
+    for (const candidate of candidates) {
+      if (found.length >= MAX_CLOSEST_TESTS) {
+        break;
+      }
+      let absolute: string;
+      try {
+        absolute = fileURLToPath(candidate);
+      } catch {
+        continue;
+      }
+      const relative = path.relative(this.options.root, absolute).split(path.sep).join('/');
+      const validation = validateWorkspacePath(this.options.root, relative);
+      if (!validation.ok) {
+        continue;
+      }
+      if (await this.pathExists(validation.absolute)) {
+        found.push(validation.relative);
+      }
+    }
+    return found;
+  }
+
+  private async runVerificationCommand(
+    command: string,
+    context: ToolExecutionContext,
+  ): Promise<{ passed: boolean; text: string }> {
+    const outcome = await this.runCommand({ command }, context);
+    return { passed: /^Exit code: 0\b/m.test(outcome.text), text: outcome.text };
+  }
+
+  private async runVerificationChecks(
+    name: string,
+    args: Record<string, any>,
+    context: ToolExecutionContext,
+    changes: VerifyChangeInfo[],
+    result: CompoundResult,
+    checks: string[],
+    touched: boolean,
+    commandKind: VerifyCheckKind | undefined,
+  ): Promise<{
+    performed: string[];
+    skipped: Array<{ check: string; reason: string }>;
+    failure?: { check: string; path: string; message: string };
+    evidence: CompoundEvidence[];
+  }> {
+    const performed: string[] = [];
+    const skipped: Array<{ check: string; reason: string }> = [];
+    const evidence: CompoundEvidence[] = [];
+    let failure: { check: string; path: string; message: string } | undefined;
+    const wants = (check: string): boolean => checks.includes(check);
+    if (wants('write')) {
+      performed.push('write');
+    }
+    if (wants('diff')) {
+      if (result.diff) {
+        performed.push('diff');
+      } else {
+        skipped.push({ check: 'diff', reason: 'no before content' });
+      }
+    }
+    if (wants('diagnostics')) {
+      performed.push('diagnostics');
+    }
+    const changedAbsolute = new Set<string>();
+    for (const change of changes) {
+      const validation = validateWorkspacePath(this.options.root, change.path);
+      if (validation.ok) {
+        changedAbsolute.add(validation.absolute);
+      }
+    }
+    const position = this.verificationPosition(name, args);
+    let related: string[] | undefined;
+    if (wants('references')) {
+      if (!touched) {
+        skipped.push({ check: 'references', reason: 'no symbol or import change' });
+      } else if (!position) {
+        skipped.push({ check: 'references', reason: 'no symbol position' });
+      } else {
+        const locations = await referenceLocationsAt(position.absolute, position.line, position.character);
+        related = [...new Set(locations.map((location) => location.absolute))];
+        performed.push('references');
+        evidence.push({
+          kind: 'references',
+          summary: `${locations.length} reference(s) across ${related.length} file(s)`,
+        });
+      }
+    }
+    if (wants('related-diagnostics')) {
+      if (!related && touched && position) {
+        const files = await referenceFilesAt(position.absolute, position.line, position.character);
+        related = [];
+        for (const file of files) {
+          const validation = validateWorkspacePath(this.options.root, file);
+          if (validation.ok) {
+            related.push(validation.absolute);
+          }
+        }
+      }
+      const capped = (related ?? [])
+        .filter((absolute) => !changedAbsolute.has(absolute))
+        .slice(0, MAX_RELATED_DIAGNOSTIC_FILES);
+      if (capped.length === 0) {
+        skipped.push({ check: 'related-diagnostics', reason: 'no related files' });
+      } else {
+        const diagnostics = await this.cachedDiagnostics(capped);
+        performed.push('related-diagnostics');
+        evidence.push(this.diagnosticsEvidence(diagnostics));
+      }
+    }
+    if (wants('closest-test')) {
+      const tests = await this.closestTestTargets(changes);
+      const testCommand = await this.commandFor('test');
+      if (tests.length === 0) {
+        skipped.push({ check: 'closest-test', reason: 'no adjacent tests' });
+      } else if (!testCommand.candidate) {
+        skipped.push({
+          check: 'closest-test',
+          reason: testCommand.ambiguous ? 'ambiguous test commands' : 'no test command',
+        });
+      } else {
+        for (const test of tests) {
+          const command = `${testCommand.candidate.command} ${test}`;
+          const outcome = await this.runVerificationCommand(command, context);
+          evidence.push({ kind: 'command', summary: `${command} — ${outcome.passed ? 'passed' : 'failed'}` });
+          if (!outcome.passed) {
+            failure = {
+              check: 'closest-test',
+              path: changes[0].path,
+              message: `${command} failed:\n${capLines(outcome.text, 10)}`,
+            };
+            break;
+          }
+        }
+        if (!failure) {
+          performed.push('closest-test');
+        }
+      }
+    }
+    if (wants('package-typecheck')) {
+      if (failure) {
+        skipped.push({ check: 'package-typecheck', reason: 'stopped after failure' });
+      } else {
+        const resolution = await this.commandFor('typecheck');
+        if (!resolution.candidate) {
+          skipped.push({
+            check: 'package-typecheck',
+            reason: resolution.ambiguous ? 'ambiguous typecheck commands' : 'no typecheck command',
+          });
+        } else {
+          const outcome = await this.runVerificationCommand(resolution.candidate.command, context);
+          evidence.push({
+            kind: 'command',
+            summary: `typecheck ${resolution.candidate.command} — ${outcome.passed ? 'passed' : 'failed'}`,
+          });
+          if (outcome.passed) {
+            performed.push('package-typecheck');
+          } else {
+            failure = {
+              check: 'package-typecheck',
+              path: changes[0].path,
+              message: `${resolution.candidate.command} failed:\n${capLines(outcome.text, 10)}`,
+            };
+          }
+        }
+      }
+    }
+    if (wants('project-command')) {
+      if (failure) {
+        skipped.push({ check: 'project-command', reason: 'stopped after failure' });
+      } else if (!commandKind) {
+        skipped.push({ check: 'project-command', reason: 'no command kind' });
+      } else {
+        const resolution = await this.commandFor(commandKind);
+        if (!resolution.candidate) {
+          skipped.push({
+            check: 'project-command',
+            reason: resolution.ambiguous ? `ambiguous ${commandKind} commands` : `no ${commandKind} command`,
+          });
+        } else {
+          const outcome = await this.runVerificationCommand(resolution.candidate.command, context);
+          evidence.push({
+            kind: 'command',
+            summary: `${commandKind} ${resolution.candidate.command} — ${outcome.passed ? 'passed' : 'failed'}`,
+          });
+          if (outcome.passed) {
+            performed.push('project-command');
+          } else {
+            failure = {
+              check: 'project-command',
+              path: changes[0].path,
+              message: `${resolution.candidate.command} failed:\n${capLines(outcome.text, 10)}`,
+            };
+          }
+        }
+      }
+    }
+    return { performed, skipped, ...(failure ? { failure } : {}), evidence };
   }
 
   private async pathExists(absolute: string): Promise<boolean> {

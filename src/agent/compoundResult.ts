@@ -1,4 +1,5 @@
 import type { FileDiagnostic } from './diagnostics';
+import type { VerifyLevel } from './verificationPolicy';
 
 export type CompoundStatus = 'verified' | 'needs_input' | 'blocked' | 'failed';
 export type VerificationLevel = 'full' | 'partial' | 'none';
@@ -50,6 +51,9 @@ export interface CompoundResult {
   skipped?: string[];
   proposedChangeSet?: ProposedChangeValidation[];
   coverage?: CompoundCoverage;
+  policyLevel?: VerifyLevel;
+  reasons?: string[];
+  repairAllowed?: boolean;
 }
 
 export interface CompoundResultPartial {
@@ -65,6 +69,9 @@ export interface CompoundResultPartial {
   skipped?: string[];
   proposedChangeSet?: ProposedChangeValidation[];
   coverage?: CompoundCoverage;
+  policyLevel?: VerifyLevel;
+  reasons?: string[];
+  repairAllowed?: boolean;
 }
 
 export function buildCompoundResult(partial: CompoundResultPartial): CompoundResult {
@@ -84,6 +91,9 @@ export function buildCompoundResult(partial: CompoundResultPartial): CompoundRes
     ...(partial.skipped !== undefined ? { skipped: partial.skipped } : {}),
     ...(partial.proposedChangeSet !== undefined ? { proposedChangeSet: partial.proposedChangeSet } : {}),
     ...(partial.coverage !== undefined ? { coverage: partial.coverage } : {}),
+    ...(partial.policyLevel !== undefined ? { policyLevel: partial.policyLevel } : {}),
+    ...(partial.reasons !== undefined ? { reasons: partial.reasons } : {}),
+    ...(partial.repairAllowed !== undefined ? { repairAllowed: partial.repairAllowed } : {}),
   };
 }
 

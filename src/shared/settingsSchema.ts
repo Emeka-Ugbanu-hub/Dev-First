@@ -117,6 +117,15 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     type: 'boolean',
   },
   {
+    key: 'adaptiveVerify',
+    tab: 'behavior',
+    group: 'Verification',
+    label: 'Adaptive verification after edits',
+    description:
+      'Escalate verification automatically after edits: diagnostics, related files, closest tests, then the project typecheck or test command when risk or scope warrants it.',
+    type: 'boolean',
+  },
+  {
     key: 'typecheckCommand',
     tab: 'behavior',
     group: 'Verification',

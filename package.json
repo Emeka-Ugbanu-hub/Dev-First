@@ -412,6 +412,11 @@
           "default": true,
           "description": "After each edit, feed language-server errors and warnings for the touched files back to the agent."
         },
+        "devFirst.adaptiveVerify": {
+          "type": "boolean",
+          "default": true,
+          "description": "Escalate verification automatically after edits: diagnostics, related files, closest tests, then the project typecheck or test command when risk or scope warrants it."
+        },
         "devFirst.typecheckCommand": {
           "type": "string",
           "default": "",
