@@ -96,7 +96,6 @@ export function PromptRail({
             <>
               <div className="rail-card-title-row">
                 <div className="rail-card-title">{hoveredPrompt.text}</div>
-                <span className="codicon codicon-bookmark rail-card-bookmark" aria-hidden="true" />
               </div>
               {hoveredPrompt.response && <div className="rail-card-text">{hoveredPrompt.response}</div>}
             </>
