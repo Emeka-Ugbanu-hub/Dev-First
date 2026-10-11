@@ -2,31 +2,11 @@
 
 ![Dev-First — Plan first. Build with confidence.](media/banner.png)
 
-> Plan first. Build with confidence. A focused coding agent for VS Code with approval-gated changes, evidence-backed scans, and architecture drill-down.
+> **Dev-First is an open-source, plan-first coding agent for VS Code.** It helps developers understand their code, decide what should happen, and stay in control while AI carries out the work.
 
-A plan-first AI coding agent for VS Code. Every request becomes a plan you approve — no code changes happen until you press **GO ON**.
+Dev-First was built around a simple developer need: see the work before it happens. Requests that need changes become a clear plan with the intended steps and files. You can ask questions, refine the plan, approve it, watch the execution, inspect the real diff, and learn how the result works. Small, low-risk requests can still be handled directly.
 
-## Gallery
-
-<!-- TODO: screenshots are not committed yet. Add plan.png, scanning.png, architecture.png, and review.png under media/screenshots/ and uncomment the links below.
-
-### Plan and approval
-
-![A Dev-First plan ready for approval](media/screenshots/plan.png)
-
-### Scanner finding
-
-![A scanner finding with its explanation](media/screenshots/scanning.png)
-
-### Architecture map
-
-![Architecture map drill-down](media/screenshots/architecture.png)
-
-### Review changes
-
-![Diff review bar for proposed code changes](media/screenshots/review.png)
-
--->
+The goal is speed with understanding: less repetitive orchestration, safer changes, and a codebase that becomes easier to read as you work on it.
 
 ## How it works
 
@@ -49,29 +29,39 @@ The planner physically cannot write files — write tools only exist during exec
 
 Context pipeline: **select** (recent messages and pinned context) → **project** (repo map, references, semantic search) → **compact** (profile-triggered summaries and deterministic pruning).
 
-## Capabilities
+## What Dev-First gives you
 
-| Area | What you get |
-| --- | --- |
-| Planning | Read-only exploration, approval-gated plans with `WHAT` / `HOW` / `WHY` / `TRADEOFF` / `CONTEXT`, expected-files lists, refinement loop, Mermaid flow diagrams |
-| Editing | Compound tools first (`apply_change_set`, `fix_in_file`, `fix_diagnostic`, `rename_symbol`, `add_import_and_use`, `update_related_files`, `refactor_symbol`) with atomic writes and rollback; `write_file`, `edit_file`, `apply_patch` remain fallbacks; diff review with Accept/Reject |
-| Verification | Adaptive L0–L3 verification (diagnostics, related files, references, closest tests, resolved project typecheck/test/lint/build), one bounded repair attempt |
-| Recovery | Durable run journal, queue/approval/question recovery, crash-safe file snapshots, restore conflict protection, finish gate, loop detection |
-| Context | Window-tiered context profiles, auto compaction plus deterministic pruning, full-history archives with pinned context, relevance retrieval, `compress_context` |
-| Terminal | Command execution with per-command approval (granular auto-approve: safe commands only, all commands, or YOLO); 15s inactivity timeout with background handoff, 10-minute cap, ANSI/OSC stripping; command generation from plain English (`Cmd/Ctrl+Shift+G`), explain/fix from the terminal context menu; OS sandbox on by default (macOS `sandbox-exec` / Linux `bubblewrap`) with a one-time "run without sandbox" escape hatch |
-| Intelligence | LSP diagnostics after every edit, symbol navigation tools (`find_symbol`, `find_references`, `document_symbols`, `go_to_definition`), scoped repo maps (`inspect_file_context` with `includeMap`), per-model context windows (models.dev), model-family prompts, stale-read rewriting, preflight context compaction + forced-compact retry, three-segment context bar, mistake tracker with 3-strike guidance, empty-response retry, parallel read-only tools, prompt caching, diff apply fallback ladder (exact → fuzzy → drift → anchor), malformed-JSON repair, defensive file reads (line windows, head+tail truncation, streamed large files) |
-| Reasoning | Model-specific reasoning controls appear only when the connected model advertises supported effort levels; thinking output appears in a collapsible row |
-| Memory | Project memory persisted across sessions, injected into prompts, with `memory_recall` / `memory_save` tools |
-| Processes | `background_process` tool: start dev servers/watchers with readiness detection, list/logs/stop |
-| Review | Built-in `/review` command (uncommitted / staged / branch / commit), a multi-file **Diff view** button, **Summarize review** (structured scorecard) and **Review across files** (cross-file issues) actions |
-| Research | `web_search`, `web_fetch`, and `semantic_search` with a **bundled local embedding model** — offline, private, no API key |
-| Input | Hints in the placeholder, paste collapse (`[Pasted ~N lines]` chips, large pastes saved to `.dev-first/pastes`), drag-and-drop images with an overlay, enhance-prompt wand (rewrites your draft, Cmd+Z restores), auto-approve shield toggle, ↑/↓ prompt history, drafts |
-| Chat UI | Mermaid diagrams render inside messages, long code blocks collapse, blockquotes/task lists styled, scroll-to-bottom pill, image lightbox, markdown with syntax-highlighted code (copy button), expandable tool output (terminal output, exit codes, file reads, rich MCP rendering), error and completion cards, context usage bar with manual compact, slash-command menu, @file mentions, quote/reply, edit & rewind, queued messages, prompt history (↑/↓), draft persistence, session search (case/regex, match navigation), prompt rail, load-earlier pagination, optional completion sound |
-| Autocomplete | Optional inline ghost-text completions via an FIM endpoint (`devFirst.autocomplete`, model via `devFirst.autocompleteModel`) |
-| Workflow | `todo_write` task tracking, skills (`.dev-first/skills/*.md`), slash commands (`.dev-first/commands/*.md`), checkpoints/revert |
-| Ecosystem | MCP servers (one-click setup), browser automation that auto-launches Chrome/Edge, git worktrees for parallel sessions (merge with conflict handoff to the agent, optional branch cleanup, `.worktreeinclude`), SCM commit-message generation |
-| Notifications | Completion, error, and **waiting-on-you** notifications (plan approval, command Allow/Deny, questions) with sounds (macOS) and keep-awake while the agent runs |
-| Scanning | On-demand AI review from the **Scan File** editor button or command palette; local candidate signals adjudicated by AI plus cross-file pair judging with cached verdicts; evidence-backed squiggles with category, severity, confidence, hover explanations, and coverage status across vulnerability, smell, bug, secret, architecture, maintainability, and scalability |
+### Plan before code
+
+- Read-only exploration before edits.
+- Plans with `WHAT`, `HOW`, `WHY`, `TRADEOFF`, context, ordered steps, expected files, and diagrams when useful.
+- Editable plans, follow-up discussion, step checkboxes, and approval with **GO ON**.
+- Direct answers and small actions without forcing a plan when one is not useful.
+
+### Safe execution and verification
+
+- Approval-gated writes and terminal commands.
+- Compound tools for common edits, atomic writes, checkpoints, rollback, and diff review.
+- Adaptive verification: diagnostics first, then related files, references, closest tests, and project checks when risk requires it.
+- One bounded repair attempt instead of an unbounded fix loop.
+
+### Understand and improve the codebase
+
+- Evidence-backed architecture maps with drill-down into UI, logic, storage, integrations, runtime, and tooling.
+- Symbols, imports, references, diagnostics, related-file lookup, and local semantic search.
+- On-demand **Scan File** review with exact-line squiggles and findings for vulnerability, bug, secret, smell, architecture, maintainability, and scalability.
+- Mermaid diagrams and plain-language explanations when they improve understanding.
+
+### Review, learn, and recover
+
+- Multi-file diff review, per-step checkpoints, revert/redo, and completion walkthroughs.
+- Durable run journals, recovery cards, queued-message recovery, and safe resume, rollback, or discard after a restart.
+- Context profiles, pinned essentials, archive rotation, relevance retrieval, deterministic summaries, and local embeddings.
+
+### Research and everyday tools
+
+- Cached `web_search` and `web_fetch` with retries, citations, and an untrusted web-content boundary.
+- Browser automation, background processes, MCP servers, git worktrees, optional autocomplete, images, file mentions, slash commands, skills, memory, notifications, and sound controls.
 
 ## Setup
 
