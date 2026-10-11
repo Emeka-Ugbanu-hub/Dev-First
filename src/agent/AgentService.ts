@@ -14,7 +14,12 @@ import type { FinishGateResult } from './finishGate';
 import { parseCompoundResult } from './compoundResult';
 import { PromptFamily, buildExecutorSpec, buildExecutorSystemPrompt } from '../planner/prompts';
 import { chatWithRetry } from '../llm/retry';
-import { DoomLoopDetector } from './doomloop';
+import {
+  DoomLoopDetector,
+  LoopProgress,
+  referencedFilePaths,
+  touchedFileHash,
+} from './doomloop';
 import { MistakeTracker } from './mistakes';
 import { isContextOverflowError } from '../llm/errors';
 import { normalizeToolArguments } from '../util/toolArgs';
@@ -83,6 +88,7 @@ export interface AgentCallbacks {
   }): void;
   takePendingUserMessage?(): string | undefined;
   planCheckRequirement?: VerifyCheckKind;
+  progressSnapshot?(): { completedStepCount?: number };
 }
 
 export interface AgentResult {
@@ -151,6 +157,40 @@ export class AgentService {
     const recentToolFailures: string[] = [];
     let finishContinuations = 0;
     let finishRejected = false;
+    let lastProgressAt = Date.now();
+    let toolCallIndex = 0;
+    let completedTodoSteps = 0;
+    const callIndexById = new Map<string, number>();
+    const deferredLoopWarnings = new Map<string, string>();
+    const progressLog: Array<{ callIndex: number; description: string; fingerprint: string }> = [];
+    const observedChecks = new Set(this.toolbox.adaptiveVerificationSnapshot?.().verificationRan ?? []);
+
+    const progressDescription = (): string =>
+      progressLog.length > 0 ? progressLog[progressLog.length - 1].description : 'run start';
+
+    const fingerprintFor = (call?: ToolCall): string => {
+      const snapshot = this.toolbox.adaptiveVerificationSnapshot?.();
+      const completedStepCount = callbacks.progressSnapshot?.().completedStepCount ?? 0;
+      const touched = call
+        ? touchedFileHash(call, this.toolbox.cachedFileHashes?.(referencedFilePaths(call)) ?? new Map())
+        : '';
+      return `${runChangedPaths.size}|${snapshot?.newDiagnosticErrors ?? 0}|${completedStepCount}|${touched}|${Math.floor(lastProgressAt / 1000)}`;
+    };
+
+    const progressFor = (call: ToolCall): LoopProgress => ({
+      fingerprint: fingerprintFor(call),
+      description: progressDescription(),
+    });
+
+    const noteProgress = (callIndex: number, description: string, call?: ToolCall): void => {
+      lastProgressAt = Date.now();
+      const fingerprint = fingerprintFor(call);
+      progressLog.push({ callIndex, description, fingerprint });
+      if (progressLog.length > 5) {
+        progressLog.shift();
+      }
+      this.doomLoop.noteProgress({ fingerprint, description });
+    };
 
     for (let step = 0; step < this.options.maxSteps; step++) {
       if (shouldPrune(estimateTokens(messages), contextLimit, profile)) {
@@ -172,6 +212,7 @@ export class AgentService {
       if (steering) {
         messages.push({ role: 'user', content: steering });
         callbacks.onNotice?.('Added your message to the running task.');
+        noteProgress(toolCallIndex, 'developer steering');
       }
 
       callbacks.onUsage?.(estimateTokens(messages));
@@ -290,16 +331,20 @@ export class AgentService {
           }
           return { summary, files: parseFinishFiles(args), reachedLimit: false };
         }
-        const loopCheck = this.doomLoop.record(call);
+        toolCallIndex += 1;
+        callIndexById.set(call.id, toolCallIndex);
+        const loopCheck = this.doomLoop.record(call, progressFor(call));
         if (loopCheck.action === 'stop') {
-          callbacks.onNotice?.(
-            `Stopped: the same tool call (${call.name}) was repeated ${loopCheck.count} times. Possible loop.`,
-          );
+          callbacks.onNotice?.(loopCheck.message ?? `Stopped: the same tool call (${call.name}) was repeated ${loopCheck.count} times. Possible loop.`);
           return { reachedLimit: false, stoppedByLoop: true };
+        }
+        if (loopCheck.action === 'warn' && loopCheck.message) {
+          deferredLoopWarnings.set(call.id, loopCheck.message);
         }
       }
       if (finishRejected) {
         finishRejected = false;
+        deferredLoopWarnings.clear();
         continue;
       }
 
@@ -385,14 +430,62 @@ export class AgentService {
           }
         }
 
+        const callIndex = callIndexById.get(call.id) ?? toolCallIndex;
+        let callMadeProgress = false;
         const changedPaths = mutationPaths(call, result);
         for (const changedPath of changedPaths) {
           runChangedPaths.add(changedPath);
         }
         if (changedPaths.length > 0) {
+          const description =
+            call.name === 'apply_change_set'
+              ? `applied change set (${changedPaths.length} files)`
+              : changedPaths.length === 1
+                ? `edited ${changedPaths[0]}`
+                : `edited ${changedPaths.length} files`;
+          noteProgress(callIndex, description, call);
+          callMadeProgress = true;
           const rewritten = rewriteStaleReads(messages, changedPaths, readCallPaths, readMessageIndex);
           if (rewritten > 0) {
             callbacks.onNotice?.(`Marked ${rewritten} earlier file read(s) as outdated.`);
+          }
+        }
+
+        if (!result.startsWith('Error:') && !result.startsWith('Error in')) {
+          const freshChecks = (this.toolbox.adaptiveVerificationSnapshot?.().verificationRan ?? []).filter(
+            (check) => !observedChecks.has(check),
+          );
+          if (freshChecks.length > 0) {
+            for (const check of freshChecks) {
+              observedChecks.add(check);
+            }
+            const compound = parseCompoundResult(result);
+            const passed =
+              call.name === 'run_terminal_command'
+                ? /^Exit code: 0\b/m.test(result)
+                : compound === undefined || compound.status === 'verified';
+            if (passed) {
+              noteProgress(
+                callIndex,
+                call.name === 'verify_change' ? 'verify_change passed' : `${freshChecks[freshChecks.length - 1]} passed`,
+                call,
+              );
+              callMadeProgress = true;
+            }
+          }
+        }
+
+        if (call.name === 'todo_write' && !result.startsWith('Error:')) {
+          const rawTodos = toolCallArgs(call).todos;
+          if (Array.isArray(rawTodos)) {
+            const done = rawTodos.filter(
+              (todo) => todo && typeof todo === 'object' && (todo as { status?: unknown }).status === 'done',
+            ).length;
+            if (done > completedTodoSteps) {
+              completedTodoSteps = done;
+              noteProgress(callIndex, `step ${done} completed`, call);
+              callMadeProgress = true;
+            }
           }
         }
 
@@ -409,12 +502,22 @@ export class AgentService {
           return { reachedLimit: false, stoppedByMistakes: true };
         }
 
-        const loopCheck = this.doomLoop.record(call);
+        const loopCheck = this.doomLoop.record(call, progressFor(call));
+        if (loopCheck.action === 'stop') {
+          callbacks.onNotice?.(loopCheck.message ?? `Stopped: the same tool call (${call.name}) was repeated ${loopCheck.count} times. Possible loop.`);
+          return { reachedLimit: false, stoppedByLoop: true };
+        }
+        const deferredWarning = deferredLoopWarnings.get(call.id);
+        deferredLoopWarnings.delete(call.id);
         if (loopCheck.action === 'warn') {
           messages.push({
             role: 'user',
-            content: `Warning: you have called ${call.name} with identical arguments ${loopCheck.count} times. Stop and reconsider — try a different approach or explain what is blocking you.`,
+            content:
+              loopCheck.message ??
+              `Warning: you have called ${call.name} with identical arguments ${loopCheck.count} times. Stop and reconsider — try a different approach or explain what is blocking you.`,
           });
+        } else if (deferredWarning && !callMadeProgress) {
+          messages.push({ role: 'user', content: deferredWarning });
         }
       }
     }

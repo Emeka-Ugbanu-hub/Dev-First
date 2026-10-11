@@ -209,6 +209,7 @@ const ADAPTIVE_SYMBOL_TOOLS = new Set([
 
 const MAX_RELATED_DIAGNOSTIC_FILES = 10;
 const MAX_CLOSEST_TESTS = 2;
+const MAX_MUTATION_HASHES = 500;
 const ADAPTIVE_PACKAGE_WALK_LIMIT = 300;
 const ADAPTIVE_PACKAGE_ROOT_CAP = 50;
 const PACKAGE_MANIFEST_FILES = new Set([
@@ -313,6 +314,7 @@ export class ToolBox {
   private readonly repairStates = new Map<string, { attempts: number; hash: string; checkId: string }>();
   private readonly verificationRan: string[] = [];
   private readonly diagnosticStats = new Map<string, { baseline: number; latest: number }>();
+  private readonly mutationHashes = new Map<string, string>();
   private diagnosticsObserved = false;
   private packageRootsCache?: number;
 
@@ -324,6 +326,56 @@ export class ToolBox {
 
   resetReadCache(): void {
     this.readCache.clear();
+  }
+
+  cachedFileHashes(relativePaths: string[]): Map<string, string> {
+    const hashes = new Map<string, string>();
+    for (const relative of relativePaths) {
+      const validation = validateWorkspacePath(this.options.root, relative);
+      if (!validation.ok) {
+        continue;
+      }
+      const mutated = this.mutationHashes.get(validation.absolute);
+      if (mutated !== undefined) {
+        hashes.set(validation.relative, mutated);
+        continue;
+      }
+      const prefix = `${validation.absolute}|`;
+      let latest: string | undefined;
+      for (const key of this.readCache.keys()) {
+        if (!key.startsWith(prefix)) {
+          continue;
+        }
+        const hash = key.slice(prefix.length).split('|')[0];
+        if (hash) {
+          latest = hash;
+        }
+      }
+      if (latest) {
+        hashes.set(validation.relative, latest);
+      }
+    }
+    return hashes;
+  }
+
+  private async applyChange(absolute: string, content: string): Promise<string> {
+    this.recordMutation(absolute, sha1Of(content));
+    return this.options.diffManager.applyChange(absolute, content);
+  }
+
+  private async applyDeletion(absolute: string): Promise<string> {
+    this.recordMutation(absolute, '');
+    return this.options.diffManager.applyDeletion(absolute);
+  }
+
+  private recordMutation(absolute: string, hash: string): void {
+    this.mutationHashes.set(absolute, hash);
+    if (this.mutationHashes.size > MAX_MUTATION_HASHES) {
+      const oldest = this.mutationHashes.keys().next().value;
+      if (oldest !== undefined) {
+        this.mutationHashes.delete(oldest);
+      }
+    }
   }
 
   adaptiveVerificationSnapshot(): AdaptiveVerificationSnapshot {
@@ -769,7 +821,7 @@ export class ToolBox {
       return 'The developer denied this edit. Do not retry it unless asked.';
     }
     const content = typeof args.content === 'string' ? args.content : '';
-    const result = await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, content));
+    const result = await withFileLock(absolute, () => this.applyChange(absolute, content));
     return result + (await this.diagnosticsFor([absolute]));
   }
 
@@ -794,7 +846,7 @@ export class ToolBox {
         if (!result.ok) {
           return { error: `Error: ${result.error}` };
         }
-        const applied = await this.options.diffManager.applyChange(absolute, result.content);
+        const applied = await this.applyChange(absolute, result.content);
         return { applied, count: result.count ?? 0 };
       },
     );
@@ -861,9 +913,9 @@ export class ToolBox {
         const results: string[] = [];
         for (const entry of planned) {
           if (entry.type === 'delete') {
-            results.push(await this.options.diffManager.applyDeletion(entry.absolute));
+            results.push(await this.applyDeletion(entry.absolute));
           } else {
-            results.push(await this.options.diffManager.applyChange(entry.absolute, entry.content));
+            results.push(await this.applyChange(entry.absolute, entry.content));
           }
         }
         return results.join('\n') + (await this.diagnosticsFor(touched));
@@ -1276,7 +1328,7 @@ export class ToolBox {
       return { ok: false, stale: errorMessage(error) };
     }
     try {
-      await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, next));
+      await withFileLock(absolute, () => this.applyChange(absolute, next));
     } catch (error) {
       return { ok: false, error: errorMessage(error) };
     }
@@ -1792,9 +1844,9 @@ export class ToolBox {
       }
       try {
         if (item.entry.action === 'delete') {
-          await withFileLock(item.absolute, () => this.options.diffManager.applyDeletion(item.absolute));
+          await withFileLock(item.absolute, () => this.applyDeletion(item.absolute));
         } else {
-          await withFileLock(item.absolute, () => this.options.diffManager.applyChange(item.absolute, item.after ?? ''));
+          await withFileLock(item.absolute, () => this.applyChange(item.absolute, item.after ?? ''));
         }
         applied.push(item.relative);
       } catch (error) {
@@ -1879,10 +1931,10 @@ export class ToolBox {
       try {
         if (original === undefined) {
           if (await this.pathExists(item.absolute)) {
-            await withFileLock(item.absolute, () => this.options.diffManager.applyDeletion(item.absolute));
+            await withFileLock(item.absolute, () => this.applyDeletion(item.absolute));
           }
         } else {
-          await withFileLock(item.absolute, () => this.options.diffManager.applyChange(item.absolute, original.text));
+          await withFileLock(item.absolute, () => this.applyChange(item.absolute, original.text));
         }
         rolledBack.push(relative);
       } catch {
@@ -2569,7 +2621,7 @@ export class ToolBox {
   ): Promise<void> {
     for (const item of [...applied].reverse()) {
       try {
-        await withFileLock(item.absolute, () => this.options.diffManager.applyChange(item.absolute, item.before));
+        await withFileLock(item.absolute, () => this.applyChange(item.absolute, item.before));
       } catch {}
     }
   }
@@ -2667,7 +2719,7 @@ export class ToolBox {
           const affected = [...applied.map((item) => item.relative), candidate.path];
           for (const item of [...applied].reverse()) {
             try {
-              await withFileLock(item.absolute, () => this.options.diffManager.applyChange(item.absolute, item.before));
+              await withFileLock(item.absolute, () => this.applyChange(item.absolute, item.before));
             } catch {}
           }
           return this.needsInput(`Concurrent edit detected in ${affected.join(', ')}; the updates were aborted.`, {
@@ -2854,7 +2906,7 @@ export class ToolBox {
       if (!targetWrite.ok) {
         let rolledBack = false;
         try {
-          await withFileLock(target.absolute, () => this.options.diffManager.applyChange(target.absolute, original.text));
+          await withFileLock(target.absolute, () => this.applyChange(target.absolute, original.text));
           rolledBack = true;
         } catch {}
         if (!targetWrite.stale && rolledBack) {
@@ -2881,11 +2933,11 @@ export class ToolBox {
       }
     } else {
       try {
-        await withFileLock(moveTarget.absolute, () => this.options.diffManager.applyChange(moveTarget.absolute, targetContent));
+        await withFileLock(moveTarget.absolute, () => this.applyChange(moveTarget.absolute, targetContent));
       } catch (error) {
         let rolledBack = false;
         try {
-          await withFileLock(target.absolute, () => this.options.diffManager.applyChange(target.absolute, original.text));
+          await withFileLock(target.absolute, () => this.applyChange(target.absolute, original.text));
           rolledBack = true;
         } catch {}
         return this.failed(`Move failed at ${targetPath} — ${errorMessage(error)}.${rolledBack ? ' The source change was rolled back.' : ' The source change could NOT be rolled back.'}`, {
@@ -2951,14 +3003,14 @@ export class ToolBox {
         return { ok: false, message: applied.error };
       }
       const message = await withFileLock(absolute, () =>
-        this.options.diffManager.applyChange(absolute, applied.content),
+        this.applyChange(absolute, applied.content),
       );
       return { ok: true, message };
     }
     if (content === undefined) {
       return { ok: false, message: 'provide patch or content.' };
     }
-    const message = await withFileLock(absolute, () => this.options.diffManager.applyChange(absolute, content));
+    const message = await withFileLock(absolute, () => this.applyChange(absolute, content));
     return { ok: true, message };
   }
 

@@ -2226,6 +2226,7 @@ export class SessionController {
         onCompaction: (info) => this.addCompactionMessage(info),
         takePendingUserMessage: () => this.takePendingUserMessage(),
         planCheckRequirement: planCheckRequirementFromSteps(this.plan?.steps),
+        progressSnapshot: () => ({ completedStepCount: this.currentRun?.completedSteps.length ?? 0 }),
       });
       if (result.files?.length) {
         this.diffManager.setFileSummaries(result.files);
