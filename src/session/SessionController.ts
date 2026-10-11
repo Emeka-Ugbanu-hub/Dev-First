@@ -331,6 +331,7 @@ export class SessionController {
   private todos: TodoItem[] = [];
   private planVersion = 0;
   private lastRequest = '';
+  private completedRunBoundary = false;
   private lastUserMessageId: string | undefined;
   private abortController: AbortController | null = null;
   private reasoningOverride: string | undefined;
@@ -1627,7 +1628,9 @@ export class SessionController {
       pendingDecisionIds,
       budget: relevanceBudget(this.buildContextProfile().tier),
       pinned: this.buildPinnedContext(),
+      completedRunBoundary: this.completedRunBoundary,
     });
+    this.completedRunBoundary = false;
     return this.maybeCompactPlanner(request.messages, provider);
   }
 
@@ -3344,6 +3347,7 @@ export class SessionController {
     const title = plan.title?.trim() || 'Plan';
     const steps = plan.steps && plan.steps.length > 0 ? [...plan.steps] : undefined;
     if (plan === this.plan) {
+      this.completedRunBoundary = true;
       plan.status = 'completed';
       this.post({ type: 'plan', plan });
       this.plan = null;
@@ -4597,3 +4601,4 @@ export class SessionController {
     }
   }
 }
+

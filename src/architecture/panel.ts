@@ -86,8 +86,14 @@ export class ArchitecturePanel {
 
   static async show(deps: ArchitecturePanelDeps): Promise<void> {
     if (ArchitecturePanel.current) {
-      ArchitecturePanel.current.panel.reveal(vscode.ViewColumn.Active);
-      return;
+      const currentRoot = path.resolve(ArchitecturePanel.current.deps.root);
+      const requestedRoot = path.resolve(deps.root);
+      if (currentRoot === requestedRoot) {
+        ArchitecturePanel.current.panel.reveal(vscode.ViewColumn.Active);
+        return;
+      }
+      // Do not carry a map from another workspace into this project.
+      ArchitecturePanel.current.dispose();
     }
     const panel = vscode.window.createWebviewPanel(
       'devFirst.architecture',

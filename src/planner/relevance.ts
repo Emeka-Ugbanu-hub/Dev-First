@@ -295,6 +295,7 @@ export interface PlannerRequestInput {
   budget?: RelevanceBudget;
   pinned?: PinnedPlannerContext;
   compact?: (messages: ChatMessage[]) => ChatMessage[];
+  completedRunBoundary?: boolean;
 }
 
 export interface PlannerRequestResult {
@@ -322,6 +323,12 @@ export function composePlannerRequest(input: PlannerRequestInput): PlannerReques
   }
   if (selection.summary) {
     messages.push({ role: 'system', content: selection.summary });
+  }
+  if (input.completedRunBoundary) {
+    messages.push({
+      role: 'system',
+      content: '[New request boundary] The previous task is complete. Keep the conversation history as context, but do not continue or repeat its plan unless the latest user message explicitly asks for that.',
+    });
   }
   messages.push(...selection.messages);
   return {
