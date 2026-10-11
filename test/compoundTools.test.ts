@@ -702,3 +702,41 @@ describe('verify_change', () => {
     expect(parsed.message).not.toContain('npm run typecheck');
   });
 });
+
+describe('compound edge cases', () => {
+  it('marks bounded_investigation partial when output exceeds the budget', async () => {
+    const lines = Array.from(
+      { length: 300 },
+      (_value, index) => `export const value${index} = 1234567890;`,
+    );
+    await fs.writeFile(path.join(root, 'big.ts'), `${lines.join('\n')}\n`, 'utf-8');
+    const result = await toolbox().execute(
+      'bounded_investigation',
+      JSON.stringify({ operations: [{ tool: 'read_file', args: { path: 'big.ts' } }] }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.verification.level).toBe('partial');
+    expect(parsed.truncated).toBe(true);
+  });
+
+  it('rejects the whole change set before writing when any target is generated', async () => {
+    await fs.writeFile(path.join(root, 'keep.ts'), 'const a = 1;\n', 'utf-8');
+    await fs.mkdir(path.join(root, 'dist'), { recursive: true });
+    await fs.writeFile(path.join(root, 'dist', 'out.js'), 'old\n', 'utf-8');
+    const result = await toolbox().execute(
+      'apply_change_set',
+      JSON.stringify({
+        changes: [
+          { path: 'keep.ts', action: 'edit', content: 'const a = 2;\n' },
+          { path: 'dist/out.js', action: 'edit', content: 'new\n' },
+        ],
+      }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(['blocked', 'needs_input', 'failed']).toContain(parsed.status);
+    expect(await fs.readFile(path.join(root, 'keep.ts'), 'utf-8')).toBe('const a = 1;\n');
+    expect(await fs.readFile(path.join(root, 'dist', 'out.js'), 'utf-8')).toBe('old\n');
+  });
+});
