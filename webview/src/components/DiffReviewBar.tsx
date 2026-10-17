@@ -94,6 +94,14 @@ export function DiffReviewBar({
                     >
                       <span className="codicon codicon-go-to-file" /> {change.path}
                     </button>
+                    <button
+                      className="icon-btn"
+                      title="Compare the original and changed versions"
+                      aria-label={`Compare original and changed versions of ${change.path}`}
+                      onClick={() => post({ type: 'openFileDiff', path: change.path, runId: group.runId })}
+                    >
+                      <span className="codicon codicon-diff" />
+                    </button>
                     <span className="diff-stat">
                       {change.isDeleted ? (
                         <span className="del">deleted</span>

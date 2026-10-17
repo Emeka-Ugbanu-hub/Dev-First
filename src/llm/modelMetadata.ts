@@ -1,5 +1,5 @@
 import type { ModelMetadata } from '../shared/protocol';
-import { fetchOllamaCapability } from './adaptive';
+import { fetchOllamaCapability, resetOllamaCapabilityCache } from './adaptive';
 
 type LmStudioModel = {
   key?: unknown;
@@ -71,6 +71,9 @@ export async function fetchModelMetadata(
 
 async function fetchOllamaMetadata(baseUrl: string): Promise<Record<string, ModelMetadata>> {
   try {
+    // A Modelfile can change num_ctx without changing the model ID. Refresh
+    // capability data so the effective context does not remain stale.
+    resetOllamaCapabilityCache();
     const response = await fetch(apiUrl(baseUrl, '/api/tags'), { signal: AbortSignal.timeout(5000) });
     if (!response.ok) return {};
     const json = (await response.json()) as { models?: Array<{ name?: string; model?: string }> };

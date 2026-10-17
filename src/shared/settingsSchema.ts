@@ -229,6 +229,15 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     type: 'number',
     min: 20,
   },
+  {
+    key: 'warmOnFocus',
+    tab: 'behavior',
+    group: 'Input',
+    label: 'Warm up local model on focus',
+    description:
+      'Load the Ollama model when the chat input gains focus so the first response starts without a cold load. The model still unloads on Ollama\'s normal idle timer.',
+    type: 'boolean',
+  },
 
   {
     key: 'autocomplete',

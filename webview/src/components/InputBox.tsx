@@ -94,6 +94,15 @@ export function InputBox({
   const [menuHidden, setMenuHidden] = useState(false);
   const undoRef = useRef<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const warmupAt = useRef(0);
+  const warmup = (force: boolean) => {
+    const now = Date.now();
+    if (!force && now - warmupAt.current < 20_000) {
+      return;
+    }
+    warmupAt.current = now;
+    post({ type: 'warmup' });
+  };
   const areaRef = useRef<HTMLDivElement>(null);
   const menuOpen = !menuHidden && (slashQuery(text) !== null || mentionQuery(text) !== null);
   useOverlayDismiss(menuOpen, () => setMenuHidden(true), areaRef);
@@ -382,7 +391,13 @@ export function InputBox({
           placeholder={placeholder}
           value={text}
           disabled={disabled}
-          onChange={(event) => setText(event.target.value)}
+          onChange={(event) => {
+            setText(event.target.value);
+            if (event.target.value.trim()) {
+              warmup(false);
+            }
+          }}
+          onFocus={() => warmup(true)}
           onPaste={(event) => {
             const files = event.clipboardData?.files;
             if (files && files.length > 0) {

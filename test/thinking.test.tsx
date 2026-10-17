@@ -36,19 +36,19 @@ function click(element: Element): void {
   });
 }
 
-function mountRow(text: string, streaming: boolean): HTMLDivElement {
+function mountRow(text: string, streaming: boolean, stage?: string, startedAt?: number): HTMLDivElement {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
   act(() => {
-    root!.render(createElement(ThinkingRow, { text, streaming }));
+    root!.render(createElement(ThinkingRow, { text, streaming, stage, startedAt }));
   });
   return container;
 }
 
-function rerenderRow(text: string, streaming: boolean): void {
+function rerenderRow(text: string, streaming: boolean, stage?: string, startedAt?: number): void {
   act(() => {
-    root!.render(createElement(ThinkingRow, { text, streaming }));
+    root!.render(createElement(ThinkingRow, { text, streaming, stage, startedAt }));
   });
 }
 
@@ -116,5 +116,30 @@ describe('ThinkingRow', () => {
       root!.render(createElement(ThinkingRow, { text: 'partial thought plus more', streaming: true }));
     });
     expect(element.querySelector('.thinking-body')?.textContent).toBe('partial thought plus more');
+  });
+
+  it('shows the stage label and elapsed time while waiting', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:10Z'));
+      const element = mountRow('', true, 'Waiting for model…', Date.now() - 3000);
+      expect(element.querySelector('.thinking-label')?.textContent).toBe('Waiting for model…');
+      expect(element.querySelector('.thinking-timer')?.textContent).toBe('3s');
+      act(() => {
+        vi.setSystemTime(new Date('2026-01-01T00:01:10Z'));
+        vi.advanceTimersByTime(500);
+      });
+      expect(element.querySelector('.thinking-timer')?.textContent).toBe('1m 3s');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops the stage and timer once the first token arrives', () => {
+    const element = mountRow('', true, 'Waiting for model…', 1000);
+    expect(element.querySelector('.thinking-timer')).not.toBeNull();
+    rerenderRow('first token', true);
+    expect(element.querySelector('.thinking-label')?.textContent).toBe('Thinking…');
+    expect(element.querySelector('.thinking-timer')).toBeNull();
   });
 });

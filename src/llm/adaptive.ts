@@ -95,9 +95,14 @@ export async function fetchOllamaCapability(
     const json = (await response.json()) as {
       capabilities?: unknown;
       thinking?: { values?: unknown; default?: unknown };
+      parameters?: unknown;
       model_info?: unknown;
     };
-    const contextWindow = findContextWindow(json.model_info);
+    // Ollama reports the base model's maximum in model_info, but a Modelfile
+    // can lower the effective runtime context with `PARAMETER num_ctx N`.
+    // Use the explicit runtime setting when it is present.
+    const configuredContext = parseOllamaNumCtx(json.parameters);
+    const contextWindow = configuredContext ?? findContextWindow(json.model_info);
     const capabilities = Array.isArray(json.capabilities)
       ? json.capabilities.filter((item): item is string => typeof item === 'string')
       : [];
@@ -122,6 +127,13 @@ export async function fetchOllamaCapability(
   } catch {
     return undefined;
   }
+}
+
+function parseOllamaNumCtx(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = /(?:^|\n)\s*num_ctx\s+(\d+)/i.exec(value);
+  const parsed = match ? Number(match[1]) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined;
 }
 
 /** Read only an explicitly advertised context length; never infer it from a model name. */

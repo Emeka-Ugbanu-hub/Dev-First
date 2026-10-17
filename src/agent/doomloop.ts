@@ -243,7 +243,7 @@ export class DoomLoopDetector {
             signature,
             callIndex,
             description: progress.description,
-            message: `Warning: you have called ${call.name} with identical arguments ${state.repeats + 1} times. Stop and reconsider — try a different approach or explain what is blocking you.`,
+            message: `LOOP RECOVERY: ${call.name} was repeated with identical arguments and no progress. Do not repeat it; re-read the relevant evidence, choose one different bounded action, or explain the blocker.`,
           };
         }
       }
@@ -260,8 +260,8 @@ export class DoomLoopDetector {
         signature,
         callIndex,
         message: polling
-          ? `Warning: ${call.name} has returned the same state ${count} times. Stop polling and try a different check.`
-          : `Warning: you have called ${call.name} with identical arguments ${count} times. Stop and reconsider — try a different approach or explain what is blocking you.`,
+          ? `LOOP RECOVERY: ${call.name} returned the same state repeatedly. Stop polling and use a different bounded check.`
+          : `LOOP RECOVERY: ${call.name} was repeated with identical arguments. Do not repeat it; choose a different bounded action or explain the blocker.`,
       };
     }
 
@@ -270,6 +270,11 @@ export class DoomLoopDetector {
 
   noteProgress(progress: LoopProgress): void {
     this.progressFingerprint = progress.fingerprint;
+    // A successful edit, verification, completed step, or steering message
+    // starts a new loop window. Do not carry exact-call counts from the old
+    // state into a legitimately different part of the task.
+    this.history.length = 0;
+    this.pollingHistory.length = 0;
     this.signatures.clear();
     this.warned.clear();
   }

@@ -61,6 +61,10 @@ const PARALLEL_SAFE = new Set([
 
 const STALE_READ_MARKER = '[outdated — this file changed after it was read; re-read it if needed]';
 
+function normalizeLoopText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().slice(0, 2000);
+}
+
 export interface AgentCallbacks {
   onTextDelta(text: string): void;
   onReasoningDelta?(text: string): void;
@@ -156,6 +160,8 @@ export class AgentService {
     const runChangedPaths = new Set<string>();
     const recentToolFailures: string[] = [];
     let finishContinuations = 0;
+    let lastAssistantText = '';
+    let repeatedAssistantText = 0;
     let finishRejected = false;
     let lastProgressAt = Date.now();
     let toolCallIndex = 0;
@@ -278,6 +284,24 @@ export class AgentService {
 
       if (toolCalls.length === 0) {
         if (text.trim()) {
+          const normalizedText = normalizeLoopText(text);
+          if (normalizedText && normalizedText === lastAssistantText) {
+            repeatedAssistantText += 1;
+            if (repeatedAssistantText >= 2) {
+              callbacks.onNotice?.(
+                'Stopped: the model repeated the same response without progress. Completed work was preserved; reconsider the next step.',
+              );
+              return { reachedLimit: false, stoppedByLoop: true };
+            }
+            messages.push({
+              role: 'user',
+              content:
+                'LOOP RECOVERY: your last response repeated without progress. Do not repeat it. Re-read the relevant evidence, take one different bounded action, or explain the blocker.',
+            });
+            continue;
+          }
+          lastAssistantText = normalizedText;
+          repeatedAssistantText = 0;
           return { reachedLimit: false };
         }
         messages.push({ role: 'user', content: 'Continue executing the plan. Use tools.' });
@@ -291,6 +315,27 @@ export class AgentService {
         }
         return { ...call, arguments: normalizeToolArguments(call.arguments, definition.parameters) };
       });
+
+      const normalizedResponse = normalizeLoopText(text);
+      if (normalizedResponse && normalizedResponse === lastAssistantText) {
+        repeatedAssistantText += 1;
+        if (repeatedAssistantText >= 2) {
+          callbacks.onNotice?.(
+            'Stopped: the model repeated the same response without progress. Completed work was preserved; reconsider the next step.',
+          );
+          return { reachedLimit: false, stoppedByLoop: true };
+        }
+        messages.push({
+          role: 'user',
+          content:
+            'LOOP RECOVERY: your last response repeated without progress. Do not repeat it. Re-read the relevant evidence, take one different bounded action, or explain the blocker.',
+        });
+        continue;
+      }
+      if (normalizedResponse) {
+        lastAssistantText = normalizedResponse;
+        repeatedAssistantText = 0;
+      }
 
       messages.push({
         role: 'assistant',

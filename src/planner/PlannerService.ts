@@ -18,6 +18,7 @@ import { normalizeToolArguments } from '../util/toolArgs';
 import { errorMessage } from '../util/errors';
 import { chatWithRetry } from '../llm/retry';
 import { mergeUsage } from '../llm/usage';
+import { checkPlanReadiness } from './planReadiness';
 
 export interface PlannerCallbacks {
   onTextDelta(text: string): void;
@@ -83,6 +84,7 @@ export class PlannerService {
     let lastText = '';
     let submitted: Plan | undefined;
     let dismissed = false;
+    let clarificationAsked = false;
 
     for (let step = 0; step < this.options.maxSteps; step++) {
       const { text, toolCalls, reasoning } = await this.runTurn(messages, callbacks, signal, turnTools);
@@ -115,15 +117,19 @@ export class PlannerService {
         if (call.name === 'submit_plan') {
           const rawPlan = planFromToolCall(call.arguments, version);
           const plan = rawPlan ? this.validateExpectedFiles(rawPlan) : undefined;
-          if (plan) {
+          const readiness = plan ? checkPlanReadiness(plan) : { ready: false, missing: ['valid plan payload'] };
+          if (plan && readiness.ready) {
             submitted = plan;
           }
           messages.push({
             role: 'tool',
             toolCallId: call.id,
             toolName: call.name,
-            content: plan ? 'Plan recorded.' : 'Error: invalid plan payload. Provide at least a steps array.',
+            content: plan && readiness.ready
+              ? 'Plan recorded.'
+              : `Error: plan is not ready. Provide only the missing fields: ${readiness.missing.join(', ')}.`,
           });
+          if (plan && readiness.ready) break;
           continue;
         }
         if (call.name === 'dismiss_plan') {
@@ -134,6 +140,7 @@ export class PlannerService {
             toolName: call.name,
             content: 'Draft plan discarded.',
           });
+          break;
           continue;
         }
         if (call.name === 'set_reasoning') {
@@ -185,6 +192,18 @@ export class PlannerService {
             content: `Error: tool "${call.name}" is not available while planning.`,
           });
           continue;
+        }
+        if (call.name === 'ask_user') {
+          if (clarificationAsked) {
+            messages.push({
+              role: 'tool',
+              toolCallId: call.id,
+              toolName: call.name,
+              content: 'Error: one focused clarification is already pending or was asked. Continue with an explicit assumption or submit the plan.',
+            });
+            continue;
+          }
+          clarificationAsked = true;
         }
         callbacks.onToolActivity(call.id, describeToolCall(call), 'running', toolIcon(call.name));
         let result: string;

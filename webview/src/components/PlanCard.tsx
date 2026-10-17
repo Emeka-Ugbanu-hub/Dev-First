@@ -52,6 +52,15 @@ export function PlanCard({
   if (plan.why) {
     sections.push({ key: 'why', label: 'WHY THIS DESIGN', content: plan.why });
   }
+  if (plan.dependencies) {
+    sections.push({ key: 'dependencies', label: 'DEPENDENCIES', content: plan.dependencies });
+  }
+  if (plan.assumptions) {
+    sections.push({ key: 'assumptions', label: 'ASSUMPTIONS', content: plan.assumptions });
+  }
+  if (plan.verification && plan.verification.length > 0) {
+    sections.push({ key: 'verification', label: 'VERIFICATION', content: plan.verification.map((check) => `- ${check}`).join('\n') });
+  }
   if (plan.tradeoff) {
     sections.push({ key: 'tradeoff', label: 'TRADEOFF', content: plan.tradeoff });
   }
@@ -99,7 +108,7 @@ export function PlanCard({
         {plan.version > 1 && <span className="plan-version">v{plan.version}</span>}
         {approved && (
           <span className="plan-approved">
-            <span className="codicon codicon-check" /> {completed ? 'completed' : 'approved'}
+            <span className="codicon codicon-check" /> {completed ? 'COMPLETED' : 'PLAN READY'}
           </span>
         )}
       </button>

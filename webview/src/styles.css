@@ -2344,6 +2344,15 @@ body.vscode-light .hljs-meta {
   color: var(--vscode-descriptionForeground);
 }
 
+.thinking-timer {
+  margin-left: auto;
+  padding-right: 4px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--vscode-descriptionForeground);
+  opacity: 0.8;
+}
+
 .thinking-row.is-streaming .thinking-icon {
   color: var(--vscode-focusBorder, #3794ff);
   animation: thinking-pulse 1.5s ease-in-out infinite;

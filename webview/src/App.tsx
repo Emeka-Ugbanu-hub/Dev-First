@@ -1033,7 +1033,14 @@ function applyHostMessage(previous: UiState, message: HostMessage): UiState {
       return {
         ...previous,
         messages: previous.messages.map((item) =>
-          item.id === message.id ? { ...item, streaming: false } : item,
+          item.id === message.id ? { ...item, streaming: false, stage: undefined } : item,
+        ),
+      };
+    case 'stage':
+      return {
+        ...previous,
+        messages: previous.messages.map((item) =>
+          item.id === message.id ? { ...item, stage: message.text || undefined } : item,
         ),
       };
     case 'plan':

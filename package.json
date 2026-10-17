@@ -2,7 +2,7 @@
   "name": "dev-first",
   "displayName": "Dev-First",
   "description": "Plan-first AI coding agent — every request becomes a plan you approve before a single line changes.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "dev-first",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "media/icon.png",
@@ -289,7 +289,7 @@
       {
         "id": "devFirst.getStarted",
         "title": "Get started with Dev-First",
-        "description": "Plan first, then let Dev-First build — and learn while it works.",
+        "description": "Developer first: stay in control while Dev-First helps you build and learn.",
         "steps": [
           {
             "id": "connect",
@@ -661,6 +661,11 @@
           "default": 120,
           "minimum": 20,
           "description": "Pasted text longer than this many lines is saved under .dev-first/pastes and referenced in the message instead of filling the prompt."
+        },
+        "devFirst.warmOnFocus": {
+          "type": "boolean",
+          "default": true,
+          "description": "Warm up the local Ollama model when the chat input gains focus, so the first response starts without a cold load. The model still unloads on Ollama's normal idle timer."
         }
       }
     }

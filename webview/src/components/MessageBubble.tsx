@@ -7,6 +7,13 @@ import { ThinkingRow } from './ThinkingRow';
 import { Collapsible } from './Collapsible';
 import { formatTokens } from '../lib/usage';
 
+function isInternalCoordinationNotice(text: string): boolean {
+  return (
+    /^Marked \d+ earlier file read\(s\) as outdated\.$/.test(text) ||
+    /^Wait for the current task to finish before (asking for|running a) /.test(text)
+  );
+}
+
 function MessageBubbleComponent({
   message,
   mcpDisplay,
@@ -36,6 +43,11 @@ function MessageBubbleComponent({
   }
 
   if (message.role === 'notice') {
+    // Keep these coordination messages in the persisted transcript for
+    // diagnostics, but do not turn repeated internal notices into chat rows.
+    if (isInternalCoordinationNotice(message.text)) {
+      return null;
+    }
     return (
       <div className="notice-row">
         <span className="notice-text">{message.text}</span>
@@ -127,7 +139,12 @@ function MessageBubbleComponent({
     <div className="message-row assistant">
       <div className="bubble assistant-bubble">
         {(message.reasoning || message.streaming) && (
-          <ThinkingRow text={message.reasoning ?? ''} streaming={Boolean(message.streaming)} />
+          <ThinkingRow
+            text={message.reasoning ?? ''}
+            streaming={Boolean(message.streaming)}
+            stage={message.stage}
+            startedAt={message.startedAt}
+          />
         )}
         {message.text && <Markdown text={message.text} streaming={Boolean(message.streaming)} />}
         {message.streaming && <span className="cursor-blink" />}

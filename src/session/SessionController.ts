@@ -126,6 +126,7 @@ import type { ToolPreflight } from '../agent/compoundPreflight';
 import { planCheckRequirementFromSteps } from '../agent/verificationPolicy';
 import { checkFinish } from '../agent/finishGate';
 import type { FinishGateResult } from '../agent/finishGate';
+import { reliabilityStateForPlan, reliabilityVerification } from '../agent/reliabilityState';
 import { ApprovalMemory, ExternalDirectoryConsent } from '../agent/approvals';
 import { runSubagent } from '../agent/subagent';
 import { SemanticIndex } from '../indexing/SemanticIndex';
@@ -134,7 +135,7 @@ import { McpManager } from '../mcp/McpManager';
 import { BrowserSession } from '../browser/BrowserSession';
 import { CheckpointManager } from '../checkpoints/CheckpointManager';
 import { FileSnapshotEntry, FileSnapshotStore, SnapshotCaptureResult } from '../checkpoints/FileSnapshotStore';
-import { writeFileAtomic } from '../util/atomicWrite';
+import { sha1Of, writeFileAtomic } from '../util/atomicWrite';
 import { architectureFilesHash } from '../architecture/mapStore';
 import { selectPlannerConversation, composePlannerRequest, relevanceBudget } from '../planner/relevance';
 import type { PinnedPlannerContext } from '../planner/relevance';
@@ -355,6 +356,7 @@ export class SessionController {
   private contextTokens = 0;
   private lastExactUsage: UsageTotals | undefined;
   private compressionBlocks: CompressionBlock[] = [];
+  private plannerConversationCache: { fingerprint: string; messages: ChatMessage[] } | null = null;
   private compressionsThisTurn = 0;
   private lastCheckpointId: string | undefined;
   private redoCheckpointId: string | undefined;
@@ -399,6 +401,48 @@ export class SessionController {
   private readonly toolPreflights = new Map<string, ToolPreflight>();
   private runningQueued: { id: string; text: string; createdAt: number } | undefined;
   private disposed = false;
+  private knowledgeRefresh: Promise<void> | null = null;
+  private rulesBaseCache: { projectRules: string | undefined; memory: string } | null = null;
+  private toolRegistryCache: { planner: ToolDef[]; executor: ToolDef[] } | null = null;
+  private lastWarmupAt = 0;
+  private warmupInFlight = false;
+  private taskWatchdog?: ReturnType<typeof setInterval>;
+  private taskWatchdogLastActivity = 0;
+  private taskWatchdogTriggered = false;
+
+  private beginTaskWatchdog(): void {
+    this.endTaskWatchdog();
+    this.taskWatchdogLastActivity = Date.now();
+    this.taskWatchdogTriggered = false;
+    // A provider can legitimately pause while loading a model or doing a
+    // large tool operation. Only recover after sustained inactivity.
+    const inactivityWindowMs = 120_000;
+    this.taskWatchdog = setInterval(() => {
+      if ((this.phase !== 'planning' && this.phase !== 'executing') || !this.abortController) {
+        return;
+      }
+      if (Date.now() - this.taskWatchdogLastActivity < inactivityWindowMs) {
+        return;
+      }
+      this.taskWatchdogTriggered = true;
+      this.addNotice('Task stopped after prolonged inactivity. Completed work was preserved; you can ask a new question or continue.');
+      this.abortController.abort();
+      this.endTaskWatchdog();
+    }, 5_000);
+  }
+
+  private touchTaskWatchdog(): void {
+    if (this.taskWatchdog) {
+      this.taskWatchdogLastActivity = Date.now();
+    }
+  }
+
+  private endTaskWatchdog(): void {
+    if (this.taskWatchdog) {
+      clearInterval(this.taskWatchdog);
+      this.taskWatchdog = undefined;
+    }
+  }
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -427,6 +471,23 @@ export class SessionController {
       vscode.window.onDidChangeTextEditorSelection(() => this.pushSelection()),
       vscode.window.onDidChangeActiveTextEditor(() => this.pushSelection()),
     );
+    if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
+      this.disposables.push(
+        vscode.workspace.onDidChangeConfiguration(() => this.invalidateDerivedCaches()),
+      );
+    }
+    if (typeof vscode.workspace.createFileSystemWatcher === 'function') {
+      try {
+        for (const pattern of ['**/AGENTS.md', '**/.dev-first/**']) {
+          const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+          const invalidate = () => this.invalidateDerivedCaches();
+          watcher.onDidChange(invalidate);
+          watcher.onDidCreate(invalidate);
+          watcher.onDidDelete(invalidate);
+          this.disposables.push(watcher);
+        }
+      } catch {}
+    }
     void this.refreshConnection();
   }
 
@@ -546,7 +607,7 @@ export class SessionController {
       lastRequest?: string;
     }>(LEGACY_SESSION_KEY);
     if (legacy?.messages?.length) {
-      this.uiMessages = legacy.messages.map((message) => ({ ...message, streaming: false }));
+      this.uiMessages = legacy.messages.map((message) => ({ ...message, streaming: false, stage: undefined }));
       this.conversation = legacy.conversation ?? [];
       this.plan = this.restorablePlan(legacy.plan ?? null);
       this.todos = legacy.todos ?? [];
@@ -1157,6 +1218,9 @@ export class SessionController {
       case 'setModel':
         await this.handleSetModel(message.model);
         break;
+      case 'warmup':
+        void this.warmLocalModel();
+        break;
       case 'approvePlan':
         await this.handleApprove();
         break;
@@ -1620,6 +1684,24 @@ export class SessionController {
 
   private async preparePlannerConversation(provider: LLMProvider): Promise<ChatMessage[]> {
     const pendingDecisionIds = this.sessionPending ? [this.sessionPending.id] : this.currentRun?.pending ? [this.currentRun.pending.id] : [];
+    const fingerprint = sha1Of(JSON.stringify({
+      conversation: this.conversation,
+      archivedConversation: this.archivedConversation,
+      contextIndex: this.contextIndex,
+      archivedContextIndex: this.archivedContextIndex,
+      compressionBlocks: this.compressionBlocks,
+      pendingDecisionIds,
+      planVersion: this.planVersion,
+      completedRunBoundary: this.completedRunBoundary,
+      profile: this.buildContextProfile().tier,
+      contextLimit: this.effectiveContextLimit(),
+      diagnosticsSummary: this.diagnosticsSummary,
+      changedFiles: this.currentRun?.changedFiles,
+    }));
+    if (this.plannerConversationCache?.fingerprint === fingerprint) {
+      this.completedRunBoundary = false;
+      return this.plannerConversationCache.messages.map((message) => ({ ...message }));
+    }
     const request = composePlannerRequest({
       conversation: projectCompressedMessages(this.conversation, this.compressionBlocks),
       contextIndex: this.contextIndex,
@@ -1631,7 +1713,9 @@ export class SessionController {
       completedRunBoundary: this.completedRunBoundary,
     });
     this.completedRunBoundary = false;
-    return this.maybeCompactPlanner(request.messages, provider);
+    const messages = await this.maybeCompactPlanner(request.messages, provider);
+    this.plannerConversationCache = { fingerprint, messages };
+    return messages.map((message) => ({ ...message }));
   }
 
   private async maybeCompactPlanner(messages: ChatMessage[], provider: LLMProvider): Promise<ChatMessage[]> {
@@ -2057,6 +2141,7 @@ export class SessionController {
 
   async reloadMcp(): Promise<void> {
     this.mcp.dispose();
+    this.toolRegistryCache = null;
     await this.mcp.ensureLoaded(workspaceRoot());
   }
 
@@ -2118,11 +2203,6 @@ export class SessionController {
       this.addNotice('Open a folder before sending a request.');
       return;
     }
-    const provider = await this.buildProvider();
-    if (!provider) {
-      return;
-    }
-
     this.compressionsThisTurn = 0;
     this.lastExactUsage = undefined;
 
@@ -2139,27 +2219,9 @@ export class SessionController {
     }
 
     const config = getConfig();
-    await this.knowledgeSource?.refreshKnowledge();
-    const rules = await this.buildRules(root, text);
-    const registry = await this.buildToolRegistry();
-    await this.registry.load();
-    const preset = findPreset(config.preset) ?? PRESETS[0];
-    const registryInfo = this.registry.lookup(preset.provider, config.model);
-    const catalogInfo = modelInfo(preset.id, config.model);
-    const family = promptFamilyFor(preset.provider, config.model);
-
     const attachment: MessageAttachment | undefined = selection
       ? { path: selection.path, startLine: selection.startLine, endLine: selection.endLine }
       : undefined;
-    const quotePrefix = quote?.trim() ? `[context] ${quote.trim()} [/context]\n\n` : '';
-    let llmText = quotePrefix + (await this.expandSessionMentions(await this.expandFileMentions(effective, root)));
-    if (selection) {
-      llmText += formatSelectionAttachment(selection);
-    }
-    const editorContext = this.editorContext();
-    if (editorContext) {
-      llmText += editorContext;
-    }
 
     if (this.plan && this.plan.status !== 'draft') {
       this.plan = null;
@@ -2167,44 +2229,85 @@ export class SessionController {
       this.persist();
     }
 
-    this.lastRequest = llmText;
-    this.addUserMessage(effective, attachment, llmText, quote, cappedImages);
+    // Post the user message and the assistant bubble before any slow setup so
+    // the transcript responds instantly; the stage line explains the wait.
+    this.lastRequest = effective;
+    const userMessage = this.addUserMessage(effective, attachment, quote, cappedImages);
     this.setPhase('planning');
-    // Create the assistant bubble immediately so the user sees Thinking…
-    // while the provider is still preparing its first streamed event.
+    this.beginTaskWatchdog();
     this.ensureStreamingMessage();
-
-    const plannerReasoningSupported =
-      Boolean(catalogInfo?.reasoning) || (registryInfo?.supportsReasoning ?? false) ||
-      (this.selectedModelMetadata(preset.id, config.model, preset.provider).reasoningLevels?.length ?? 0) > 0;
-    const planner = new PlannerService(provider, config.model, {
-      maxSteps: config.plannerMaxSteps,
-      tools: registry.planner,
-      rules,
-      family,
-      reasoning: this.reasoningOptions(plannerReasoningSupported, preset.id),
-      resolveReasoning: () => this.reasoningOptions(plannerReasoningSupported, preset.id),
-      reasoningSwitch: this.reasoningSwitchEnabled(),
-      workspaceRoot: root,
-    });
-    this.abortController = new AbortController();
+    this.setStage('PLANNING — inspecting files…');
+    this.startKnowledgeRefresh();
 
     try {
+      // Provider setup, request-context expansion, rules, and the tool
+      // registry are independent preparation work. Start them together so
+      // model startup does not wait behind unrelated local reads.
+      this.setStage('PLANNING — loading tools…');
+      const providerPromise = this.buildProvider();
+      const requestContextPromise = (async () => {
+        const quotePrefix = quote?.trim() ? `[context] ${quote.trim()} [/context]\n\n` : '';
+        let llmText = quotePrefix + (await this.expandSessionMentions(await this.expandFileMentions(effective, root)));
+        if (selection) {
+          llmText += formatSelectionAttachment(selection);
+        }
+        const editorContext = this.editorContext();
+        if (editorContext) {
+          llmText += editorContext;
+        }
+        return llmText;
+      })();
+      const preparationPromise = Promise.all([
+        this.buildRules(root, text),
+        this.buildToolRegistry(),
+      ]);
+      const [provider, llmText, [rules, registry]] = await Promise.all([
+        providerPromise,
+        requestContextPromise,
+        preparationPromise,
+      ]);
+      if (!provider) {
+        return;
+      }
+      this.lastRequest = llmText;
+      this.appendUserConversation(userMessage, llmText, cappedImages);
+      await this.registry.load();
+      const preset = findPreset(config.preset) ?? PRESETS[0];
+      const registryInfo = this.registry.lookup(preset.provider, config.model);
+      const catalogInfo = modelInfo(preset.id, config.model);
+      const family = promptFamilyFor(preset.provider, config.model);
+
+      const plannerReasoningSupported =
+        Boolean(catalogInfo?.reasoning) || (registryInfo?.supportsReasoning ?? false) ||
+        (this.selectedModelMetadata(preset.id, config.model, preset.provider).reasoningLevels?.length ?? 0) > 0;
+      const planner = new PlannerService(provider, config.model, {
+        maxSteps: config.plannerMaxSteps,
+        tools: registry.planner,
+        rules,
+        family,
+        reasoning: this.reasoningOptions(plannerReasoningSupported, preset.id),
+        resolveReasoning: () => this.reasoningOptions(plannerReasoningSupported, preset.id),
+        reasoningSwitch: this.reasoningSwitchEnabled(),
+        workspaceRoot: root,
+      });
+      this.abortController = new AbortController();
+      this.setStage('PLANNING — waiting for model…');
+
       const result = await planner.plan(
         await this.preparePlannerConversation(provider),
         this.plan,
         this.planVersion + 1,
         {
-          onTextDelta: (delta) => this.appendStreamingText(delta),
-          onReasoningDelta: (delta) => this.appendStreamingReasoning(delta),
-          onToolActivity: (id, label, status, icon, meta) => this.upsertActivity(id, label, status, icon, meta),
+          onTextDelta: (delta) => { this.touchTaskWatchdog(); this.appendStreamingText(delta); },
+          onReasoningDelta: (delta) => { this.touchTaskWatchdog(); this.appendStreamingReasoning(delta); },
+          onToolActivity: (id, label, status, icon, meta) => { this.touchTaskWatchdog(); this.upsertActivity(id, label, status, icon, meta); },
           executeTool: (call) => this.executePlannerTool(call),
           setReasoning: (level) => this.setRunReasoning(level),
           compressContext: (focus) => this.compressContext(focus),
           onNotice: (notice) => this.addNotice(notice),
-          onStatus: (id, text, tone, done) => this.setStatus(id, text, tone, done),
-          onUsage: (tokens) => this.reportUsage(tokens),
-          onUsageExact: (usage) => this.reportExactUsage(usage),
+          onStatus: (id, text, tone, done) => { this.touchTaskWatchdog(); this.setStatus(id, text, tone, done); },
+          onUsage: (tokens) => { this.touchTaskWatchdog(); this.reportUsage(tokens); },
+          onUsageExact: (usage) => { this.touchTaskWatchdog(); this.reportExactUsage(usage); },
         },
         this.abortController.signal,
       );
@@ -2256,12 +2359,15 @@ export class SessionController {
     } catch (error) {
       if (isAbortError(error)) {
         this.markStreamingInterrupted();
-        this.addNotice('Stopped.');
+        if (!this.taskWatchdogTriggered) {
+          this.addNotice('Stopped.');
+        }
       } else {
         this.markStreamingInterrupted();
         this.addError(errorMessage(error));
       }
     } finally {
+      this.endTaskWatchdog();
       this.endStreaming();
       this.setPhase(this.diffManager.hasPendingChanges() ? 'review' : 'idle');
       this.abortController = null;
@@ -2421,6 +2527,7 @@ export class SessionController {
   }
 
   private async checkRunFinish(summary: FinishCheckSummary): Promise<FinishGateResult> {
+    this.setStage('VERIFYING — checking changed files…');
     const plan = this.plan;
     const steps = plan?.steps ?? [];
     const completed = new Set<number>(this.currentRun?.completedSteps ?? []);
@@ -2452,6 +2559,27 @@ export class SessionController {
       changedFiles.push({ path: file.path, delivered });
     }
     const planRequiredCheck = planCheckRequirementFromSteps(plan?.steps);
+    if (run?.reliability) {
+      const failed = summary.newDiagnosticErrors > 0 || summary.recentToolFailures.length > 0;
+      const next = reliabilityVerification(run.reliability, summary.verificationRan, failed);
+      if (next) {
+        const files = new Set(next.scope.files);
+        const evidence = [...next.evidence];
+        for (const file of summary.changedFiles) {
+          files.add(file.path);
+          if (!evidence.some((item) => item.kind === 'changed-file' && item.file === file.path)) {
+            evidence.push({ kind: 'changed-file', summary: 'Changed during this run', file: file.path });
+          }
+        }
+        run.reliability = {
+          ...next,
+          scope: { ...next.scope, files: [...files].sort() },
+          evidence: evidence.slice(-32),
+        };
+        run.updatedAt = Date.now();
+        this.persist();
+      }
+    }
     return checkFinish({
       planSteps: steps,
       completedSteps: [...completed],
@@ -2471,6 +2599,10 @@ export class SessionController {
   private async startExecution(plan: Plan, provider: LLMProvider, approve: boolean): Promise<void> {
     const config = getConfig();
     const root = workspaceRoot() ?? process.cwd();
+    if (this.knowledgeRefresh) {
+      await this.knowledgeRefresh.catch(() => undefined);
+    }
+    this.setStage('IMPLEMENTING — loading tools…');
     const rules = await this.buildRules(root, this.lastRequest);
     const registry = await this.buildToolRegistry();
     await this.registry.load();
@@ -2513,12 +2645,16 @@ export class SessionController {
         ...(reasoningLabel ? { reasoning: reasoningLabel } : {}),
         ...(this.lastCheckpointId ? { checkpointId: this.lastCheckpointId } : {}),
         workspaceHash: this.lastCheckpointId ?? (await this.hashWorkspaceFiles()),
+        reliability: reliabilityStateForPlan(plan, this.lastCheckpointId),
         createdAt: now,
         updatedAt: now,
       };
     } else {
       if (!this.currentRun.checkpointId && this.lastCheckpointId) {
         this.currentRun.checkpointId = this.lastCheckpointId;
+      }
+      if (!this.currentRun.reliability) {
+        this.currentRun.reliability = reliabilityStateForPlan(plan, this.currentRun.checkpointId);
       }
       if (reasoningLabel && !this.currentRun.reasoning) {
         this.currentRun.reasoning = reasoningLabel;
@@ -2535,6 +2671,25 @@ export class SessionController {
     this.setPhase('executing');
     this.markRun('executing');
     this.abortController = new AbortController();
+    this.beginTaskWatchdog();
+
+    // Seed the visible progress state from the approved plan before the
+    // executor starts. Compound calls may batch work, so waiting for the
+    // model's first todo_write can leave the plan card behind the work.
+    // Resumed runs and model-authored checkpoints remain authoritative.
+    if (this.todos.length === 0 && plan.steps?.length) {
+      this.todos = plan.steps.map((text, index) => ({
+        text,
+        status: plan.skippedSteps?.includes(index)
+          ? 'done'
+          : index === 0
+            ? 'in_progress'
+            : 'pending',
+      }));
+      this.post({ type: 'todos', todos: this.todos });
+      this.persist();
+      this.recordRunProgress();
+    }
 
     const agent = new AgentService(provider, config.model, this.buildToolbox(), {
       maxSteps: config.maxSteps,
@@ -2552,20 +2707,21 @@ export class SessionController {
       finishCheck: (summary) => this.checkRunFinish(summary),
     });
 
+    this.setStage('IMPLEMENTING — applying approved changes…');
     try {
       const result = await agent.run(plan, this.lastRequest, this.abortController.signal, {
-        onTextDelta: (delta) => this.appendStreamingText(delta),
-        onReasoningDelta: (delta) => this.appendStreamingReasoning(delta),
-        onToolActivity: (id, label, status, icon, meta) => this.upsertActivity(id, label, status, icon, meta),
+        onTextDelta: (delta) => { this.touchTaskWatchdog(); this.appendStreamingText(delta); },
+        onReasoningDelta: (delta) => { this.touchTaskWatchdog(); this.appendStreamingReasoning(delta); },
+        onToolActivity: (id, label, status, icon, meta) => { this.touchTaskWatchdog(); this.upsertActivity(id, label, status, icon, meta); },
         requestTerminalApproval: (command, cwd) => this.requestApproval(command, cwd),
         requestExternalDirectoryApproval: (directory) => this.requestExternalAccess(directory),
         askUser: (request) => this.requestUserAnswer(request),
         setReasoning: (level) => this.setRunReasoning(level),
         compressContext: (focus) => this.compressContext(focus),
         onNotice: (notice) => this.addNotice(notice),
-        onStatus: (id, text, tone, done) => this.setStatus(id, text, tone, done),
-        onUsage: (tokens) => this.reportUsage(tokens),
-        onUsageExact: (usage) => this.reportExactUsage(usage),
+        onStatus: (id, text, tone, done) => { this.touchTaskWatchdog(); this.setStatus(id, text, tone, done); },
+        onUsage: (tokens) => { this.touchTaskWatchdog(); this.reportUsage(tokens); },
+        onUsageExact: (usage) => { this.touchTaskWatchdog(); this.reportExactUsage(usage); },
         onCompaction: (info) => this.addCompactionMessage(info),
         takePendingUserMessage: () => this.takePendingUserMessage(),
         planCheckRequirement: planCheckRequirementFromSteps(this.plan?.steps),
@@ -2597,7 +2753,9 @@ export class SessionController {
         if (this.currentRun && (this.currentRun.status === 'executing' || this.currentRun.status === 'waiting')) {
           this.markRun('interrupted');
         }
-        this.addNotice('Stopped.');
+        if (!this.taskWatchdogTriggered) {
+          this.addNotice('Stopped.');
+        }
       } else {
         this.markStreamingInterrupted();
         if (this.currentRun) {
@@ -2607,6 +2765,7 @@ export class SessionController {
         this.addError(errorMessage(error));
       }
     } finally {
+      this.endTaskWatchdog();
       this.completePlan(plan);
       this.endStreaming();
       this.setPhase(this.diffManager.hasPendingChanges() ? 'review' : 'idle');
@@ -2642,17 +2801,14 @@ export class SessionController {
 
   private async buildRules(root: string, request = ''): Promise<string | undefined> {
     const parts: string[] = [];
-    const projectRules = await loadProjectRules(root);
-    if (projectRules) {
-      parts.push(projectRules);
+    const loaded = await this.loadRulesBase(root);
+    if (loaded.projectRules) {
+      parts.push(loaded.projectRules);
     }
-    if (getConfig().memory) {
-      const memory = await this.memory.read();
-      if (memory.trim()) {
-        parts.push(`# Project memory\n${memory.trim()}`);
-      }
+    if (getConfig().memory && loaded.memory) {
+      parts.push(`# Project memory\n${loaded.memory}`);
       if (request.trim()) {
-        const relevant = relevantProjectModelBullets(parseProjectModelSection(memory), request);
+        const relevant = relevantProjectModelBullets(parseProjectModelSection(loaded.memory), request);
         const model = formatRelevantProjectModel(relevant);
         if (model) {
           parts.push(model);
@@ -2660,6 +2816,39 @@ export class SessionController {
       }
     }
     return parts.length > 0 ? parts.join('\n\n---\n\n') : undefined;
+  }
+
+  private async loadRulesBase(root: string): Promise<{ projectRules: string | undefined; memory: string }> {
+    if (this.rulesBaseCache) {
+      return this.rulesBaseCache;
+    }
+    const projectRules = await loadProjectRules(root);
+    const memory = (await this.memory.read()).trim();
+    this.rulesBaseCache = { projectRules, memory };
+    return this.rulesBaseCache;
+  }
+
+  private invalidateDerivedCaches(): void {
+    this.rulesBaseCache = null;
+    this.toolRegistryCache = null;
+    this.plannerConversationCache = null;
+  }
+
+  private invalidateRulesBase(): void {
+    this.rulesBaseCache = null;
+  }
+
+  private startKnowledgeRefresh(): void {
+    if (!this.knowledgeSource) {
+      this.knowledgeRefresh = null;
+      return;
+    }
+    this.knowledgeRefresh = this.knowledgeSource
+      .refreshKnowledge()
+      .then(() => {
+        this.invalidateRulesBase();
+      })
+      .catch(() => undefined);
   }
 
   private async expandSessionMentions(text: string): Promise<string> {
@@ -2804,6 +2993,7 @@ export class SessionController {
 
   private appendStreamingReasoning(delta: string): void {
     const message = this.ensureStreamingMessage();
+    this.clearStage(message);
     message.reasoning = appendDelta(message.reasoning ?? '', delta);
     this.post({ type: 'reasoningDelta', id: message.id, text: delta });
   }
@@ -2833,6 +3023,10 @@ export class SessionController {
   }
 
   private async buildToolRegistry(): Promise<{ planner: ToolDef[]; executor: ToolDef[] }> {
+    if (this.toolRegistryCache) {
+      this.registerToolPreflights(this.toolRegistryCache.executor);
+      return this.toolRegistryCache;
+    }
     const root = workspaceRoot();
     const skills = await listSkills(root);
     const skillNames = skills.map((skill) => skill.name);
@@ -2844,16 +3038,21 @@ export class SessionController {
     const executor = attachToolPreflights(
       executionTools({ skills: skillNames, semanticSearch, memory, mcpTools, reasoningSwitch, task: true }),
     );
+    this.toolRegistryCache = {
+      planner: plannerTools({ skills: skillNames, semanticSearch, memory }),
+      executor,
+    };
+    this.registerToolPreflights(executor);
+    return this.toolRegistryCache;
+  }
+
+  private registerToolPreflights(executor: ToolDef[]): void {
     this.toolPreflights.clear();
     for (const definition of executor) {
       if (definition.preflight) {
         this.toolPreflights.set(definition.name, definition.preflight);
       }
     }
-    return {
-      planner: plannerTools({ skills: skillNames, semanticSearch, memory }),
-      executor,
-    };
   }
 
   private getSemanticIndex(): SemanticIndex | undefined {
@@ -2917,6 +3116,47 @@ export class SessionController {
     return undefined;
   }
 
+  private static readonly WARMUP_MIN_INTERVAL_MS = 4 * 60 * 1000;
+
+  private async warmLocalModel(): Promise<void> {
+    if (this.disposed || this.warmupInFlight) {
+      return;
+    }
+    if (this.phase === 'planning' || this.phase === 'executing') {
+      return;
+    }
+    const config = getConfig();
+    if (!config.warmOnFocus) {
+      return;
+    }
+    const preset = findPreset(config.preset);
+    if (!preset || preset.id !== 'ollama') {
+      return;
+    }
+    const model = config.model.trim();
+    if (!model) {
+      return;
+    }
+    if (Date.now() - this.lastWarmupAt < SessionController.WARMUP_MIN_INTERVAL_MS) {
+      return;
+    }
+    this.warmupInFlight = true;
+    try {
+      const baseUrl = effectiveBaseUrl(preset, config.baseUrl).replace(/\/v1\/?$/i, '');
+      await fetch(`${baseUrl}/api/generate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model, prompt: 'a', stream: false, options: { num_predict: 1 } }),
+        signal: AbortSignal.timeout(120_000),
+      });
+    } catch {
+      // Ollama missing or busy — warming is best-effort.
+    } finally {
+      this.lastWarmupAt = Date.now();
+      this.warmupInFlight = false;
+    }
+  }
+
   private buildToolbox(allowTask = true): ToolBox {
     const config = getConfig();
     const controller = this;
@@ -2928,6 +3168,9 @@ export class SessionController {
           const result = await super.execute(name, argsJson, context);
           controller.finishRunOperation(operationId, !result.startsWith('Error:'));
           controller.recordDiagnosticsContext(this.adaptiveVerificationSnapshot());
+          if (name === 'memory_save' && !result.startsWith('Error:')) {
+            controller.invalidateRulesBase();
+          }
           return result;
         } catch (error) {
           controller.finishRunOperation(operationId, false);
@@ -3427,10 +3670,9 @@ export class SessionController {
   private addUserMessage(
     text: string,
     attachment?: MessageAttachment,
-    llmText?: string,
     quote?: string,
     images?: string[],
-  ): void {
+  ): UiMessage {
     const message: UiMessage = { id: randomId('msg'), role: 'user', text, attachment, quote, images };
     this.lastUserMessageId = message.id;
     if (this.sessionTitle === 'New session' || this.sessionTitle === 'Imported session') {
@@ -3438,9 +3680,13 @@ export class SessionController {
       this.postSessions();
     }
     this.uiMessages.push(message);
-    this.appendConversation({ id: message.id, role: 'user', content: llmText ?? text, images });
     this.post({ type: 'addMessage', message });
     this.persist();
+    return message;
+  }
+
+  private appendUserConversation(message: UiMessage, llmText: string, images?: string[]): void {
+    this.appendConversation({ id: message.id, role: 'user', content: llmText, images });
   }
 
   private addAssistantMessage(text: string): UiMessage {
@@ -3457,6 +3703,7 @@ export class SessionController {
     }
     const index = this.conversation.length;
     this.conversation.push(message);
+    this.plannerConversationCache = null;
     const entry = buildContextEntry(message, index, this.pendingContextMetadata);
     this.pendingContextMetadata = undefined;
     this.contextIndex.push(entry);
@@ -3470,6 +3717,7 @@ export class SessionController {
       return;
     }
     mergeContextMetadata(entry, update);
+    this.plannerConversationCache = null;
   }
 
   private recordToolCallContext(name: string, argsJson: string): void {
@@ -3579,6 +3827,7 @@ export class SessionController {
       role: 'assistant',
       text: '',
       streaming: true,
+      startedAt: Date.now(),
       activities: [],
     };
     this.streamingMessageId = message.id;
@@ -3587,8 +3836,26 @@ export class SessionController {
     return message;
   }
 
+  private setStage(text: string): void {
+    const message = this.ensureStreamingMessage();
+    if (message.stage === text) {
+      return;
+    }
+    message.stage = text;
+    this.post({ type: 'stage', id: message.id, text });
+  }
+
+  private clearStage(message: UiMessage): void {
+    if (message.stage === undefined) {
+      return;
+    }
+    message.stage = undefined;
+    this.post({ type: 'stage', id: message.id, text: '' });
+  }
+
   private appendStreamingText(delta: string): void {
     const message = this.ensureStreamingMessage();
+    this.clearStage(message);
     message.text = appendDelta(message.text, delta);
     this.post({ type: 'assistantDelta', id: message.id, text: delta });
   }
@@ -3723,6 +3990,7 @@ export class SessionController {
     }
     const message = this.uiMessages.find((candidate) => candidate.id === this.streamingMessageId);
     if (message) {
+      this.clearStage(message);
       message.streaming = false;
     }
     this.post({ type: 'assistantDone', id: this.streamingMessageId });
@@ -3924,6 +4192,13 @@ export class SessionController {
       return;
     }
     run.pending = pending;
+    if (run.reliability) {
+      run.reliability = {
+        ...run.reliability,
+        recovery: { ...run.reliability.recovery, pendingDecisionId: pending.id, resumable: true },
+        updatedAt: Date.now(),
+      };
+    }
     this.recordContextMetadata(decisionContextMetadata(pending));
     if (run.status === 'executing') {
       run.status = 'waiting';
@@ -3938,6 +4213,13 @@ export class SessionController {
       return;
     }
     run.pending = undefined;
+    if (run.reliability) {
+      run.reliability = {
+        ...run.reliability,
+        recovery: { ...run.reliability.recovery, pendingDecisionId: undefined },
+        updatedAt: Date.now(),
+      };
+    }
     if (run.status === 'waiting') {
       run.status = 'executing';
     }

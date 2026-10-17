@@ -30,6 +30,9 @@ export function planFromObject(input: unknown, version: number): Plan | undefine
   const convention = firstString(get('convention'));
   const risks = normalizeRisks(get('risks', 'risk'));
   const whyNot = firstString(get('whynot', 'whynotalternative'));
+  const dependencies = firstString(get('dependencies', 'dependson', 'depends'));
+  const assumptions = firstString(get('assumptions', 'assumption'));
+  const verification = normalizeSteps(get('verification', 'verify', 'checks'));
   const steps = normalizeSteps(get('steps', 'plan', 'actions'));
   const context = normalizeContext(get('context', 'files'));
   const expectedFiles = normalizeExpectedFiles(get('expectedfiles', 'filestochange', 'affectedfiles'), steps);
@@ -57,6 +60,9 @@ export function planFromObject(input: unknown, version: number): Plan | undefine
     convention,
     risks,
     whyNot,
+    dependencies,
+    assumptions,
+    verification,
     context,
     expectedFiles,
     steps,
@@ -66,6 +72,7 @@ export function planFromObject(input: unknown, version: number): Plan | undefine
 
 function normalizeExpectedFiles(value: unknown, steps?: string[]): PlanExpectedFile[] | undefined {
   const entries: PlanExpectedFile[] = [];
+  const explicitlyProvided = Array.isArray(value);
   if (Array.isArray(value)) {
     for (const item of value) {
       if (!item || typeof item !== 'object') continue;
@@ -86,7 +93,7 @@ function normalizeExpectedFiles(value: unknown, steps?: string[]): PlanExpectedF
       }
     }
   }
-  return entries.length > 0 ? entries.slice(0, 24) : undefined;
+  return entries.length > 0 ? entries.slice(0, 24) : explicitlyProvided ? [] : undefined;
 }
 
 function extractPaths(text: string): string[] {

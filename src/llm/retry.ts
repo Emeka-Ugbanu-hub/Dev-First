@@ -26,7 +26,7 @@ export async function* chatWithRetry(
     try {
       for await (const event of provider.chat(messages, options)) {
         forwarded = true;
-        if (event.type === 'text' || event.type === 'toolCall') {
+        if (event.type === 'text' || event.type === 'toolCall' || event.type === 'reasoning') {
           sawContent = true;
         }
         yield event;

@@ -613,6 +613,19 @@ export const submitPlanTool: ToolDef = {
           required: ['path', 'action', 'reason'],
         },
       },
+      dependencies: {
+        type: 'string',
+        description: 'Dependencies that affect the implementation, or the literal "none" when there are none.',
+      },
+      assumptions: {
+        type: 'string',
+        description: 'Assumptions used to close scope, or the literal "none" when there are none.',
+      },
+      verification: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Concrete checks execution will run. Include ["none"] only when no check is applicable.',
+      },
       trivial: {
         type: 'boolean',
         description:

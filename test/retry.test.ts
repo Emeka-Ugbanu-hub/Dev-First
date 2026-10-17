@@ -127,6 +127,37 @@ describe('chatWithRetry', () => {
     expect(events.some((event) => event.type === 'text')).toBe(true);
   });
 
+  it('does not retry turns that only streamed reasoning', async () => {
+    let attempts = 0;
+    const provider: LLMProvider = {
+      id: 'fake',
+      async *chat() {
+        attempts++;
+        yield { type: 'reasoning', text: 'thinking hard' } as StreamEvent;
+        yield { type: 'done' } as StreamEvent;
+      },
+      async listModels() {
+        return [];
+      },
+      async embed() {
+        return [];
+      },
+    };
+    const events = await collect(
+      chatWithRetry(
+        provider,
+        [{ role: 'user', content: 'hi' }],
+        { model: 'm' },
+        { retryOnEmpty: true, delayFn: noDelay },
+      ),
+    );
+    expect(attempts).toBe(1);
+    expect(events).toEqual([
+      { type: 'reasoning', text: 'thinking hard' },
+      { type: 'done' },
+    ]);
+  });
+
   it('does not retry network TypeErrors more than the limit', async () => {
     const provider = makeProvider(10, new TypeError('fetch failed'));
     await expect(

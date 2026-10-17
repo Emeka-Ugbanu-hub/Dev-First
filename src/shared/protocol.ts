@@ -33,6 +33,9 @@ export interface Plan {
   whyNot?: string;
   context?: PlanContextEntry[];
   expectedFiles?: PlanExpectedFile[];
+  dependencies?: string;
+  assumptions?: string;
+  verification?: string[];
   steps?: string[];
   skippedSteps?: number[];
   filePath?: string;
@@ -116,6 +119,18 @@ export interface PendingDecisionRecord {
   createdAt: number;
 }
 
+export interface RunReliabilityState {
+  /** Files and symbols currently in the approved working scope. */
+  scope: { files: string[]; symbols: string[] };
+  /** Compact facts returned by read-only inspection or compound tools. */
+  evidence: Array<{ kind: string; summary: string; file?: string }>;
+  /** Required checks and the checks that actually ran. */
+  verification: { required: string[]; ran: string[]; status: 'pending' | 'passed' | 'failed' };
+  /** Recovery information needed to resume safely after interruption. */
+  recovery: { checkpointId?: string; pendingDecisionId?: string; resumable: boolean };
+  updatedAt: number;
+}
+
 export interface QueuedPromptRecord {
   id: string;
   text: string;
@@ -143,6 +158,7 @@ export interface RunRecord {
   processes?: RunProcessRecord[];
   browser?: { port: number; url?: string };
   pending?: PendingDecisionRecord;
+  reliability?: RunReliabilityState;
   createdAt: number;
   updatedAt: number;
 }
@@ -159,6 +175,8 @@ export interface UiMessage {
     messagesAfter: number;
   };
   streaming?: boolean;
+  startedAt?: number;
+  stage?: string;
   takeaways?: string[];
   failureConcept?: string;
   activities?: ToolActivity[];
@@ -354,6 +372,7 @@ export type WebviewMessage =
   | { type: 'disconnectProvider'; preset: string }
   | { type: 'setProvider'; preset: string; model: string }
   | { type: 'setModel'; model: string }
+  | { type: 'warmup' }
   | { type: 'compactNow' }
   | { type: 'updatePlan'; markdown: string }
   | { type: 'toggleStep'; index: number }
@@ -417,6 +436,7 @@ export type HostMessage =
   | { type: 'assistantDelta'; id: string; text: string }
   | { type: 'assistantDone'; id: string }
   | { type: 'status'; id: string; text: string; tone?: 'progress' | 'error'; done?: boolean }
+  | { type: 'stage'; id: string; text: string }
   | { type: 'plan'; plan: Plan | null }
   | { type: 'todos'; todos: TodoItem[] }
   | { type: 'checkpoint'; messageId: string; checkpointId: string }

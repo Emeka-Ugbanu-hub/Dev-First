@@ -62,6 +62,7 @@ export interface DevFirstConfig {
   architectureReasoningEffort: ReasoningEffortSetting | '';
   architecture: boolean;
   pasteFileLines: number;
+  warmOnFocus: boolean;
   typecheckCommand: string;
   testCommand: string;
   lintCommand: string;
@@ -129,6 +130,7 @@ export function getConfig(): DevFirstConfig {
     architectureReasoningEffort: config.get<ReasoningEffortSetting | ''>('architectureReasoningEffort', ''),
     architecture: config.get<boolean>('architecture', true),
     pasteFileLines: Math.max(20, config.get<number>('pasteFileLines', 120)),
+    warmOnFocus: config.get<boolean>('warmOnFocus', true),
     typecheckCommand: config.get<string>('typecheckCommand', '').trim(),
     testCommand: config.get<string>('testCommand', '').trim(),
     lintCommand: config.get<string>('lintCommand', '').trim(),
