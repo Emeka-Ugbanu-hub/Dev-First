@@ -1,4 +1,5 @@
 import { ChatMessage, LLMProvider } from '../llm/types';
+import { Plan } from '../shared/protocol';
 import { chatWithRetry } from '../llm/retry';
 import { COMPACTION_PROMPT } from '../planner/prompts';
 import { ContextProfile, MIN_RECENT_MESSAGES, effectiveThresholdTokens, preserveBudgetTokens } from './modelProfile';
@@ -47,6 +48,82 @@ export function estimateTokens(messages: ChatMessage[]): number {
     }
   }
   return Math.ceil(chars / 4);
+}
+
+/**
+ * Build a conservative prompt projection for a large multi-step execution.
+ * The full transcript remains in memory; only the request sent to the model
+ * is reduced. If the current step has no file anchors, retain the full context
+ * because relevance cannot be established safely.
+ */
+export function projectExecutionMessages(
+  messages: ChatMessage[],
+  plan: Plan,
+  completedStepCount: number,
+  contextLimitTokens: number,
+): ChatMessage[] {
+  if (plan.steps && plan.steps.length < 3) return messages;
+  if (estimateTokens(messages) <= contextLimitTokens * 0.65) return messages;
+  const current = plan.steps?.[Math.min(completedStepCount, (plan.steps?.length ?? 1) - 1)] ?? '';
+  const anchors = new Set<string>();
+  for (const value of [current, ...(plan.expectedFiles ?? []).map((entry) => entry.path)]) {
+    for (const match of value.matchAll(/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\.[A-Za-z0-9_-]+/g)) {
+      anchors.add(match[0]);
+    }
+  }
+  if (anchors.size === 0) return messages;
+
+  const keep = new Set<number>([0, 1]);
+  const tailStart = Math.max(2, messages.length - 8);
+  for (let index = tailStart; index < messages.length; index++) keep.add(index);
+  const matches = (message: ChatMessage): boolean => {
+    const content = message.content ?? '';
+    return [...anchors].some((anchor) => content.includes(anchor));
+  };
+  for (let index = 2; index < messages.length; index++) {
+    const message = messages[index];
+    if (!message || !matches(message)) continue;
+    keep.add(index);
+    if (message.role === 'tool' && message.toolCallId) {
+      for (let prior = index - 1; prior >= 2; prior--) {
+        const candidate = messages[prior];
+        if (candidate && candidate.role === 'assistant' && candidate.toolCalls?.some((call) => call.id === message.toolCallId)) {
+          keep.add(prior);
+          break;
+        }
+      }
+    }
+    if (message.role === 'assistant' && message.toolCalls?.length) {
+      const ids = new Set(message.toolCalls.map((call) => call.id));
+      for (let next = index + 1; next < messages.length; next++) {
+        const nextMessage = messages[next];
+        if (nextMessage?.role === 'tool' && nextMessage.toolCallId && ids.has(nextMessage.toolCallId)) keep.add(next);
+      }
+    }
+  }
+  // Preserve valid assistant/tool message pairs for every retained result.
+  for (const index of [...keep]) {
+    const message = messages[index];
+    if (message.role !== 'tool' || !message.toolCallId) continue;
+    for (let prior = index - 1; prior >= 2; prior--) {
+      const candidate = messages[prior];
+      if (candidate.role === 'assistant' && candidate.toolCalls?.some((call) => call.id === message.toolCallId)) {
+        keep.add(prior);
+        break;
+      }
+    }
+  }
+  if (keep.size >= messages.length) return messages;
+  const projection = messages
+    .filter((_message, index) => keep.has(index));
+  return [
+    ...projection.slice(0, 2),
+    {
+      role: 'user',
+      content: `[Execution context projection]\nCurrent step: ${current}\nRelevant evidence was selected by file anchors. Request exact reads if any required evidence is missing.`,
+    },
+    ...projection.slice(2),
+  ];
 }
 
 export function chooseRecentStart(
@@ -164,6 +241,31 @@ export function buildCompactedMessages(
   return [
     ...head,
     { role: 'user', content: `[Summary of earlier work — the full history was compacted]\n\n${summary}` },
+    ...messages.slice(recentStart),
+  ];
+}
+
+/**
+ * Last-resort compaction that never calls a model. It keeps the pinned head,
+ * a bounded checkpoint of older work, and the recent tail. This is used only
+ * when semantic summarization is unavailable or fails at the context cliff.
+ */
+export function buildDeterministicCheckpoint(
+  messages: ChatMessage[],
+  recentStart: number,
+  maxChars = 12_000,
+): ChatMessage[] {
+  const head = messages.slice(0, Math.min(2, messages.length));
+  const older = messages.slice(2, recentStart);
+  const checkpoint = serializeForSummary(older);
+  const bounded = checkpoint.length > maxChars
+    ? `${checkpoint.slice(0, Math.max(1, maxChars - 80))}\n… [older context clipped]`
+    : checkpoint;
+  return [
+    ...head,
+    ...(bounded.trim()
+      ? [{ role: 'user' as const, content: `[Deterministic checkpoint of earlier work]\n\n${bounded}` }]
+      : []),
     ...messages.slice(recentStart),
   ];
 }

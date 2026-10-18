@@ -23,8 +23,8 @@ describe('planner routing decision table', () => {
       'Respond to the latest user message; use earlier messages only when they help answer it or it refers to earlier work.',
     );
     expect(prompt).toContain('classify it internally as simple, balanced, or deep');
-    expect(prompt).toContain('The class alone sets the investigation budget and the answer shape.');
-    expect(prompt).toContain('choose the lighter one');
+    expect(prompt).toContain('The class guides response depth and the first inspection target');
+    expect(prompt).toContain('choose the lighter starting scope');
     expect(prompt).toContain('The reasoning setting never changes the class.');
     expect(prompt).toContain(
       "Prefer the shortest answer at the depth the question's class requires — never omit something the developer needs at that depth.",

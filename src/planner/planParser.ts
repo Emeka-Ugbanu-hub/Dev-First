@@ -1,6 +1,7 @@
-import { Plan, PlanContextEntry, PlanExpectedFile, PlanExpectedFileAction } from '../shared/protocol';
+import { Plan, PlanContextEntry, PlanExpectedFile, PlanExpectedFileAction, PlanningMode } from '../shared/protocol';
 
 import { parseJsonLoose } from '../util/json';
+import { repairJson } from '../agent/jsonRepair';
 
 export function planFromObject(input: unknown, version: number): Plan | undefined {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -39,6 +40,10 @@ export function planFromObject(input: unknown, version: number): Plan | undefine
   const title = firstString(get('title'));
   const intentValue = firstString(get('intent'));
   const intent = intentValue === 'explanation' || intentValue === 'plan' ? intentValue : undefined;
+  const modeValue = firstString(get('planningmode', 'mode'));
+  const planningMode: PlanningMode | undefined = modeValue === 'skip' || modeValue === 'lite' || modeValue === 'spec' || modeValue === 'full'
+    ? modeValue
+    : undefined;
   const trivial = get('trivial') === true || get('trivial') === 'true';
 
   if (!what && !how && !flow && !why && !tradeoff && !leaveAsIs && !concept && !risks && !whyNot && !steps && !context?.length) {
@@ -49,6 +54,7 @@ export function planFromObject(input: unknown, version: number): Plan | undefine
     version,
     status: 'draft',
     intent: intent ?? (steps?.length ? 'plan' : 'explanation'),
+    planningMode,
     title: title ?? deriveTitle(what, steps),
     what,
     how,
@@ -66,7 +72,7 @@ export function planFromObject(input: unknown, version: number): Plan | undefine
     context,
     expectedFiles,
     steps,
-    trivial: trivial || undefined,
+    trivial: trivial || planningMode === 'skip' || undefined,
   };
 }
 
@@ -183,10 +189,20 @@ export function parsePlanFromText(text: string, version: number): Plan | undefin
 
 export function planFromToolCall(argumentsJson: string, version: number): Plan | undefined {
   const json = parseJsonLoose(argumentsJson);
-  if (json === undefined) {
+  if (json !== undefined) {
+    const plan = planFromObject(json, version);
+    if (plan) {
+      return plan;
+    }
+  }
+  // Small models frequently emit almost-JSON (trailing commas, unterminated
+  // strings/structures). Repair once instead of spending a whole model turn.
+  const repaired = repairJson(argumentsJson);
+  if (repaired === argumentsJson) {
     return undefined;
   }
-  return planFromObject(json, version);
+  const repairedJson = parseJsonLoose(repaired);
+  return repairedJson === undefined ? undefined : planFromObject(repairedJson, version);
 }
 
 
@@ -209,7 +225,7 @@ export function planFromText(markdown: string, version: number): Plan | undefine
   let section: string | null = null;
 
   for (const line of lines) {
-    const header = /^(WHAT|HOW|FLOW|WHY NOT|WHYNOT|WHY|TRADEOFF|LEAVE AS IS|LEAVEASIS|CONCEPT|CONVENTION|RISKS|CONTEXT|EXPECTED FILES|EXPECTEDFILES|PLAN):\s*(.*)$/i.exec(line.trim());
+    const header = /^(PLANNING MODE|PLANNINGMODE|MODE|WHAT|HOW|FLOW|WHY NOT|WHYNOT|WHY|TRADEOFF|LEAVE AS IS|LEAVEASIS|CONCEPT|CONVENTION|RISKS|CONTEXT|EXPECTED FILES|EXPECTEDFILES|PLAN):\s*(.*)$/i.exec(line.trim());
     if (header) {
       section = header[1].toUpperCase().replace(/\s+/g, '');
       buffers[section] = header[2] ? [header[2]] : [];
@@ -273,6 +289,11 @@ export function planFromText(markdown: string, version: number): Plan | undefine
     expectedFiles: expectedFiles.length > 0 ? expectedFiles : undefined,
     steps: steps.length > 0 ? steps : undefined,
   };
+  const textMode = (buffers.PLANNINGMODE ?? buffers.MODE ?? []).join('\n').trim();
+  if (textMode === 'skip' || textMode === 'lite' || textMode === 'spec' || textMode === 'full') {
+    plan.planningMode = textMode;
+    if (textMode === 'skip') plan.trivial = true;
+  }
 
   if (
     !plan.what &&
@@ -306,6 +327,27 @@ export function planSlug(plan: Plan, fallback: string): string {
 
 export function planToText(plan: Plan): string {
   const lines: string[] = [];
+  if (plan.planningMode) {
+    lines.push(`PLANNING MODE: ${plan.planningMode}`);
+  }
+  if (plan.planningMode === 'lite') {
+    if (plan.what) lines.push(`WHAT: ${plan.what}`);
+    if (plan.expectedFiles?.length) {
+      lines.push('EXPECTED FILES:');
+      plan.expectedFiles.forEach((entry) => lines.push(`- ${entry.action} ${entry.path} — ${entry.reason}`));
+    }
+    if (plan.steps?.length) {
+      lines.push('PLAN:');
+      plan.steps.forEach((step, index) => lines.push(`${index + 1}. ${step}`));
+    }
+    if (plan.dependencies) lines.push(`DEPENDENCIES: ${plan.dependencies}`);
+    if (plan.assumptions) lines.push(`ASSUMPTIONS: ${plan.assumptions}`);
+    if (plan.verification?.length) {
+      lines.push('VERIFICATION:');
+      plan.verification.forEach((check) => lines.push(`- ${check}`));
+    }
+    return lines.join('\n');
+  }
   if (plan.what) {
     lines.push(`WHAT: ${plan.what}`);
   }

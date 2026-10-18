@@ -159,6 +159,8 @@ import {
   planVerification,
 } from './verificationPolicy';
 import { getConfig } from '../config';
+import { CONTEXT_SHUNT_BYTES, CONTEXT_SHUNT_MAX_BYTES } from './contextShunt';
+import type { ContextShunt } from './contextShunt';
 import { QuestionItem, QuestionRequest, TerminalApprovalDecision, TodoItem } from '../shared/protocol';
 import { randomId } from '../util/id';
 import { sha1Of } from '../util/atomicWrite';
@@ -302,6 +304,7 @@ export interface ToolBoxOptions {
   recentRunOperations?: (filePath: string) => string[];
   readCache?: FileReadCache;
   planCheckRequirement?: VerifyCheckKind;
+  contextShunt?: ContextShunt;
 }
 
 export interface AdaptiveVerificationSnapshot {
@@ -636,6 +639,20 @@ export class ToolBox {
     }
     if (stat.size > MAX_STREAM_BYTES) {
       return `Error: ${display} is larger than 50 MB. Use search_text or read a smaller file.`;
+    }
+    if (this.options.contextShunt && stat.size >= CONTEXT_SHUNT_BYTES && stat.size <= CONTEXT_SHUNT_MAX_BYTES && args.start_line === undefined && args.end_line === undefined) {
+      const source = await fs.readFile(absolute, 'utf-8');
+      if (!source.includes('\u0000')) {
+        const summary = await this.options.contextShunt.summarize({
+          path: display,
+          text: source,
+          hash: sha1Of(source),
+          signal: context.signal,
+        });
+        if (summary) {
+          return `${summary}\nUse read_file with start_line/end_line for exact content.`;
+        }
+      }
     }
     const text =
       stat.size > MAX_READ_BYTES

@@ -33,6 +33,13 @@ export interface ReasoningOptions {
   kind?: AdaptiveReasoningKind;
 }
 
+export interface ReasoningRouteContext {
+  phase: 'planning' | 'execution' | 'verification';
+  turn: number;
+  previousToolNames?: readonly string[];
+  previousToolFailed?: boolean;
+}
+
 export interface ChatOptions {
   model: string;
   tools?: ToolDef[];
@@ -41,6 +48,7 @@ export interface ChatOptions {
   signal?: AbortSignal;
   reasoning?: ReasoningOptions;
   cache?: boolean;
+  contextTokens?: number;
 }
 
 export interface UsageTotals {

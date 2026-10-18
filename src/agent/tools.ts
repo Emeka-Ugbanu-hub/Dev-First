@@ -536,6 +536,27 @@ export const submitPlanTool: ToolDef = {
         enum: ['plan'],
         description: 'Always "plan" — use this tool only when the developer asked for a change.',
       },
+      planningMode: {
+        type: 'string',
+        enum: ['skip', 'lite', 'spec', 'full'],
+        description:
+          'Choose the smallest safe mode: skip for one explicit low-risk operation, lite for a small known change or one operation over multiple explicit targets, spec for a normal change, full for architecture or high-risk work.',
+      },
+      needsClarification: {
+        type: 'boolean',
+        description: 'Set true only when a missing developer decision changes the target or implementation. When true, provide clarification and do not expect execution yet.',
+      },
+      clarification: {
+        type: 'object',
+        description: 'Structured question to ask when needsClarification is true. Provide one question or a batch of up to four related questions.',
+        properties: {
+          question: { type: 'string' },
+          header: { type: 'string' },
+          options: { type: 'array', items: { type: 'object' } },
+          multiple: { type: 'boolean' },
+          questions: { type: 'array', items: { type: 'object' }, maxItems: 4 },
+        },
+      },
       what: {
         type: 'string',
         description: 'The user-visible or code-level result of the change.',
@@ -694,6 +715,42 @@ export function plannerToolSet(tools: ToolDef[], options: PlannerToolSetOptions 
   return result;
 }
 
+// Planner schemas are sent on every planning request. Keep only the concise
+// planner-facing description here; execution receives the fuller descriptions.
+const PLANNER_TOOL_DESCRIPTIONS: Record<string, string> = {
+  inspect_file_context: 'Read a compact file snapshot with content, symbols, imports, and diagnostics. Use includeMap only when cross-file structure is unclear.',
+  investigate_issue: 'Read-only investigation of a file and optional line.',
+  bounded_investigation: 'Run bounded read-only investigation across the requested scope and return evidence.',
+  verify_change: 'Check diagnostics for the listed files only. Planning mode never runs commands.',
+  read_file: 'Read a text file with numbered lines. Use start_line and end_line for large files or exact ranges.',
+  list_files: 'List workspace files, optionally scoped by path and glob.',
+  search_text: 'Search file contents for text or a regular expression and return file:line matches.',
+  semantic_search: 'Search the codebase by meaning and return relevant files and line ranges.',
+  find_symbol: 'Find symbols by name and return their file, line, kind, and container.',
+  document_symbols: 'List a file\'s symbol tree with line numbers.',
+  find_references: 'Find references to a symbol in the workspace.',
+  go_to_definition: 'Find where a symbol is defined.',
+  hover: 'Return language-server type, documentation, and signature at a file position.',
+  go_to_implementation: 'Find implementations of an interface, abstract method, or overridden member.',
+  incoming_calls: 'List callers of the function or method at a file position.',
+  outgoing_calls: 'List functions or methods called from a file position.',
+  web_fetch: 'Fetch a URL and return its text for documentation, references, changelogs, or issues.',
+  web_search: 'Search the web for documentation or solutions, then fetch relevant results.',
+  list_processes: 'List Dev-First-managed background processes and their status.',
+  ask_user: 'Ask the developer a bounded clarification when a decision cannot be resolved from the code.',
+  run_terminal_command: 'Run a shell command in the workspace for inspection or required checks; approval applies.',
+  memory_recall: 'Search saved project memory for conventions, commands, decisions, and gotchas.',
+  use_skill: 'Load a matching project skill by name.',
+};
+
+function plannerToolView(tool: ToolDef): ToolDef {
+  return {
+    ...tool,
+    description: PLANNER_TOOL_DESCRIPTIONS[tool.name]
+      ?? tool.description.replace(FALLBACK_SUFFIX, '').trim(),
+  };
+}
+
 export function plannerTools(options: ToolRegistryOptions = {}): ToolDef[] {
   return [
     inspectFileContextTool,
@@ -702,7 +759,7 @@ export function plannerTools(options: ToolRegistryOptions = {}): ToolDef[] {
     verifyChangeTools().planner,
     ...readOnlyTools(options),
     runTerminalTool,
-  ];
+  ].map(plannerToolView);
 }
 
 export function useSkillTool(names: string[]): ToolDef {

@@ -18,6 +18,7 @@ import {
   PendingDecisionRecord,
   Phase,
   Plan,
+  PlanningState,
   ProviderConnection,
   QueuedPromptRecord,
   QuestionItem,
@@ -83,12 +84,14 @@ import {
   validateRecoveredDecision,
 } from './runRecovery';
 import { PromptFamily, promptFamilyFor } from '../planner/prompts';
-import { ReasoningOptions } from '../llm/types';
+import { ReasoningOptions, ReasoningRouteContext } from '../llm/types';
+import { routeReasoning } from '../llm/reasoningRouter';
 import {
   ADAPTIVE_RECENT_FLOOR,
   CompressionBlock,
   MIN_COMPRESS_MESSAGES,
   buildCompactedMessages,
+  buildDeterministicCheckpoint,
   checkCompaction,
   chooseRecentStart,
   estimateTokens,
@@ -99,7 +102,7 @@ import { ContextProfile, contextProfileFor, preserveBudgetTokens, reserveRatioTo
 import { usageTotal } from '../llm/usage';
 import { DevFirstConfig, deleteApiKey, getApiKeyForPreset, getConfig, saveApiKey, workspaceRoot } from '../config';
 import { createProvider } from '../llm';
-import { activeProvider } from '../llm/activeProvider';
+import { activeProvider, roleProvider } from '../llm/activeProvider';
 import { PRESETS, ProviderPreset, connectionNotice, effectiveBaseUrl, findPreset } from '../llm/presets';
 import { ConnectionsStore, StoredConnection, connectionQualifies } from './connections';
 import { formatSelectionAttachment } from '../util/selection';
@@ -140,6 +143,8 @@ import { architectureFilesHash } from '../architecture/mapStore';
 import { selectPlannerConversation, composePlannerRequest, relevanceBudget } from '../planner/relevance';
 import type { PinnedPlannerContext } from '../planner/relevance';
 import { chatWithRetry } from '../llm/retry';
+import { summarizeWithWorker } from '../agent/contextShunt';
+import type { ContextShuntInput } from '../agent/contextShunt';
 import { appendDelta } from '../shared/stream';
 import { ReviewFileDiff } from '../review/changeset';
 import { buildReviewSummaryPrompt } from '../review/summary';
@@ -329,6 +334,7 @@ export class SessionController {
   private pendingContextMetadata: ContextMetadataUpdate | undefined;
   private diagnosticsSummary: string | undefined;
   private plan: Plan | null = null;
+  private planningState: PlanningState = { status: 'idle', planVersion: 0, updatedAt: Date.now() };
   private todos: TodoItem[] = [];
   private planVersion = 0;
   private lastRequest = '';
@@ -357,6 +363,7 @@ export class SessionController {
   private lastExactUsage: UsageTotals | undefined;
   private compressionBlocks: CompressionBlock[] = [];
   private plannerConversationCache: { fingerprint: string; messages: ChatMessage[] } | null = null;
+  private readonly contextShuntCache = new Map<string, string>();
   private compressionsThisTurn = 0;
   private lastCheckpointId: string | undefined;
   private redoCheckpointId: string | undefined;
@@ -404,8 +411,10 @@ export class SessionController {
   private knowledgeRefresh: Promise<void> | null = null;
   private rulesBaseCache: { projectRules: string | undefined; memory: string } | null = null;
   private toolRegistryCache: { planner: ToolDef[]; executor: ToolDef[] } | null = null;
+  private plannerToolCache: ToolDef[] | null = null;
   private lastWarmupAt = 0;
   private warmupInFlight = false;
+  private warmupPromise: Promise<void> | null = null;
   private taskWatchdog?: ReturnType<typeof setInterval>;
   private taskWatchdogLastActivity = 0;
   private taskWatchdogTriggered = false;
@@ -502,6 +511,7 @@ export class SessionController {
       phase: this.phase,
       messages: this.uiMessages,
       plan: this.plan,
+      planningState: this.planningState,
       todos: this.todos,
       changes: this.diffManager.getChangeSummaries(),
       terminalApproval: this.currentApproval,
@@ -642,6 +652,12 @@ export class SessionController {
       }
     }
     this.plan = this.restorablePlan(plan);
+    this.planningState = stored.planningState ?? {
+      status: this.plan ? 'ready' : 'idle',
+      ...(this.plan?.planningMode ? { mode: this.plan.planningMode } : {}),
+      planVersion: this.planVersion,
+      updatedAt: Date.now(),
+    };
     this.todos = Array.isArray(stored.todos)
       ? stored.todos.filter((todo) => todo && typeof todo.text === 'string' && todo.text.trim())
           .map((todo) => ({
@@ -716,6 +732,7 @@ export class SessionController {
       messages: this.uiMessages,
       conversation: this.conversation,
       plan: this.plan,
+      planningState: this.planningState,
       todos: this.todos,
       planVersion: this.planVersion,
       lastRequest: this.lastRequest,
@@ -794,6 +811,7 @@ export class SessionController {
     this.pendingContextMetadata = undefined;
     this.diagnosticsSummary = undefined;
     this.plan = null;
+    this.planningState = { status: 'idle', planVersion: 0, updatedAt: Date.now() };
     this.todos = [];
     this.planVersion = 0;
     this.lastRequest = '';
@@ -1719,6 +1737,9 @@ export class SessionController {
   }
 
   private async maybeCompactPlanner(messages: ChatMessage[], provider: LLMProvider): Promise<ChatMessage[]> {
+    if (!getConfig().autoCompact) {
+      return messages;
+    }
     const profile = this.buildContextProfile();
     const check = checkCompaction(messages, this.effectiveContextLimit(), {
       profile,
@@ -1727,6 +1748,13 @@ export class SessionController {
     if (!check.needed || check.recentStart <= 2) {
       return messages;
     }
+    // Trim-first: planning usually only needs the pinned head plus the recent
+    // window, so drop the stale middle without paying for a summarize call.
+    const trimmed = [...messages.slice(0, 2), ...messages.slice(check.recentStart)];
+    const threshold = check.threshold ?? this.effectiveContextLimit() * 0.6;
+    if (estimateTokens(trimmed) <= threshold) {
+      return trimmed;
+    }
     try {
       const summary = await summarizeMessages(
         provider,
@@ -1734,12 +1762,11 @@ export class SessionController {
         messages.slice(2, check.recentStart),
         this.abortController?.signal ?? new AbortController().signal,
       );
-      if (!summary) {
-        return messages;
-      }
-      return buildCompactedMessages(messages, summary, check.recentStart);
+      return summary
+        ? buildCompactedMessages(messages, summary, check.recentStart)
+        : buildDeterministicCheckpoint(messages, check.recentStart);
     } catch {
-      return messages;
+      return buildDeterministicCheckpoint(messages, check.recentStart);
     }
   }
 
@@ -2154,8 +2181,7 @@ export class SessionController {
   }
 
   async plannerToolDefs(): Promise<ToolDef[]> {
-    const registry = await this.buildToolRegistry();
-    return registry.planner;
+    return this.buildPlannerToolRegistry();
   }
 
   readOnlyToolExecutor(): ((call: ToolCall) => Promise<string>) | undefined {
@@ -2219,6 +2245,7 @@ export class SessionController {
     }
 
     const config = getConfig();
+    const deferKnowledgeRefresh = Boolean((findPreset(config.preset) ?? PRESETS[0]).local);
     const attachment: MessageAttachment | undefined = selection
       ? { path: selection.path, startLine: selection.startLine, endLine: selection.endLine }
       : undefined;
@@ -2236,14 +2263,18 @@ export class SessionController {
     this.setPhase('planning');
     this.beginTaskWatchdog();
     this.ensureStreamingMessage();
-    this.setStage('PLANNING — inspecting files…');
-    this.startKnowledgeRefresh();
+    this.setStage('PLANNING — preparing local model…');
+    // On local presets the refresh runs a background model call that competes
+    // with the planner's own prompt evaluation on the same single GPU.
+    if (!deferKnowledgeRefresh) {
+      this.startKnowledgeRefresh();
+    }
 
     try {
       // Provider setup, request-context expansion, rules, and the tool
       // registry are independent preparation work. Start them together so
       // model startup does not wait behind unrelated local reads.
-      this.setStage('PLANNING — loading tools…');
+      this.setStage('PLANNING — loading tools and context…');
       const providerPromise = this.buildProvider();
       const requestContextPromise = (async () => {
         const quotePrefix = quote?.trim() ? `[context] ${quote.trim()} [/context]\n\n` : '';
@@ -2259,9 +2290,10 @@ export class SessionController {
       })();
       const preparationPromise = Promise.all([
         this.buildRules(root, text),
-        this.buildToolRegistry(),
+        this.buildPlannerToolRegistry(),
+        this.registry.load(),
       ]);
-      const [provider, llmText, [rules, registry]] = await Promise.all([
+      const [provider, llmText, [rules, plannerTools]] = await Promise.all([
         providerPromise,
         requestContextPromise,
         preparationPromise,
@@ -2271,7 +2303,6 @@ export class SessionController {
       }
       this.lastRequest = llmText;
       this.appendUserConversation(userMessage, llmText, cappedImages);
-      await this.registry.load();
       const preset = findPreset(config.preset) ?? PRESETS[0];
       const registryInfo = this.registry.lookup(preset.provider, config.model);
       const catalogInfo = modelInfo(preset.id, config.model);
@@ -2281,25 +2312,30 @@ export class SessionController {
         Boolean(catalogInfo?.reasoning) || (registryInfo?.supportsReasoning ?? false) ||
         (this.selectedModelMetadata(preset.id, config.model, preset.provider).reasoningLevels?.length ?? 0) > 0;
       const planner = new PlannerService(provider, config.model, {
-        maxSteps: config.plannerMaxSteps,
-        tools: registry.planner,
+        maxSteps: this.plannerStepLimit(config, preset),
+        tools: plannerTools,
         rules,
         family,
-        reasoning: this.reasoningOptions(plannerReasoningSupported, preset.id),
-        resolveReasoning: () => this.reasoningOptions(plannerReasoningSupported, preset.id),
+        reasoning: this.plannerReasoningOptions(plannerReasoningSupported, preset.id),
+        resolveReasoning: (context) => this.plannerReasoningOptions(plannerReasoningSupported, preset.id, context),
         reasoningSwitch: this.reasoningSwitchEnabled(),
+        contextLimitTokens: this.effectiveContextLimit(),
         workspaceRoot: root,
       });
       this.abortController = new AbortController();
-      this.setStage('PLANNING — waiting for model…');
+      const warmupPromise = this.settleWarmup();
+      const plannerConversationPromise = this.preparePlannerConversation(provider);
+      await Promise.all([warmupPromise, plannerConversationPromise]);
+      this.setStage('PLANNING — processing code context…');
 
       const result = await planner.plan(
-        await this.preparePlannerConversation(provider),
+        await plannerConversationPromise,
         this.plan,
         this.planVersion + 1,
         {
           onTextDelta: (delta) => { this.touchTaskWatchdog(); this.appendStreamingText(delta); },
           onReasoningDelta: (delta) => { this.touchTaskWatchdog(); this.appendStreamingReasoning(delta); },
+          onStage: (stage) => { this.touchTaskWatchdog(); this.setStage(stage); },
           onToolActivity: (id, label, status, icon, meta) => { this.touchTaskWatchdog(); this.upsertActivity(id, label, status, icon, meta); },
           executeTool: (call) => this.executePlannerTool(call),
           setReasoning: (level) => this.setRunReasoning(level),
@@ -2350,10 +2386,12 @@ export class SessionController {
         if (result.text.trim()) {
           this.appendConversation({ id: this.streamingMessageId ?? undefined, role: 'assistant', content: result.text });
         }
-        if (result.exhausted) {
+        if (result.stopped === 'same-plan') {
+          this.addNotice('The planner could not fill in the plan details. Try rephrasing or splitting the request.');
+        } else if (result.exhausted) {
           this.addNotice('The planner reached its step limit. Try rephrasing or splitting the request.');
         } else if (!result.text.trim()) {
-          this.addNotice('The model returned an empty response. Check the provider settings and try again.');
+          this.addNotice('The model produced no output — its context may be full. Try Compact, or a smaller request.');
         }
       }
     } catch (error) {
@@ -2367,6 +2405,9 @@ export class SessionController {
         this.addError(errorMessage(error));
       }
     } finally {
+      if (deferKnowledgeRefresh) {
+        this.startKnowledgeRefresh();
+      }
       this.endTaskWatchdog();
       this.endStreaming();
       this.setPhase(this.diffManager.hasPendingChanges() ? 'review' : 'idle');
@@ -2507,7 +2548,9 @@ export class SessionController {
   }
 
   private isDirectRun(plan: Plan): boolean {
-    return plan.intent !== 'explanation' && plan.trivial === true && !plan.skippedSteps?.length;
+    return plan.intent !== 'explanation'
+      && (plan.planningMode === 'skip' || plan.trivial === true)
+      && !plan.skippedSteps?.length;
   }
 
   private async handleApprove(): Promise<void> {
@@ -2700,13 +2743,14 @@ export class SessionController {
       contextLimitTokens: this.effectiveContextLimit(),
       parallelTools: config.parallelTools,
       reasoning: executorReasoning,
-      resolveReasoning: () => this.reasoningOptions(executorReasoningSupported, preset.id),
+      resolveReasoning: (context) => this.executionReasoningOptions(executorReasoningSupported, preset.id, context),
       planFilePath: plan.filePath,
       contextProfile,
       profileReasoning: executorReasoningSupported,
       finishCheck: (summary) => this.checkRunFinish(summary),
     });
 
+    await this.settleWarmup();
     this.setStage('IMPLEMENTING — applying approved changes…');
     try {
       const result = await agent.run(plan, this.lastRequest, this.abortController.signal, {
@@ -2831,6 +2875,7 @@ export class SessionController {
   private invalidateDerivedCaches(): void {
     this.rulesBaseCache = null;
     this.toolRegistryCache = null;
+    this.plannerToolCache = null;
     this.plannerConversationCache = null;
   }
 
@@ -2915,7 +2960,8 @@ export class SessionController {
 
   private reasoningOptions(supported: boolean, presetId: string): ReasoningOptions | undefined {
     const config = getConfig();
-    const levels = this.selectedModelMetadata(presetId, config.model, config.provider).reasoningLevels ?? [];
+    const providerId = findPreset(presetId)?.provider ?? config.provider;
+    const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
     const selected = this.selectedReasoningEffort(presetId, config.model, levels);
     const effort = this.reasoningOverride
       ? clampReasoningLevel(this.reasoningOverride, selected, levels)
@@ -2933,6 +2979,60 @@ export class SessionController {
       return presetId === 'deepseek' ? { enabled: true } : { enabled: true, effort: 'on', ...adaptive };
     }
     return { enabled: true, effort, ...adaptive };
+  }
+
+  private executionReasoningOptions(
+    supported: boolean,
+    presetId: string,
+    context: ReasoningRouteContext,
+  ): ReasoningOptions | undefined {
+    const options = this.reasoningOptions(supported, presetId);
+    const config = getConfig();
+    // Explicit planner modes and run-level overrides remain authoritative.
+    if (config.plannerThinking !== 'auto' || this.reasoningOverride) return options;
+    const providerId = findPreset(presetId)?.provider ?? config.provider;
+    const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
+    return routeReasoning(options, levels, context);
+  }
+
+  private plannerReasoningOptions(
+    supported: boolean,
+    presetId: string,
+    context?: ReasoningRouteContext,
+  ): ReasoningOptions | undefined {
+    const options = this.reasoningOptions(supported, presetId);
+    if (!options || !options.enabled || this.reasoningOverride) {
+      return options;
+    }
+    const mode = getConfig().plannerThinking;
+    const local = findPreset(presetId)?.local ?? false;
+    const disable = mode === 'off' || (mode === 'auto' && local);
+    if (!disable) {
+      if (mode === 'auto' && context) {
+        const config = getConfig();
+        const providerId = findPreset(presetId)?.provider ?? config.provider;
+        const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
+        return routeReasoning(options, levels, context);
+      }
+      return options;
+    }
+    // Thinking tokens are the main source of planning latency: local models
+    // pay for them in wall-clock time on every re-evaluated turn. Planning
+    // runs without deliberation; execution can turn it back on via
+    // set_reasoning. Each provider family has its own "off" spelling.
+    const currentConfig = getConfig();
+    const providerId = findPreset(presetId)?.provider ?? currentConfig.provider;
+    const levels = this.selectedModelMetadata(presetId, currentConfig.model, providerId).reasoningLevels ?? [];
+    if (options.effort === 'off' || (!levels.includes('off') && !levels.includes('none') && presetId !== 'deepseek')) {
+      return options;
+    }
+    if (presetId === 'deepseek') {
+      return { enabled: false };
+    }
+    if (levels.includes('none')) {
+      return { ...options, effort: 'none' };
+    }
+    return { ...options, effort: 'off' };
   }
 
   private setRunReasoning(level: string): string {
@@ -3027,6 +3127,7 @@ export class SessionController {
       this.registerToolPreflights(this.toolRegistryCache.executor);
       return this.toolRegistryCache;
     }
+    const planner = await this.buildPlannerToolRegistry();
     const root = workspaceRoot();
     const skills = await listSkills(root);
     const skillNames = skills.map((skill) => skill.name);
@@ -3039,11 +3140,29 @@ export class SessionController {
       executionTools({ skills: skillNames, semanticSearch, memory, mcpTools, reasoningSwitch, task: true }),
     );
     this.toolRegistryCache = {
-      planner: plannerTools({ skills: skillNames, semanticSearch, memory }),
+      planner,
       executor,
     };
     this.registerToolPreflights(executor);
     return this.toolRegistryCache;
+  }
+
+  /**
+   * Build only the tools needed while deciding whether a request is a
+   * question or a change. Executor/MCP tools stay lazy until execution.
+   */
+  private async buildPlannerToolRegistry(): Promise<ToolDef[]> {
+    if (this.toolRegistryCache) return this.toolRegistryCache.planner;
+    if (this.plannerToolCache) return this.plannerToolCache;
+    const root = workspaceRoot();
+    const skills = await listSkills(root);
+    const config = getConfig();
+    this.plannerToolCache = plannerTools({
+      skills: skills.map((skill) => skill.name),
+      semanticSearch: config.semanticIndex,
+      memory: config.memory,
+    });
+    return this.plannerToolCache;
   }
 
   private registerToolPreflights(executor: ToolDef[]): void {
@@ -3118,43 +3237,57 @@ export class SessionController {
 
   private static readonly WARMUP_MIN_INTERVAL_MS = 4 * 60 * 1000;
 
-  private async warmLocalModel(): Promise<void> {
+  private warmLocalModel(): Promise<void> {
     if (this.disposed || this.warmupInFlight) {
-      return;
+      return this.warmupPromise ?? Promise.resolve();
     }
     if (this.phase === 'planning' || this.phase === 'executing') {
-      return;
+      return Promise.resolve();
     }
     const config = getConfig();
     if (!config.warmOnFocus) {
-      return;
+      return Promise.resolve();
     }
     const preset = findPreset(config.preset);
     if (!preset || preset.id !== 'ollama') {
-      return;
+      return Promise.resolve();
     }
     const model = config.model.trim();
     if (!model) {
-      return;
+      return Promise.resolve();
     }
     if (Date.now() - this.lastWarmupAt < SessionController.WARMUP_MIN_INTERVAL_MS) {
-      return;
+      return Promise.resolve();
     }
     this.warmupInFlight = true;
-    try {
-      const baseUrl = effectiveBaseUrl(preset, config.baseUrl).replace(/\/v1\/?$/i, '');
-      await fetch(`${baseUrl}/api/generate`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model, prompt: 'a', stream: false, options: { num_predict: 1 } }),
-        signal: AbortSignal.timeout(120_000),
-      });
-    } catch {
-      // Ollama missing or busy — warming is best-effort.
-    } finally {
-      this.lastWarmupAt = Date.now();
-      this.warmupInFlight = false;
-    }
+    this.warmupPromise = (async () => {
+      try {
+        const baseUrl = effectiveBaseUrl(preset, config.baseUrl).replace(/\/v1\/?$/i, '');
+        await fetch(`${baseUrl}/api/generate`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            prompt: 'a',
+            stream: false,
+            keep_alive: '10m',
+            options: { num_predict: 1 },
+          }),
+          signal: AbortSignal.timeout(120_000),
+        });
+      } catch {
+        // Ollama missing or busy — warming is best-effort.
+      } finally {
+        this.lastWarmupAt = Date.now();
+        this.warmupInFlight = false;
+        this.warmupPromise = null;
+      }
+    })();
+    return this.warmupPromise;
+  }
+
+  private async settleWarmup(): Promise<void> {
+    await this.warmupPromise?.catch(() => undefined);
   }
 
   private buildToolbox(allowTask = true): ToolBox {
@@ -3199,7 +3332,32 @@ export class SessionController {
       approvalMemory: this.approvalMemory,
       externalDirectories: this.externalDirectories,
       recentRunOperations: (filePath) => this.recentRunOperations(filePath),
+      contextShunt: {
+        summarize: (input) => this.summarizeContextWithWorker(input),
+      },
     });
+  }
+
+  private async summarizeContextWithWorker(input: ContextShuntInput): Promise<string | undefined> {
+    const config = getConfig();
+    const scannerConfigured = Boolean(config.scanPreset.trim() || config.scanModel.trim() || config.scanAiModel.trim());
+    if (!scannerConfigured) return undefined;
+    const worker = await roleProvider(this.context, 'scanner');
+    if (!worker || !worker.model || !worker.preset.local) return undefined;
+    if (worker.preset.id === config.preset && worker.model === config.model && worker.baseUrl === config.baseUrl) {
+      return undefined;
+    }
+    const key = `${worker.preset.id}|${worker.baseUrl}|${worker.model}|${input.path}|${input.hash}`;
+    const cached = this.contextShuntCache.get(key);
+    if (cached) return cached;
+    const summary = await summarizeWithWorker(worker.provider, worker.model, input);
+    if (summary) {
+      this.contextShuntCache.set(key, summary);
+      if (this.contextShuntCache.size > 64) {
+        this.contextShuntCache.delete(this.contextShuntCache.keys().next().value as string);
+      }
+    }
+    return summary;
   }
 
   private recentRunOperations(filePath: string): string[] {
@@ -3379,6 +3537,20 @@ export class SessionController {
 
   private setPhase(phase: Phase): void {
     this.phase = phase;
+    const status = phase === 'planning'
+      ? 'planning'
+      : phase === 'executing'
+        ? 'executing'
+        : this.plan?.status === 'draft'
+          ? 'ready'
+          : 'idle';
+    this.planningState = {
+      status,
+      ...(this.plan?.planningMode ? { mode: this.plan.planningMode } : {}),
+      planVersion: this.plan?.version ?? this.planVersion,
+      ...(this.lastUserMessageId ? { requestId: this.lastUserMessageId } : {}),
+      updatedAt: Date.now(),
+    };
     this.post({ type: 'phase', phase });
     this.phaseListener?.(phase);
   }
@@ -3914,7 +4086,19 @@ export class SessionController {
     const config = getConfig();
     const preset = findPreset(config.preset) ?? PRESETS[0];
     const metadata = this.selectedModelMetadata(preset.id, config.model, preset.provider);
-    return metadata.contextWindow || config.contextLimitTokens;
+    const modelLimit = metadata.contextWindow || config.contextLimitTokens;
+    if (!preset.local || config.localContextCapTokens <= 0) {
+      return modelLimit;
+    }
+    return Math.min(modelLimit, config.localContextCapTokens);
+  }
+
+  private plannerStepLimit(config: DevFirstConfig, preset: ProviderPreset): number {
+    if (!preset.local || config.plannerMaxSteps <= 0) {
+      return config.plannerMaxSteps;
+    }
+    const profile = this.buildContextProfile();
+    return profile.tier === 'compact' ? Math.min(config.plannerMaxSteps, 8) : config.plannerMaxSteps;
   }
 
   private reservedOutputTokens(): number {

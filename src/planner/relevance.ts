@@ -331,6 +331,12 @@ export function composePlannerRequest(input: PlannerRequestInput): PlannerReques
     });
   }
   messages.push(...selection.messages);
+  // The latest user request is the active instruction. Keep it even when
+  // relevance selection or compaction drops older conversation entries.
+  const latestUser = [...input.conversation].reverse().find((message) => message.role === 'user');
+  if (latestUser && !messages.some((message) => message.id && latestUser.id && message.id === latestUser.id)) {
+    messages.push(latestUser);
+  }
   return {
     messages: input.compact ? input.compact(messages) : messages,
     retrieved: selection.retrieved,

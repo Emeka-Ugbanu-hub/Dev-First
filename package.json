@@ -2,7 +2,7 @@
   "name": "dev-first",
   "displayName": "Dev-First",
   "description": "Plan-first AI coding agent — every request becomes a plan you approve before a single line changes.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "dev-first",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "media/icon.png",
@@ -447,6 +447,12 @@
           "default": 128000,
           "description": "Fallback context window used only when the model is not in the model catalog."
         },
+        "devFirst.localContextCapTokens": {
+          "type": "number",
+          "default": 32768,
+          "minimum": 0,
+          "description": "Optional maximum context for local models. 0 disables the cap; the effective limit never exceeds the model or Modelfile context."
+        },
         "devFirst.contextProfile": {
           "type": "string",
           "enum": [
@@ -463,6 +469,21 @@
           ],
           "default": "auto",
           "description": "Adaptive context profile controlling compaction and pruning thresholds."
+        },
+        "devFirst.plannerThinking": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "off",
+            "on"
+          ],
+          "enumDescriptions": [
+            "Skip planner thinking on local models; auto-routing uses lower effort for simple execution turns and preserves the selected ceiling.",
+            "Never think while planning, on any provider. Execution is not affected.",
+            "Planning uses the selected reasoning effort, including on local models."
+          ],
+          "default": "auto",
+          "description": "Whether the planner deliberates before answering. Thinking tokens are the main source of planning latency on local models."
         },
         "devFirst.semanticIndex": {
           "type": "boolean",

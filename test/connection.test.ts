@@ -28,6 +28,7 @@ vi.mock('vscode', () => {
       asRelativePath: (value: string) => value,
     },
     window: {
+      visibleTextEditors: [],
       onDidChangeTextEditorSelection: () => disposable,
       onDidChangeActiveTextEditor: () => disposable,
       showInformationMessage: () => undefined,
@@ -68,6 +69,7 @@ function createController(posted: HostMessage[]): SessionController {
     onDidChangePendingChanges: () => ({ dispose() {} }),
     getChangeSummaries: () => [],
     getCurrentRunId: () => undefined,
+    hasPendingChanges: () => false,
   } as never;
   return new SessionController(context, (message) => posted.push(message), diffManager);
 }

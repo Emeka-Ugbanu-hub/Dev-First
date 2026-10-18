@@ -9,6 +9,7 @@ export type EmbeddingsProvider = 'local' | 'api';
 export type ReasoningEffortSetting = 'off' | 'low' | 'medium' | 'high' | (string & {});
 export type NotifySound = 'off' | 'chime' | 'beep';
 export type ContextProfileSetting = 'auto' | ContextProfileTier;
+export type PlannerThinkingSetting = 'auto' | 'off' | 'on';
 
 export interface DevFirstConfig {
   preset: string;
@@ -28,7 +29,9 @@ export interface DevFirstConfig {
   adaptiveVerify: boolean;
   autoCompact: boolean;
   contextLimitTokens: number;
+  localContextCapTokens: number;
   contextProfile: ContextProfileSetting;
+  plannerThinking: PlannerThinkingSetting;
   semanticIndex: boolean;
   embeddingsProvider: EmbeddingsProvider;
   embeddingsModel: string;
@@ -72,6 +75,10 @@ export interface DevFirstConfig {
 const DEFAULT_SCAN_IGNORE =
   '**/node_modules/**,**/dist/**,**/out/**,**/.next/**,**/vendor/**,**/target/**,**/build/**,**/coverage/**,**/*.min.*,**/*.pb.go,**/*.generated.*,**/generated/**,**/package-lock.json,**/yarn.lock,**/pnpm-lock.yaml';
 
+function normalizePlannerThinking(value: string): PlannerThinkingSetting {
+  return value === 'off' || value === 'on' ? value : 'auto';
+}
+
 export function getConfig(): DevFirstConfig {
   const config = vscode.workspace.getConfiguration('devFirst');
   return {
@@ -92,7 +99,9 @@ export function getConfig(): DevFirstConfig {
     adaptiveVerify: config.get<boolean>('adaptiveVerify', true),
     autoCompact: config.get<boolean>('autoCompact', true),
     contextLimitTokens: config.get<number>('contextLimitTokens', 128000),
+    localContextCapTokens: Math.max(0, config.get<number>('localContextCapTokens', 32768)),
     contextProfile: config.get<ContextProfileSetting>('contextProfile', 'auto'),
+    plannerThinking: normalizePlannerThinking(config.get<string>('plannerThinking', 'auto')),
     semanticIndex: config.get<boolean>('semanticIndex', true),
     embeddingsProvider: config.get<EmbeddingsProvider>('embeddingsProvider', 'local'),
     embeddingsModel: config.get<string>('embeddingsModel', 'text-embedding-3-small'),

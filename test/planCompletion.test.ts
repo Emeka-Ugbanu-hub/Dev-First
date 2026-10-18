@@ -188,6 +188,10 @@ describe('run completion plan lifecycle', () => {
         intent: 'plan',
         what: 'Add caching.',
         steps: ['Add a cache helper'],
+        expectedFiles: [],
+        dependencies: 'none',
+        assumptions: 'none',
+        verification: ['none'],
       }),
     ]);
     const posted: HostMessage[] = [];

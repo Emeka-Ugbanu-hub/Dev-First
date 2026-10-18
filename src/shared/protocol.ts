@@ -1,4 +1,14 @@
 export type Phase = 'idle' | 'planning' | 'executing' | 'review';
+export type PlanningMode = 'skip' | 'lite' | 'spec' | 'full';
+export type PlanningStateStatus = 'idle' | 'planning' | 'ready' | 'executing';
+
+export interface PlanningState {
+  status: PlanningStateStatus;
+  mode?: PlanningMode;
+  planVersion: number;
+  requestId?: string;
+  updatedAt: number;
+}
 
 export interface PlanContextEntry {
   path: string;
@@ -20,6 +30,7 @@ export interface Plan {
   version: number;
   status: 'draft' | 'approved' | 'completed';
   intent?: 'plan' | 'explanation';
+  planningMode?: PlanningMode;
   title?: string;
   what?: string;
   how?: string;
@@ -327,6 +338,7 @@ export interface UiState {
   phase: Phase;
   messages: UiMessage[];
   plan: Plan | null;
+  planningState?: PlanningState;
   todos: TodoItem[];
   changes: ChangeSummary[];
   terminalApproval: TerminalApprovalRequest | null;

@@ -150,7 +150,15 @@ describe('direct trivial runs', () => {
 
   it('never starts the executor for a non-trivial plan before handleApprove', async () => {
     stubFetch([
-      toolSse('submit_plan', { intent: 'plan', what: 'Add retries', steps: ['Add a retry helper', 'Wire it in'] }),
+      toolSse('submit_plan', {
+        intent: 'plan',
+        what: 'Add retries',
+        steps: ['Add a retry helper', 'Wire it in'],
+        expectedFiles: [],
+        dependencies: 'none',
+        assumptions: 'none',
+        verification: ['none'],
+      }),
     ]);
     const run = vi.spyOn(AgentService.prototype, 'run').mockResolvedValue({ reachedLimit: false });
     const posted: HostMessage[] = [];

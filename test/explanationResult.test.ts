@@ -134,6 +134,10 @@ describe('SessionController explanation results', () => {
         what: 'Add a health endpoint.',
         how: 'Register a route that returns status.',
         steps: ['Add the handler', 'Register the route'],
+        expectedFiles: [],
+        dependencies: 'none',
+        assumptions: 'none',
+        verification: ['none'],
       }),
     ]);
     const posted: HostMessage[] = [];

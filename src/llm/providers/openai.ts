@@ -177,7 +177,7 @@ export class OpenAIProvider implements LLMProvider {
       body.reasoning_effort = reasoning.effort ?? (isReasoningModel(options.model) ? 'medium' : undefined);
     }
     if (options.cache !== false) {
-      const cacheKey = promptCacheKey(messages);
+      const cacheKey = promptCacheKey(messages, options);
       if (cacheKey) {
         body.prompt_cache_key = cacheKey;
       }
@@ -220,6 +220,10 @@ export class OpenAIProvider implements LLMProvider {
       // system message before calling /api/chat.
       messages: toOllamaMessages(messages),
       stream: true,
+      // Keep the local model resident between planner turns and follow-up
+      // messages. Ollama still re-evaluates the prompt, but avoids a cold
+      // model reload on every request.
+      keep_alive: '10m',
       think: reasoning.enabled
         ? reasoning.effort === 'off' ? false : reasoning.effort === 'on' ? true : reasoning.effort ?? true
         : false,
@@ -233,6 +237,10 @@ export class OpenAIProvider implements LLMProvider {
     const modelOptions: Record<string, unknown> = {};
     if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
     if (options.maxTokens !== undefined) modelOptions.num_predict = options.maxTokens;
+    // Match num_ctx to the window the app budgeted for. Without this Ollama
+    // silently truncates at the model default (often 4096), which makes the
+    // model go quiet after a few tool round-trips.
+    if (options.contextTokens !== undefined) modelOptions.num_ctx = options.contextTokens;
     if (Object.keys(modelOptions).length) body.options = modelOptions;
 
     const response = await fetchWithTimeouts(
@@ -334,6 +342,16 @@ function toOllamaMessages(messages: ChatMessage[]): unknown[] {
   const normalized: ChatMessage[] = system
     ? [{ role: 'system', content: system }, ...ordered]
     : ordered;
+  if (!normalized.some((message) => message.role === 'user')) {
+    // Some context projections can contain only system/tool/assistant history.
+    // Ollama templates require a user query, so recover the pinned active
+    // request instead of sending a malformed transcript.
+    const match = system.match(/(?:^|\n)Latest request:\s*([\s\S]*?)(?=\n(?:Active plan|Pending |Changed files|Diagnostics:)|$)/i);
+    const request = match?.[1]?.trim();
+    if (request) {
+      normalized.push({ role: 'user', content: request });
+    }
+  }
   return normalized.map((message) => ({
     role: message.role,
     content: sanitizeSurrogates(message.content),
@@ -347,13 +365,26 @@ function toOllamaMessages(messages: ChatMessage[]): unknown[] {
   }));
 }
 
-function promptCacheKey(messages: ChatMessage[]): string | undefined {
+function promptCacheKey(messages: ChatMessage[], options: ChatOptions): string | undefined {
   const system = messages.find((message) => message.role === 'system');
   const firstUser = messages.find((message) => message.role === 'user');
   if (!system?.content) {
     return undefined;
   }
-  const seed = `${system.content}\n${firstUser?.content ?? ''}`;
+  // Keep the cache partition aligned with the actual static prefix. Tool
+  // schemas are part of that prefix, so requests with different tool sets
+  // must not share a provider-side prompt cache entry.
+  const tools = options.tools?.map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+  }));
+  const seed = JSON.stringify({
+    model: options.model,
+    system: system.content,
+    firstUser: firstUser?.content ?? '',
+    tools: tools ?? [],
+  });
   let hash = 2166136261;
   for (let i = 0; i < seed.length; i++) {
     hash ^= seed.charCodeAt(i);

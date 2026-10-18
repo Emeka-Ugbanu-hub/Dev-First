@@ -1,4 +1,4 @@
-import { ChatMessage, LLMProvider, ReasoningOptions, ToolCall, ToolDef, UsageTotals } from '../llm/types';
+import { ChatMessage, LLMProvider, ReasoningOptions, ReasoningRouteContext, ToolCall, ToolDef, UsageTotals } from '../llm/types';
 import { Plan, QuestionRequest, TerminalApprovalDecision } from '../shared/protocol';
 import {
   ActivityMeta,
@@ -21,43 +21,31 @@ import {
   touchedFileHash,
 } from './doomloop';
 import { MistakeTracker } from './mistakes';
+import { ConvergenceGuard, ConvergenceState } from './convergence';
 import { isContextOverflowError } from '../llm/errors';
 import { normalizeToolArguments } from '../util/toolArgs';
 import {
   ADAPTIVE_RECENT_FLOOR,
   PRESERVE_RECENT_TOKENS,
   buildCompactedMessages,
+  buildDeterministicCheckpoint,
   checkCompaction,
   chooseRecentStart,
   DEFAULT_CONTEXT_LIMIT,
   estimateTokens,
+  projectExecutionMessages,
   summarizeMessages,
 } from './compaction';
 import { pruneMessages, shouldPrune } from './prune';
 import { ContextProfile, preserveBudgetTokens } from './modelProfile';
 import { mergeUsage, usageTotal } from '../llm/usage';
+import { sha1Of } from '../util/atomicWrite';
 
 const CONTEXT_NUDGE_RATIO = 0.5;
 const CONTEXT_NUDGE_FIRM_RATIO = 0.85;
 const CONTEXT_NUDGE_TURN_GAP = 5;
 
-const PARALLEL_SAFE = new Set([
-  'read_file',
-  'list_files',
-  'search_text',
-  'find_symbol',
-  'document_symbols',
-  'find_references',
-  'go_to_definition',
-  'hover',
-  'go_to_implementation',
-  'incoming_calls',
-  'outgoing_calls',
-  'semantic_search',
-  'web_fetch',
-  'web_search',
-  'list_processes',
-]);
+import { PARALLEL_SAFE } from './parallelTools';
 
 const STALE_READ_MARKER = '[outdated — this file changed after it was read; re-read it if needed]';
 
@@ -121,7 +109,7 @@ export interface AgentOptions {
   contextLimitTokens: number;
   parallelTools?: boolean;
   reasoning?: ReasoningOptions;
-  resolveReasoning?: () => ReasoningOptions | undefined;
+  resolveReasoning?: (context: ReasoningRouteContext) => ReasoningOptions | undefined;
   planFilePath?: string;
   contextProfile?: ContextProfile;
   profileReasoning?: boolean;
@@ -131,6 +119,7 @@ export interface AgentOptions {
 export class AgentService {
   private readonly doomLoop = new DoomLoopDetector();
   private readonly mistakes = new MistakeTracker();
+  private readonly convergence = new ConvergenceGuard();
 
   constructor(
     private readonly provider: LLMProvider,
@@ -138,6 +127,18 @@ export class AgentService {
     private readonly toolbox: ToolBox,
     private readonly options: AgentOptions,
   ) {}
+
+  private closedConvergenceResult(state: ConvergenceState, reason: string): AgentResult {
+    return {
+      reachedLimit: false,
+      stoppedByLoop: true,
+      summary: `Run ended incomplete — ${state}: ${reason}.`,
+      incomplete: {
+        issues: [reason],
+        compact: `No verified deliverable was produced because convergence state ${state} was reached.`,
+      },
+    };
+  }
 
   async run(
     plan: Plan,
@@ -162,12 +163,15 @@ export class AgentService {
     let finishContinuations = 0;
     let lastAssistantText = '';
     let repeatedAssistantText = 0;
+    let previousToolNames: string[] = [];
+    let previousToolFailed = false;
     let finishRejected = false;
     let lastProgressAt = Date.now();
     let toolCallIndex = 0;
     let completedTodoSteps = 0;
     const callIndexById = new Map<string, number>();
     const deferredLoopWarnings = new Map<string, string>();
+    const seenToolEvidence = new Set<string>();
     const progressLog: Array<{ callIndex: number; description: string; fingerprint: string }> = [];
     const observedChecks = new Set(this.toolbox.adaptiveVerificationSnapshot?.().verificationRan ?? []);
 
@@ -221,7 +225,13 @@ export class AgentService {
         noteProgress(toolCallIndex, 'developer steering');
       }
 
-      callbacks.onUsage?.(estimateTokens(messages));
+      let projectedMessages = projectExecutionMessages(
+        messages,
+        plan,
+        callbacks.progressSnapshot?.().completedStepCount ?? completedTodoSteps,
+        contextLimit,
+      );
+      callbacks.onUsage?.(estimateTokens(projectedMessages));
 
       let text = '';
       let reasoning = '';
@@ -234,12 +244,20 @@ export class AgentService {
         try {
           for await (const event of chatWithRetry(
             this.provider,
-            messages,
+            projectedMessages,
             {
               model: this.model,
               tools: this.options.tools,
               signal,
-              reasoning: this.options.resolveReasoning ? this.options.resolveReasoning() : this.options.reasoning,
+              reasoning: this.options.resolveReasoning
+                ? this.options.resolveReasoning({
+                    phase: 'execution',
+                    turn: step,
+                    previousToolNames,
+                    previousToolFailed,
+                  })
+                : this.options.reasoning,
+              contextTokens: this.options.contextLimitTokens,
             },
             {
               retryOnEmpty: true,
@@ -276,7 +294,17 @@ export class AgentService {
           if (attempt === 0 && isContextOverflowError(error)) {
             callbacks.onNotice?.('Context limit reached — compacting and retrying…');
             messages = await this.forceCompact(messages, signal, callbacks);
+            projectedMessages = projectExecutionMessages(
+              messages,
+              plan,
+              callbacks.progressSnapshot?.().completedStepCount ?? completedTodoSteps,
+              contextLimit,
+            );
             continue;
+          }
+          if (attempt > 0 && (text.trim() || reasoning.trim())) {
+            callbacks.onNotice?.('Stopped: the model stream ended before a complete deliverable.');
+            return this.closedConvergenceResult('TRUNCATED', 'the model stream ended after partial output');
           }
           throw error;
         }
@@ -291,7 +319,7 @@ export class AgentService {
               callbacks.onNotice?.(
                 'Stopped: the model repeated the same response without progress. Completed work was preserved; reconsider the next step.',
               );
-              return { reachedLimit: false, stoppedByLoop: true };
+              return this.closedConvergenceResult('FIXED_POINT', 'the same assistant response repeated without progress');
             }
             messages.push({
               role: 'user',
@@ -302,7 +330,18 @@ export class AgentService {
           }
           lastAssistantText = normalizedText;
           repeatedAssistantText = 0;
+          const convergence = this.convergence.observe({
+            signature: `text:${normalizedText}`,
+            producedOutput: true,
+            madeProgress: true,
+          });
+          if (convergence) return this.closedConvergenceResult(convergence.state, convergence.reason);
           return { reachedLimit: false };
+        }
+        const convergence = this.convergence.observe({ signature: 'empty', producedOutput: false, madeProgress: false });
+        if (convergence) {
+          callbacks.onNotice?.(`Stopped: ${convergence.reason}.`);
+          return this.closedConvergenceResult(convergence.state, convergence.reason);
         }
         messages.push({ role: 'user', content: 'Continue executing the plan. Use tools.' });
         continue;
@@ -323,7 +362,7 @@ export class AgentService {
           callbacks.onNotice?.(
             'Stopped: the model repeated the same response without progress. Completed work was preserved; reconsider the next step.',
           );
-          return { reachedLimit: false, stoppedByLoop: true };
+          return this.closedConvergenceResult('FIXED_POINT', 'the assistant repeated the same response with tool calls');
         }
         messages.push({
           role: 'user',
@@ -381,7 +420,7 @@ export class AgentService {
         const loopCheck = this.doomLoop.record(call, progressFor(call));
         if (loopCheck.action === 'stop') {
           callbacks.onNotice?.(loopCheck.message ?? `Stopped: the same tool call (${call.name}) was repeated ${loopCheck.count} times. Possible loop.`);
-          return { reachedLimit: false, stoppedByLoop: true };
+          return this.closedConvergenceResult('SHELL_LOOP', loopCheck.message ?? `the same tool call (${call.name}) repeated without progress`);
         }
         if (loopCheck.action === 'warn' && loopCheck.message) {
           deferredLoopWarnings.set(call.id, loopCheck.message);
@@ -394,6 +433,9 @@ export class AgentService {
       }
 
       const results = new Map<string, string>();
+      previousToolNames = normalizedCalls.map((call) => call.name);
+      previousToolFailed = false;
+      let turnMadeProgress = false;
       const executeOne = async (call: ToolCall): Promise<void> => {
         callbacks.onToolActivity(call.id, describeToolCall(call), 'running', toolIcon(call.name), activityMeta(call, ''));
         let result: string;
@@ -458,6 +500,7 @@ export class AgentService {
 
       for (const call of normalizedCalls) {
         const result = results.get(call.id) ?? 'Error: tool did not run.';
+        if (result.startsWith('Error:') || result.startsWith('Error in')) previousToolFailed = true;
         messages.push({ role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
 
         if (result.startsWith('Error:') || result.startsWith('Error in')) {
@@ -477,6 +520,13 @@ export class AgentService {
 
         const callIndex = callIndexById.get(call.id) ?? toolCallIndex;
         let callMadeProgress = false;
+        const evidenceKey = `${call.name}:${call.arguments}:${sha1Of(result)}`;
+        if (!result.startsWith('Error:') && !result.startsWith('Error in') && !seenToolEvidence.has(evidenceKey)) {
+          seenToolEvidence.add(evidenceKey);
+          noteProgress(callIndex, `new ${call.name} result`, call);
+          callMadeProgress = true;
+          turnMadeProgress = true;
+        }
         const changedPaths = mutationPaths(call, result);
         for (const changedPath of changedPaths) {
           runChangedPaths.add(changedPath);
@@ -490,6 +540,7 @@ export class AgentService {
                 : `edited ${changedPaths.length} files`;
           noteProgress(callIndex, description, call);
           callMadeProgress = true;
+          turnMadeProgress = true;
           const rewritten = rewriteStaleReads(messages, changedPaths, readCallPaths, readMessageIndex);
           if (rewritten > 0) {
             callbacks.onNotice?.(`Marked ${rewritten} earlier file read(s) as outdated.`);
@@ -516,6 +567,7 @@ export class AgentService {
                 call,
               );
               callMadeProgress = true;
+              turnMadeProgress = true;
             }
           }
         }
@@ -530,6 +582,7 @@ export class AgentService {
               completedTodoSteps = done;
               noteProgress(callIndex, `step ${done} completed`, call);
               callMadeProgress = true;
+              turnMadeProgress = true;
             }
           }
         }
@@ -544,13 +597,21 @@ export class AgentService {
           callbacks.onNotice?.(
             `Stopped after ${mistake.count} consecutive tool failures. Review the errors, then tell me how you would like to proceed.`,
           );
-          return { reachedLimit: false, stoppedByMistakes: true };
+          return {
+            reachedLimit: false,
+            stoppedByMistakes: true,
+            summary: `Run ended incomplete — ${mistake.count} consecutive tool failures.`,
+            incomplete: {
+              issues: [`${mistake.count} consecutive tool failures`],
+              compact: 'No verified deliverable was produced after repeated tool failures.',
+            },
+          };
         }
 
         const loopCheck = this.doomLoop.record(call, progressFor(call));
         if (loopCheck.action === 'stop') {
           callbacks.onNotice?.(loopCheck.message ?? `Stopped: the same tool call (${call.name}) was repeated ${loopCheck.count} times. Possible loop.`);
-          return { reachedLimit: false, stoppedByLoop: true };
+          return this.closedConvergenceResult('SHELL_LOOP', loopCheck.message ?? `the same tool call (${call.name}) repeated without progress`);
         }
         const deferredWarning = deferredLoopWarnings.get(call.id);
         deferredLoopWarnings.delete(call.id);
@@ -564,6 +625,16 @@ export class AgentService {
         } else if (deferredWarning && !callMadeProgress) {
           messages.push({ role: 'user', content: deferredWarning });
         }
+      }
+      const convergence = this.convergence.observe({
+        signature: normalizedCalls.map((call) => `${call.name}:${call.arguments}`).join('|'),
+        producedOutput: true,
+        madeProgress: turnMadeProgress,
+        toolNames: normalizedCalls.map((call) => call.name),
+      });
+      if (convergence) {
+        callbacks.onNotice?.(`Stopped: ${convergence.reason}.`);
+        return this.closedConvergenceResult(convergence.state, convergence.reason);
       }
     }
 
@@ -589,10 +660,9 @@ export class AgentService {
     }
     try {
       const summary = await summarizeMessages(this.provider, this.model, messages.slice(2, check.recentStart), signal);
-      if (!summary) {
-        return messages;
-      }
-      const compacted = buildCompactedMessages(messages, summary, check.recentStart);
+      const compacted = summary
+        ? buildCompactedMessages(messages, summary, check.recentStart)
+        : buildDeterministicCheckpoint(messages, check.recentStart);
       callbacks.onCompaction?.({
         tokensBefore: estimateTokens(messages),
         tokensAfter: estimateTokens(compacted),
@@ -601,7 +671,14 @@ export class AgentService {
       });
       return compacted;
     } catch {
-      return messages;
+      const compacted = buildDeterministicCheckpoint(messages, check.recentStart);
+      callbacks.onCompaction?.({
+        tokensBefore: estimateTokens(messages),
+        tokensAfter: estimateTokens(compacted),
+        messagesBefore: messages.length,
+        messagesAfter: compacted.length,
+      });
+      return compacted;
     }
   }
 
@@ -628,9 +705,9 @@ export class AgentService {
         return buildCompactedMessages(messages, summary, recentStart);
       }
     } catch {
-      // fall through
+      // fall through to a model-free checkpoint below
     }
-    return messages;
+    return buildDeterministicCheckpoint(messages, recentStart);
   }
 
   private finishCheckSummary(

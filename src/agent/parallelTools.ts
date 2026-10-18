@@ -1,0 +1,17 @@
+export const PARALLEL_SAFE = new Set([
+  'read_file',
+  'list_files',
+  'search_text',
+  'find_symbol',
+  'document_symbols',
+  'find_references',
+  'go_to_definition',
+  'hover',
+  'go_to_implementation',
+  'incoming_calls',
+  'outgoing_calls',
+  'semantic_search',
+  'web_fetch',
+  'web_search',
+  'list_processes',
+]);

@@ -161,7 +161,7 @@ describe('DoomLoopDetector no-progress detection', () => {
     expect(detector.record(variant(1), same).action).toBe('none');
     const warned = detector.record(variant(2), same);
     expect(warned.action).toBe('warn');
-    expect(warned.message).toContain('Stop and reconsider');
+    expect(warned.message).toContain('LOOP RECOVERY: read_file was repeated with identical arguments');
     expect(detector.record(variant(3), same).action).toBe('none');
     const stopped = detector.record(variant(4), same);
     expect(stopped.action).toBe('stop');

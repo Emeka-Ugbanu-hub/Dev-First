@@ -499,3 +499,94 @@ describe('self-adjusting reasoning prompts', () => {
     expect(buildExecutorSystemPrompt()).toContain('Never narrate individual tool calls');
   });
 });
+
+describe('planner thinking setting', () => {
+  function plannerOptionsOf(controller: SessionController, presetId: string): ReasoningOptions | undefined {
+    return (controller as unknown as {
+      plannerReasoningOptions(supported: boolean, preset: string): ReasoningOptions | undefined;
+    }).plannerReasoningOptions(true, presetId);
+  }
+
+  function stubReasoningLevels(controller: SessionController, levels: string[]): void {
+    const target = controller as unknown as { selectedModelMetadata: () => unknown };
+    vi.spyOn(target, 'selectedModelMetadata').mockReturnValue({
+      id: 'test-model',
+      reasoningLevels: levels,
+      reasoningDefault: levels.includes('medium') ? 'medium' : levels[0],
+    });
+  }
+
+  it('auto skips thinking while planning on local models', () => {
+    const { controller } = createController([]);
+    env.config = { preset: 'ollama', model: 'qwen3:8b', plannerThinking: 'auto', reasoningEffort: 'on' };
+    stubReasoningLevels(controller, ['off', 'on']);
+    expect(reasoningOptionsOf(controller)?.effort).toBe('on');
+    expect(plannerOptionsOf(controller, 'ollama')?.effort).toBe('off');
+    controller.dispose();
+  });
+
+  it('auto keeps the selected effort on hosted models', () => {
+    const { controller } = createController([]);
+    env.config = { preset: 'openai', model: 'gpt-5.6', plannerThinking: 'auto' };
+    stubReasoningLevels(controller, ['off', 'low', 'medium', 'high']);
+    expect(plannerOptionsOf(controller, 'openai')).toEqual(reasoningOptionsOf(controller));
+    controller.dispose();
+  });
+
+  it('auto leaves thinking untouched when the local model has no off level', () => {
+    const { controller } = createController([]);
+    env.config = { preset: 'ollama', model: 'gpt-oss:20b', plannerThinking: 'auto' };
+    stubReasoningLevels(controller, ['low', 'medium', 'high']);
+    expect(plannerOptionsOf(controller, 'ollama')?.effort).not.toBe('off');
+    controller.dispose();
+  });
+
+  it('on keeps the selected effort on local models', () => {
+    const { controller } = createController([]);
+    env.config = { preset: 'ollama', model: 'qwen3:8b', plannerThinking: 'on', reasoningEffort: 'on' };
+    stubReasoningLevels(controller, ['off', 'on']);
+    expect(plannerOptionsOf(controller, 'ollama')?.effort).toBe('on');
+    controller.dispose();
+  });
+
+  it('off plans without thinking on local models', () => {
+    const { controller } = createController([]);
+    env.config = { preset: 'ollama', model: 'qwen3:8b', plannerThinking: 'off' };
+    stubReasoningLevels(controller, ['off', 'on']);
+    expect(plannerOptionsOf(controller, 'ollama')?.effort).toBe('off');
+    controller.dispose();
+  });
+
+  it('off uses the none level on hosted models that spell it that way', () => {
+    const { controller } = createController([]);
+    env.config = { preset: 'openai', model: 'gpt-5.6', plannerThinking: 'off' };
+    stubReasoningLevels(controller, ['none', 'low', 'medium', 'high']);
+    expect(plannerOptionsOf(controller, 'openai')?.effort).toBe('none');
+    controller.dispose();
+  });
+
+  it('off disables thinking through the deepseek toggle', () => {
+    const { controller } = createController([]);
+    env.config = { preset: 'deepseek', model: 'deepseek-reasoner', plannerThinking: 'off' };
+    stubReasoningLevels(controller, ['off', 'on']);
+    expect(plannerOptionsOf(controller, 'deepseek')).toEqual({ enabled: false });
+    controller.dispose();
+  });
+
+  it('off leaves thinking untouched when the model cannot disable it', () => {
+    const { controller } = createController([]);
+    env.config = { preset: 'openai', model: 'gpt-5.6', plannerThinking: 'off' };
+    stubReasoningLevels(controller, ['low', 'medium', 'high']);
+    expect(plannerOptionsOf(controller, 'openai')).toEqual(reasoningOptionsOf(controller));
+    controller.dispose();
+  });
+
+  it('a run override still wins over the setting', () => {
+    const { controller } = createController([]);
+    env.config = { preset: 'ollama', model: 'qwen3:8b', plannerThinking: 'off', reasoningEffort: 'on' };
+    stubReasoningLevels(controller, ['off', 'low', 'medium', 'high']);
+    expect(setRunReasoning(controller, 'high')).toContain('Reasoning effort set to medium for this run.');
+    expect(plannerOptionsOf(controller, 'ollama')?.effort).toBe('medium');
+    controller.dispose();
+  });
+});

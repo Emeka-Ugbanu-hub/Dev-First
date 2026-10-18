@@ -7,7 +7,7 @@ export interface PlanReadiness {
 
 /** Validate the minimum execution contract without another model call. */
 export function checkPlanReadiness(plan: Plan): PlanReadiness {
-  if (plan.trivial) return { ready: true, missing: [] };
+  if (plan.trivial || plan.planningMode === 'skip') return { ready: true, missing: [] };
   const missing: string[] = [];
   if (!nonEmpty(plan.what)) missing.push('scope (what)');
   if (!plan.steps?.some(nonEmpty)) missing.push('concrete steps');

@@ -79,6 +79,11 @@ export function isRetryableError(error: unknown): boolean {
     return true;
   }
   if (error instanceof HttpError) {
+    // Template/message-shape failures are deterministic. Retrying the same
+    // payload only repeats the failure and can make the model appear to loop.
+    if (/jinja|no user (?:query|message)|system message must be at the beginning|chat template/i.test(error.message)) {
+      return false;
+    }
     return error.status === 408 || error.status === 409 || error.status === 429 || error.status >= 500;
   }
   if (error instanceof TypeError) {

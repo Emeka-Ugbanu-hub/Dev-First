@@ -210,6 +210,16 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     max: 2_000_000,
   },
   {
+    key: 'localContextCapTokens',
+    tab: 'behavior',
+    group: 'Context',
+    label: 'Local context cap',
+    description: 'Optional maximum context for local models. 0 disables it; the effective limit never exceeds the model or Modelfile context.',
+    type: 'number',
+    min: 0,
+    max: 2_000_000,
+  },
+  {
     key: 'contextProfile',
     tab: 'behavior',
     group: 'Context',
@@ -218,6 +228,16 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
       'Adaptive compaction aggressiveness. Auto derives the tier from the model context window: compact for small windows, standard for mid-size, large for very large ones.',
     type: 'enum',
     options: ['auto', 'compact', 'standard', 'large'],
+  },
+  {
+    key: 'plannerThinking',
+    tab: 'behavior',
+    group: 'Context',
+    label: 'Planner thinking',
+    description:
+      'Whether the planner deliberates before answering. Auto skips planner thinking on local models and uses bounded effort routing elsewhere; off disables it everywhere; on honors the selected effort. Explicit run overrides always win.',
+    type: 'enum',
+    options: ['auto', 'off', 'on'],
   },
   {
     key: 'pasteFileLines',

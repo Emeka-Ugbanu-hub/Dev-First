@@ -24,6 +24,18 @@ const call = (name: string, args: Record<string, unknown>): StreamEvent => ({
   toolCall: { id: `call-${name}`, name, arguments: JSON.stringify(args) },
 });
 
+const callWithId = (id: string, name: string, args: Record<string, unknown>): StreamEvent => ({
+  type: 'toolCall',
+  toolCall: { id, name, arguments: JSON.stringify(args) },
+});
+
+const readiness = {
+  expectedFiles: [],
+  dependencies: 'none',
+  assumptions: 'none',
+  verification: ['none'],
+};
+
 const draftPlan: Plan = {
   version: 1,
   status: 'draft',
@@ -86,7 +98,7 @@ describe('PlannerService single-turn intent handling', () => {
   });
 
   it('handles a greeting plus a task as a task in the same selected-model call', async () => {
-    const provider = new ScriptedProvider([[call('submit_plan', { what: 'Fix X', steps: ['Fix X'] })]]);
+    const provider = new ScriptedProvider([[call('submit_plan', { what: 'Fix X', steps: ['Fix X'], ...readiness })]]);
     const result = await planner(provider, { enabled: true, effort: 'max' }).plan(
       [{ role: 'user', content: 'hi, now fix X' }], null, 1, callbacks(), new AbortController().signal,
     );
@@ -131,7 +143,7 @@ describe('PlannerService single-turn intent handling', () => {
   });
 
   it('submits a requested change in the first call', async () => {
-    const provider = new ScriptedProvider([[call('submit_plan', { what: 'Add a health endpoint', steps: ['Add the endpoint'] })]]);
+    const provider = new ScriptedProvider([[call('submit_plan', { what: 'Add a health endpoint', steps: ['Add the endpoint'], ...readiness })]]);
     const result = await planner(provider).plan(request, null, 1, callbacks(), new AbortController().signal);
 
     expect(result.plan?.what).toBe('Add a health endpoint');
@@ -152,6 +164,7 @@ describe('PlannerService single-turn intent handling', () => {
     const provider = new ScriptedProvider([[call('submit_plan', {
       what: 'Add retry handling and logging',
       steps: ['Add a retry helper', 'Add logging'],
+      ...readiness,
     })]]);
     const result = await planner(provider).plan(
       [{ role: 'user', content: 'also add logging' }], draftPlan, 3, callbacks(), new AbortController().signal,
@@ -166,7 +179,7 @@ describe('PlannerService single-turn intent handling', () => {
   it('asks for clarification, then continues with the user answer without a routing pass', async () => {
     const provider = new ScriptedProvider([
       [call('ask_user', { question: 'Do you want an explanation or a code change?', header: 'Clarify request' })],
-      [call('submit_plan', { what: 'Update the login page', steps: ['Update the page'] })],
+      [call('submit_plan', { what: 'Update the login page', steps: ['Update the page'], ...readiness  })],
     ]);
     const toolResults: string[] = [];
     const result = await planner(provider).plan(request, null, 1, callbacks(toolResults), new AbortController().signal);
@@ -175,5 +188,81 @@ describe('PlannerService single-turn intent handling', () => {
     expect(provider.calls).toHaveLength(2);
     expect(provider.calls[1].messages.some((message) => message.role === 'tool' && message.content === 'Please update the login page.')).toBe(true);
     expect(result.plan?.what).toBe('Update the login page');
+  });
+
+  it('runs read-only tool calls in one parallel batch and keeps result order', async () => {
+    const provider = new ScriptedProvider([
+      [
+        callWithId('t1', 'read_file', { path: 'a.ts' }),
+        callWithId('t2', 'read_file', { path: 'b.ts' }),
+      ],
+      [call('submit_plan', { what: 'Fix X', steps: ['Fix X'], ...readiness })],
+    ]);
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const cb = callbacks();
+    cb.executeTool = async (tool) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      inFlight -= 1;
+      return `contents-${tool.id}`;
+    };
+
+    const result = await planner(provider).plan(request, null, 1, cb, new AbortController().signal);
+
+    expect(result.plan?.what).toBe('Fix X');
+    expect(maxInFlight).toBe(2);
+    const toolMessages = provider.calls[1].messages.filter(
+      (message) => message.role === 'tool' && message.toolName === 'read_file');
+    expect(toolMessages.map((message) => message.content)).toEqual(['contents-t1', 'contents-t2']);
+  });
+
+  it('trims stale tool results so prompt re-evaluation stays cheap', async () => {
+    const reads = Array.from({ length: 9 }, (_, index) =>
+      callWithId(`t${index}`, 'read_file', { path: `f${index}.ts` }));
+    const provider = new ScriptedProvider([
+      reads,
+      [call('submit_plan', { what: 'Fix X', steps: ['Fix X'], ...readiness })],
+    ]);
+    const cb = callbacks();
+    cb.executeTool = async (tool) => `${tool.id}:`.padEnd(600, 'x');
+
+    await planner(provider).plan(request, null, 1, cb, new AbortController().signal);
+
+    const toolMessages = provider.calls[1].messages.filter(
+      (message) => message.role === 'tool' && message.toolName === 'read_file');
+    expect(toolMessages).toHaveLength(9);
+    expect(toolMessages[0].content).toContain('[earlier result trimmed to keep planning fast]');
+    expect(toolMessages[0].content.length).toBeLessThan(600);
+    expect(toolMessages[8].content).not.toContain('trimmed');
+  });
+
+  it('nudges once when a turn ends with thinking but no answer', async () => {
+    const provider = new ScriptedProvider([
+      [{ type: 'reasoning', text: 'Let me think about this.' }],
+      [{ type: 'text', text: 'Use the health endpoint at /health.' }],
+    ]);
+    const result = await planner(provider).plan(request, null, 1, callbacks(), new AbortController().signal);
+
+    expect(result.text).toBe('Use the health endpoint at /health.');
+    expect(provider.calls).toHaveLength(2);
+    const nudge = provider.calls[1].messages.at(-1);
+    expect(nudge?.role).toBe('user');
+    expect(String(nudge?.content)).toContain('stopped after thinking');
+  });
+
+  it('nudges once after repeated readiness rejections, then stops', async () => {
+    const minimal = call('submit_plan', { what: 'Fix X', steps: ['Fix X'] });
+    const provider = new ScriptedProvider([[minimal], [minimal], [minimal]]);
+    const result = await planner(provider).plan(request, null, 1, callbacks(), new AbortController().signal);
+
+    expect(result.plan).toBeUndefined();
+    expect(result.exhausted).toBe(true);
+    expect(result.stopped).toBe('same-plan');
+    expect(provider.calls).toHaveLength(3);
+    expect(provider.calls[2].messages.some(
+      (message) => message.role === 'user' && String(message.content).startsWith('LOOP RECOVERY:'),
+    )).toBe(true);
   });
 });

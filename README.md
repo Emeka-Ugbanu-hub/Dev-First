@@ -90,6 +90,97 @@ You can add workspace rules, reusable skills, commands, and project notes under 
 
 Useful commands include **Open Chat**, **New Session**, **Explain Selection**, **Fix Selection**, **Scan File**, **Open Architecture**, **Refresh Architecture**, **Build Semantic Index**, **Select Model**, and **Export Transcript**.
 
+## Settings
+
+Open the **gear icon** for the in-panel settings view: **Provider** (connection + task models), **Behavior** (safety, behavior, accuracy, verification, context, input), **Display** (chat, notifications), and **About**. Changes apply instantly with a brief "Saved" confirmation. The same keys are available in VS Code settings (linked from About), along with a few advanced keys that predate the panel and are intentionally not shown there (execution step limits, terminal timeout, low-level provider adapter, embeddings model, browser port, legacy reasoning effort).
+
+### Provider
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `devFirst.preset` | `openai` | Provider preset: `openai`, `anthropic`, `gemini`, `openrouter`, `groq`, `deepseek`, `ollama`, `lmstudio`, `custom` (normally set from the panel) |
+| `devFirst.model` | `gpt-4o` | Model id used for chat, planning, and execution |
+| `devFirst.baseUrl` | provider default | Custom API base URL (e.g. OpenRouter, Ollama) |
+| `devFirst.scanPreset` | `""` | Provider for scanner operations; empty inherits the main connection |
+| `devFirst.scanModel` | `""` | Model for scanner operations; empty uses the scanner connection model |
+| `devFirst.scanReasoningEffort` | `""` | Reasoning effort for the scanner model; empty inherits the main setting |
+| `devFirst.architecturePreset` | `""` | Provider for architecture mapping; empty inherits the main connection |
+| `devFirst.architectureModel` | `""` | Model for architecture mapping; empty uses the architecture connection model |
+| `devFirst.architectureReasoningEffort` | `""` | Reasoning effort for the architecture model; empty inherits the main setting |
+
+### Safety, behavior, and accuracy
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `devFirst.sandbox` | `workspace-write` | OS sandbox for terminal writes (`off` or `workspace-write`); the approval card can bypass it once per command |
+| `devFirst.autoApproveTerminal` | `false` | Skip the Allow/Deny card for terminal commands |
+| `devFirst.autoApproveEdits` | `true` | Apply `write_file`, `edit_file`, and `apply_patch` without asking |
+| `devFirst.autoApproveMcp` | `true` | Run MCP tool calls without asking |
+| `devFirst.safeCommandsOnly` | `true` | With terminal auto-approve on, only read-only commands run automatically |
+| `devFirst.yolo` | `false` | Auto-approve everything: edits, all commands, and MCP tools |
+| `devFirst.headerTimeout` | `120` | Seconds to wait for model response headers; `0` disables |
+| `devFirst.streamIdleTimeout` | `120` | Seconds between streaming chunks before aborting; `0` disables |
+| `devFirst.checkDiagnostics` | `true` | Feed language-server diagnostics for touched files back after edits |
+| `devFirst.parallelTools` | `true` | Run independent read-only tool calls in parallel |
+| `devFirst.memory` | `true` | Save and recall durable project facts across sessions |
+| `devFirst.semanticIndex` | `true` | Enable `semantic_search` with the bundled local embedding model |
+| `devFirst.embeddingsProvider` | `local` | `local` = bundled MiniLM (offline) · `api` = provider embeddings |
+
+### Verification
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `devFirst.adaptiveVerify` | `true` | Escalate verification automatically after edits: diagnostics, related files, closest tests, then the project typecheck or test command |
+| `devFirst.typecheckCommand` | `""` | Typecheck command for `verify_change`; empty auto-detects |
+| `devFirst.testCommand` | `""` | Test command for `verify_change`; empty auto-detects |
+| `devFirst.lintCommand` | `""` | Lint command for `verify_change`; empty auto-detects |
+| `devFirst.buildCommand` | `""` | Build command for `verify_change`; empty auto-detects |
+
+### Context and input
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `devFirst.autoCompact` | `true` | Summarize the conversation when it approaches the context limit |
+| `devFirst.contextLimitTokens` | `128000` | Fallback context window used only when the model is not in the model catalog |
+| `devFirst.localContextCapTokens` | `32768` | Optional maximum context for local models; `0` disables the cap and the effective limit never exceeds the model or Modelfile context |
+| `devFirst.contextProfile` | `auto` | `auto` derives the tier from the model window, or force `compact`, `standard`, `large` |
+| `devFirst.plannerThinking` | `auto` | Planner thinking policy: `auto` skips planner thinking on local models and uses bounded evidence-based effort routing elsewhere, `off` disables it everywhere, and `on` honors the selected effort; explicit run overrides win |
+| `devFirst.pasteFileLines` | `120` | Pasted text longer than this many lines is saved under `.dev-first/pastes` instead of filling the prompt |
+| `devFirst.warmOnFocus` | `true` | Warm up the local Ollama model when the chat input gains focus, so the first response starts without a cold load |
+
+Planning is graduated per change: the model chooses `skip` for one explicit low-risk operation, `lite` for a small known change, `spec` for a normal change, or `full` for architecture and high-risk work. Skip runs directly; the other modes keep the appropriate plan and approval flow.
+
+### Autocomplete
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `devFirst.autocomplete` | `false` | Enable inline ghost-text completions |
+| `devFirst.autocompleteModel` | `""` | FIM model id; empty means auto per provider |
+| `devFirst.autocompleteFallback` | `true` | Ask the connected chat model when no FIM model applies (throttled) |
+
+### Scanning and attention
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `devFirst.scanMaxFiles` | `2000` | Stop scanner indexing after this many files |
+| `devFirst.scanIgnore` | built-in globs | Comma-separated globs to skip when scanning |
+| `devFirst.scanAiModel` | `""` | Model for the AI scan; empty uses the main chat model |
+| `devFirst.keepAwake` | `false` | Prevent sleep while a plan is running (macOS `caffeinate`) |
+
+### Display and notifications
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `devFirst.resources` | `true` | Show the Learn more button on plans and walkthroughs |
+| `devFirst.mcpDisplay` | `markdown` | MCP tool output rendering: `markdown` or `plain` |
+| `devFirst.architecture` | `true` | Show the Architecture button for codebase mapping |
+| `devFirst.soundOnFinish` | `false` | Play a short tone when a run completes |
+| `devFirst.notifyOnFinish` | `false` | VS Code notification when a task finishes (any result) |
+| `devFirst.notifyOnComplete` | `true` | VS Code notification when a run finishes successfully |
+| `devFirst.notifyOnError` | `true` | VS Code error notification when a run fails |
+| `devFirst.notifySound` | `chime` | Notification sound: `off`, `chime`, or `beep` |
+| `devFirst.notifyOnInput` | `true` | Notify when a plan awaits approval, a command needs Allow/Deny, or the agent asked a question |
+
 ## Open source and the direction of the project
 
 Dev-First is an evolving open-source harness for a developer-led AI workflow. The aim is to make coding more enjoyable and more understandable: help developers learn their systems from architecture to file-level detail, inspect and refactor code with confidence, see what is happening, and still gain the speed and repeatability that AI can provide.
