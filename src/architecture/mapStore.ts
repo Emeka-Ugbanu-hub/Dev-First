@@ -10,6 +10,8 @@ export interface ArchitectureMapCoverage extends ArchitectureScanCoverage {
 
 export interface StoredArchitectureMap {
   version: 3;
+  /** Absolute workspace root that produced this map. Older maps omit this and are ignored by the panel. */
+  workspaceRoot?: string;
   filesHash: string;
   mermaid: string;
   paths: MapPaths;
@@ -79,6 +81,7 @@ export function readStoredMap(state: {
   }
   return {
     version: 3,
+    ...(typeof candidate.workspaceRoot === 'string' ? { workspaceRoot: candidate.workspaceRoot } : {}),
     filesHash: candidate.filesHash,
     mermaid: candidate.mermaid,
     paths: clean,

@@ -506,6 +506,8 @@ export class SessionController {
     const metadata = this.selectedModelMetadata(preset.id, config.model, preset.provider);
     const reasoningLevels = metadata.reasoningLevels ?? [];
     const reasoningEffort = this.selectedReasoningEffort(preset.id, config.model, reasoningLevels, metadata.reasoningDefault);
+    const reasoningSliderLevels = reasoningLevels.length > 0 ? ['auto', ...reasoningLevels] : [];
+    const reasoningCurrent = config.plannerThinking === 'auto' ? 'auto' : config.plannerThinking === 'off' ? 'off' : reasoningEffort;
     const recovery = this.buildRecoveryState();
     return {
       phase: this.phase,
@@ -533,8 +535,8 @@ export class SessionController {
       visionSupportKnown: metadata.supportsVision !== undefined,
       modelDisplayName: metadata.name ?? config.model,
       reasoningEffort,
-      reasoningLevels,
-      reasoningCurrent: reasoningEffort,
+      reasoningLevels: reasoningSliderLevels,
+      reasoningCurrent,
       reasoningDefault: metadata.reasoningDefault ?? '',
       resources: config.resources,
       mcpDisplay: config.mcpDisplay,
@@ -2316,7 +2318,12 @@ export class SessionController {
         tools: plannerTools,
         rules,
         family,
-        reasoning: this.plannerReasoningOptions(plannerReasoningSupported, preset.id),
+        reasoning: this.plannerReasoningOptions(plannerReasoningSupported, preset.id, {
+          phase: 'planning',
+          turn: 0,
+          previousToolNames: [],
+          previousToolFailed: false,
+        }),
         resolveReasoning: (context) => this.plannerReasoningOptions(plannerReasoningSupported, preset.id, context),
         reasoningSwitch: this.reasoningSwitchEnabled(),
         contextLimitTokens: this.effectiveContextLimit(),
@@ -2986,10 +2993,14 @@ export class SessionController {
     presetId: string,
     context: ReasoningRouteContext,
   ): ReasoningOptions | undefined {
-    const options = this.reasoningOptions(supported, presetId);
     const config = getConfig();
-    // Explicit planner modes and run-level overrides remain authoritative.
-    if (config.plannerThinking !== 'auto' || this.reasoningOverride) return options;
+    const options = config.plannerThinking === 'auto'
+      ? this.autoReasoningOptions(supported, presetId)
+      : this.reasoningOptions(supported, presetId);
+    // One reasoning mode governs planning and execution. A run-level override
+    // remains authoritative when the model explicitly changes it mid-run.
+    if (this.reasoningOverride || config.plannerThinking === 'on') return options;
+    if (config.plannerThinking === 'off') return this.disableReasoning(options, presetId);
     const providerId = findPreset(presetId)?.provider ?? config.provider;
     const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
     return routeReasoning(options, levels, context);
@@ -3000,39 +3011,54 @@ export class SessionController {
     presetId: string,
     context?: ReasoningRouteContext,
   ): ReasoningOptions | undefined {
-    const options = this.reasoningOptions(supported, presetId);
+    const config = getConfig();
+    const options = config.plannerThinking === 'auto'
+      ? this.autoReasoningOptions(supported, presetId)
+      : this.reasoningOptions(supported, presetId);
     if (!options || !options.enabled || this.reasoningOverride) {
       return options;
     }
-    const mode = getConfig().plannerThinking;
-    const local = findPreset(presetId)?.local ?? false;
-    const disable = mode === 'off' || (mode === 'auto' && local);
-    if (!disable) {
-      if (mode === 'auto' && context) {
-        const config = getConfig();
-        const providerId = findPreset(presetId)?.provider ?? config.provider;
-        const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
-        return routeReasoning(options, levels, context);
-      }
+    const mode = config.plannerThinking;
+    if (mode === 'on') {
       return options;
     }
-    // Thinking tokens are the main source of planning latency: local models
-    // pay for them in wall-clock time on every re-evaluated turn. Planning
-    // runs without deliberation; execution can turn it back on via
-    // set_reasoning. Each provider family has its own "off" spelling.
-    const currentConfig = getConfig();
-    const providerId = findPreset(presetId)?.provider ?? currentConfig.provider;
-    const levels = this.selectedModelMetadata(presetId, currentConfig.model, providerId).reasoningLevels ?? [];
-    if (options.effort === 'off' || (!levels.includes('off') && !levels.includes('none') && presetId !== 'deepseek')) {
-      return options;
+    if (mode === 'off') {
+      return this.disableReasoning(options, presetId);
     }
-    if (presetId === 'deepseek') {
-      return { enabled: false };
-    }
-    if (levels.includes('none')) {
-      return { ...options, effort: 'none' };
-    }
+    // Auto uses the same bounded router for local and hosted models. The
+    // initial planning request gets an explicit planning context so a binary
+    // off/on model starts off and can turn on only after strong evidence.
+    const providerId = findPreset(presetId)?.provider ?? config.provider;
+    const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
+    return routeReasoning(options, levels, context ?? {
+      phase: 'planning',
+      turn: 0,
+      previousToolNames: [],
+      previousToolFailed: false,
+    });
+  }
+
+  private disableReasoning(options: ReasoningOptions | undefined, presetId: string): ReasoningOptions | undefined {
+    if (!options) return options;
+    if (presetId === 'deepseek') return { enabled: false };
+    const config = getConfig();
+    const providerId = findPreset(presetId)?.provider ?? config.provider;
+    const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
+    if (options.effort === 'off' || (!levels.includes('off') && !levels.includes('none'))) return options;
+    if (levels.includes('none')) return { ...options, effort: 'none' };
     return { ...options, effort: 'off' };
+  }
+
+  private autoReasoningOptions(supported: boolean, presetId: string): ReasoningOptions | undefined {
+    const options = this.reasoningOptions(supported, presetId);
+    if (!options || !options.enabled || (options.effort !== 'off' && options.effort !== 'none')) return options;
+    const config = getConfig();
+    const providerId = findPreset(presetId)?.provider ?? config.provider;
+    const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
+    const ceiling = [...levels].reverse().find((level) => level !== 'off' && level !== 'none');
+    if (!ceiling) return options;
+    if (presetId === 'deepseek') return { ...options, enabled: true };
+    return { ...options, enabled: true, effort: ceiling };
   }
 
   private setRunReasoning(level: string): string {
@@ -3669,10 +3695,14 @@ export class SessionController {
     const preset = findPreset(presetId);
     if (!preset || presetId !== getConfig().preset || modelId !== getConfig().model) return;
     const levels = this.selectedModelMetadata(presetId, modelId, preset.provider).reasoningLevels ?? [];
+    if (value === 'auto') {
+      await this.applySetting('plannerThinking', 'auto');
+      return;
+    }
     if (!levels.includes(value)) return;
     const key = `devFirst.reasoning.${encodeURIComponent(presetId)}.${encodeURIComponent(modelId)}`;
     await this.context.globalState.update(key, value);
-    this.pushState();
+    await this.applySetting('plannerThinking', value === 'off' ? 'off' : 'on');
   }
 
   private postSettings(): void {

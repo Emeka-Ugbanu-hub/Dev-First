@@ -9,6 +9,7 @@ import { buildMapDigest } from './mapDigest';
 import { buildMermaidMap, mapPathsOf, parseStructuredMap } from './mapValidate';
 import { buildLevelView } from './mapLevels';
 import {
+  ARCHITECTURE_MAP_KEY,
   StoredArchitectureMap,
   architectureFilesHash,
   isStale,
@@ -75,7 +76,7 @@ export class ArchitecturePanel {
     private readonly panel: vscode.WebviewPanel,
     private readonly deps: ArchitecturePanelDeps,
   ) {
-    this.stored = readStoredMap(deps.state);
+    this.stored = this.readProjectMap();
     this.projectName = path.basename(deps.root) || 'this project';
     panel.webview.html = this.html(panel.webview);
     panel.onDidDispose(() => this.dispose());
@@ -171,7 +172,7 @@ export class ArchitecturePanel {
   }
 
   private async postCurrentState(): Promise<void> {
-    const stored = this.stored ?? readStoredMap(this.deps.state);
+    const stored = this.stored ?? this.readProjectMap();
     this.stored = stored;
     if (stored) {
       this.postMap(stored, false);
@@ -180,6 +181,16 @@ export class ArchitecturePanel {
     }
     const reason = (await this.hasProvider()) ? EMPTY_NOT_DRAWN : EMPTY_NO_MODEL;
     this.post({ type: 'empty', reason, project: this.projectName });
+  }
+
+  private readProjectMap(): StoredArchitectureMap | undefined {
+    const stored = readStoredMap(this.deps.state);
+    if (!stored) return undefined;
+    if (stored.workspaceRoot === path.resolve(this.deps.root)) return stored;
+    // There is one durable map slot, so discard a map from another/older
+    // workspace instead of retaining stale project data in global state.
+    void this.deps.state.update(ARCHITECTURE_MAP_KEY, undefined);
+    return undefined;
   }
 
   private async refreshStaleFlag(stored: StoredArchitectureMap): Promise<void> {
@@ -336,6 +347,7 @@ export class ArchitecturePanel {
       };
       const map: StoredArchitectureMap = {
         version: 3,
+        workspaceRoot: path.resolve(this.deps.root),
         filesHash: architectureFilesHash(facts.map((fact) => fact.file)),
         mermaid: buildMermaidMap(validated),
         paths: mapPathsOf(validated, (relative) => existsSync(path.join(this.deps.root, relative))),

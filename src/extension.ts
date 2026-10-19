@@ -606,10 +606,15 @@ export function activate(context: vscode.ExtensionContext): void {
         getActive: () => roleProvider(context, 'architecture'),
         getReasoning: async () => {
           const config = getConfig();
-          const effort = config.architectureReasoningEffort || config.reasoningEffort;
-          if (!effort || effort === 'off') return undefined;
           const role = await roleProvider(context, 'architecture');
-          if (role?.reasoningLevels?.length && !role.reasoningLevels.includes(effort)) {
+          const levels = role?.reasoningLevels ?? [];
+          // Architecture is deliberately independent from the main composer:
+          // use its explicit setting, or the strongest supported level by
+          // default because map generation spans many files and boundaries.
+          const configured = config.architectureReasoningEffort.trim();
+          const effort = configured || [...levels].reverse().find((level) => level !== 'off' && level !== 'none') || '';
+          if (!effort || effort === 'off' || effort === 'none') return undefined;
+          if (levels.length > 0 && !levels.includes(effort)) {
             return undefined;
           }
           return { enabled: true, effort: effort as 'low' | 'medium' | 'high' };

@@ -230,16 +230,6 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     options: ['auto', 'compact', 'standard', 'large'],
   },
   {
-    key: 'plannerThinking',
-    tab: 'behavior',
-    group: 'Context',
-    label: 'Planner thinking',
-    description:
-      'Whether the planner deliberates before answering. Auto skips planner thinking on local models and uses bounded effort routing elsewhere; off disables it everywhere; on honors the selected effort. Explicit run overrides always win.',
-    type: 'enum',
-    options: ['auto', 'off', 'on'],
-  },
-  {
     key: 'pasteFileLines',
     tab: 'behavior',
     group: 'Input',
@@ -395,7 +385,7 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
   },
   {
     key: 'scanReasoningEffort', tab: 'provider', group: 'Task models', label: 'Scanner reasoning effort',
-    description: 'Effort for the selected scanner model. Empty inherits the main setting; unsupported levels are ignored.', type: 'enum',
+    description: 'Effort for the selected scanner model. Empty uses a speed-first default and does not inherit the main composer.', type: 'enum',
     options: ['', 'off', 'low', 'medium', 'high', 'max'],
   },
   {
@@ -409,7 +399,7 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
   },
   {
     key: 'architectureReasoningEffort', tab: 'provider', group: 'Task models', label: 'Architecture reasoning effort',
-    description: 'Effort for the selected architecture model. Empty inherits the main setting; unsupported levels are ignored.', type: 'enum',
+    description: 'Effort for the selected architecture model. Empty uses the strongest supported level for broad, accurate maps; it does not inherit the main composer.', type: 'enum',
     options: ['', 'off', 'low', 'medium', 'high', 'max'],
   },
   {
@@ -422,4 +412,4 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
   },
 ];
 
-export const SETTING_KEYS = new Set(SETTINGS_SCHEMA.map((setting) => setting.key));
+export const SETTING_KEYS = new Set([...SETTINGS_SCHEMA.map((setting) => setting.key), 'plannerThinking']);

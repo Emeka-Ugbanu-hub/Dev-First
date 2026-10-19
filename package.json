@@ -2,7 +2,7 @@
   "name": "dev-first",
   "displayName": "Dev-First",
   "description": "Plan-first AI coding agent — every request becomes a plan you approve before a single line changes.",
-  "version": "0.1.7",
+  "version": "0.1.9",
   "publisher": "dev-first",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "media/icon.png",
@@ -470,21 +470,6 @@
           "default": "auto",
           "description": "Adaptive context profile controlling compaction and pruning thresholds."
         },
-        "devFirst.plannerThinking": {
-          "type": "string",
-          "enum": [
-            "auto",
-            "off",
-            "on"
-          ],
-          "enumDescriptions": [
-            "Skip planner thinking on local models; auto-routing uses lower effort for simple execution turns and preserves the selected ceiling.",
-            "Never think while planning, on any provider. Execution is not affected.",
-            "Planning uses the selected reasoning effort, including on local models."
-          ],
-          "default": "auto",
-          "description": "Whether the planner deliberates before answering. Thinking tokens are the main source of planning latency on local models."
-        },
         "devFirst.semanticIndex": {
           "type": "boolean",
           "default": true,
@@ -655,7 +640,7 @@
         "devFirst.scanReasoningEffort": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Reasoning effort for scanner operations. Empty inherits the main setting."
+          "markdownDescription": "Reasoning effort for scanner operations. Empty uses a speed-first default and does not inherit the main composer."
         },
         "devFirst.architecturePreset": {
           "type": "string",
@@ -670,7 +655,7 @@
         "devFirst.architectureReasoningEffort": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Reasoning effort for architecture mapping. Empty inherits the main setting."
+          "markdownDescription": "Reasoning effort for architecture mapping. Empty uses the strongest supported level for broad, accurate maps and does not inherit the main composer."
         },
         "devFirst.architecture": {
           "type": "boolean",

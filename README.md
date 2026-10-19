@@ -144,7 +144,6 @@ Open the **gear icon** for the in-panel settings view: **Provider** (connection 
 | `devFirst.contextLimitTokens` | `128000` | Fallback context window used only when the model is not in the model catalog |
 | `devFirst.localContextCapTokens` | `32768` | Optional maximum context for local models; `0` disables the cap and the effective limit never exceeds the model or Modelfile context |
 | `devFirst.contextProfile` | `auto` | `auto` derives the tier from the model window, or force `compact`, `standard`, `large` |
-| `devFirst.plannerThinking` | `auto` | Planner thinking policy: `auto` skips planner thinking on local models and uses bounded evidence-based effort routing elsewhere, `off` disables it everywhere, and `on` honors the selected effort; explicit run overrides win |
 | `devFirst.pasteFileLines` | `120` | Pasted text longer than this many lines is saved under `.dev-first/pastes` instead of filling the prompt |
 | `devFirst.warmOnFocus` | `true` | Warm up the local Ollama model when the chat input gains focus, so the first response starts without a cold load |
 

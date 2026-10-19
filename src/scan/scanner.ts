@@ -83,7 +83,9 @@ export class ScanRunner implements vscode.Disposable {
       getConfig: () => {
         const config = getConfig();
         const selectedModel = config.scanModel.trim() || config.scanAiModel.trim() || config.model;
-        const selectedEffort = config.scanReasoningEffort || config.reasoningEffort;
+        // Scanner reasoning is independent from the main composer. Keep the
+        // default speed-first when no scanner-specific effort is configured.
+        const selectedEffort = config.scanReasoningEffort || 'off';
         const supportedLevels = reasoningLevelsFor(config.scanPreset || config.preset, selectedModel);
         return {
           ...config,

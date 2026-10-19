@@ -37,6 +37,7 @@ import type {
   ChatOptions,
   LLMProvider,
   ReasoningOptions,
+  ReasoningRouteContext,
   StreamEvent,
   ToolCall,
 } from '../src/llm/types';
@@ -501,10 +502,10 @@ describe('self-adjusting reasoning prompts', () => {
 });
 
 describe('planner thinking setting', () => {
-  function plannerOptionsOf(controller: SessionController, presetId: string): ReasoningOptions | undefined {
+  function plannerOptionsOf(controller: SessionController, presetId: string, context?: ReasoningRouteContext): ReasoningOptions | undefined {
     return (controller as unknown as {
-      plannerReasoningOptions(supported: boolean, preset: string): ReasoningOptions | undefined;
-    }).plannerReasoningOptions(true, presetId);
+      plannerReasoningOptions(supported: boolean, preset: string, context?: ReasoningRouteContext): ReasoningOptions | undefined;
+    }).plannerReasoningOptions(true, presetId, context);
   }
 
   function stubReasoningLevels(controller: SessionController, levels: string[]): void {
@@ -525,11 +526,24 @@ describe('planner thinking setting', () => {
     controller.dispose();
   });
 
-  it('auto keeps the selected effort on hosted models', () => {
+  it('auto starts planning at low effort on hosted models', () => {
     const { controller } = createController([]);
     env.config = { preset: 'openai', model: 'gpt-5.6', plannerThinking: 'auto' };
     stubReasoningLevels(controller, ['off', 'low', 'medium', 'high']);
-    expect(plannerOptionsOf(controller, 'openai')).toEqual(reasoningOptionsOf(controller));
+    expect(plannerOptionsOf(controller, 'openai')?.effort).toBe('low');
+    controller.dispose();
+  });
+
+  it('auto escalates planning after a high-signal result', () => {
+    const { controller } = createController([]);
+    env.config = { preset: 'ollama', model: 'qwen3:8b', plannerThinking: 'auto', reasoningEffort: 'on' };
+    stubReasoningLevels(controller, ['off', 'on']);
+    expect(plannerOptionsOf(controller, 'ollama', {
+      phase: 'planning',
+      turn: 1,
+      previousToolNames: ['verify_change'],
+      previousToolFailed: false,
+    })?.effort).toBe('on');
     controller.dispose();
   });
 
