@@ -4,7 +4,11 @@ import { OpenAIProvider } from './providers/openai';
 import { AnthropicProvider } from './providers/anthropic';
 import { GeminiProvider } from './providers/gemini';
 
-export function createProvider(config: DevFirstConfig, apiKey: string | undefined): LLMProvider {
+export interface ProviderRuntimeOptions {
+  ollamaReasoningViaV1?: boolean;
+}
+
+export function createProvider(config: DevFirstConfig, apiKey: string | undefined, runtime: ProviderRuntimeOptions = {}): LLMProvider {
   const baseUrl = config.baseUrl.trim() || defaultBaseUrl(config.provider);
   const timeouts = {
     headerMs: Math.max(0, config.headerTimeout ?? 120) * 1000,
@@ -21,6 +25,7 @@ export function createProvider(config: DevFirstConfig, apiKey: string | undefine
         baseUrl,
         deepSeek: config.preset === 'deepseek',
         ollama: config.preset === 'ollama',
+        ollamaReasoningViaV1: runtime.ollamaReasoningViaV1,
         providerId: config.preset,
         timeouts,
       });

@@ -1,5 +1,5 @@
 import type { ModelMetadata } from '../shared/protocol';
-import { fetchOllamaCapability, resetOllamaCapabilityCache } from './adaptive';
+import { fetchOllamaCapability, resetOllamaCapabilityCache, ollamaOpenAIReasoningLevels } from './adaptive';
 
 type LmStudioModel = {
   key?: unknown;
@@ -82,11 +82,15 @@ async function fetchOllamaMetadata(baseUrl: string): Promise<Record<string, Mode
     await Promise.all(models.map(async (id) => {
       const capability = await fetchOllamaCapability(baseUrl, id);
       if (!capability) return;
+      const nativeLevels = capability.reasoningLevels ?? [];
+      const v1Levels = capability.thinking && nativeLevels.every((level) => ['off', 'on'].includes(level))
+        ? await ollamaOpenAIReasoningLevels(baseUrl, id)
+        : [];
       details[id] = {
         id,
         ...(capability.capabilities.length ? { supportsVision: capability.capabilities.includes('vision') } : {}),
         ...(capability.contextWindow ? { contextWindow: capability.contextWindow } : {}),
-        ...(capability.reasoningLevels?.length ? { reasoningLevels: capability.reasoningLevels } : {}),
+        ...(v1Levels.length ? { reasoningLevels: v1Levels } : capability.reasoningLevels?.length ? { reasoningLevels: capability.reasoningLevels } : {}),
         ...(capability.reasoningDefault ? { reasoningDefault: capability.reasoningDefault } : {}),
       };
     }));

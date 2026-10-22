@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { ChatMessage } from '../llm/types';
-import { Plan, PendingDecisionRecord, PlanningState, QueuedPromptRecord, SessionSummary, TodoItem, UiMessage } from '../shared/protocol';
+import { DurableTaskState, Plan, PendingDecisionRecord, PlanningState, QueuedPromptRecord, SessionSummary, TaskRouteEvent, TodoItem, UiMessage } from '../shared/protocol';
 import { rebuildContextIndex, messageHash } from './contextIndex';
 
 export interface StoredSession {
@@ -18,6 +18,8 @@ export interface StoredSession {
   lastRequest: string;
   contextTokens: number;
   queued?: QueuedPromptRecord[];
+  taskState?: DurableTaskState;
+  routeLog?: TaskRouteEvent[];
   pending?: PendingDecisionRecord;
   archived?: { count: number; files: string[]; uiCount?: number };
   archiveUnavailable?: boolean;

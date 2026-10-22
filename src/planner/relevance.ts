@@ -41,6 +41,7 @@ export interface PinnedPlannerContext {
   pending?: PendingDecisionRecord;
   changedFiles: string[];
   diagnosticsSummary?: string;
+  taskState?: { state: string; completedSteps: number[]; nextSteps: number[]; blockers: string[] };
 }
 
 export const RETRIEVED_CONTEXT_HEADER =
@@ -195,10 +196,6 @@ function selectWithAnchors(
     return { messages: conversation, retrieved: false, ambiguous: false };
   }
   const latest = conversation[conversation.length - 1];
-  const latestText = content(latest).trim();
-  if (/^(hi|hello|hey|thanks|thank you|ok|okay|got it|understood)[!.\s]*$/i.test(latestText)) {
-    return { messages: conversation.slice(-2), retrieved: false, ambiguous: false };
-  }
   // Without a multilingual embedding index, preserve full context for non-Latin
   // or highly ambiguous turns rather than risking a false omission.
   if (/[^\u0000-\u024f]/u.test(content(latest))) {
@@ -282,6 +279,15 @@ export function pinnedContextMessage(pinned: PinnedPlannerContext): ChatMessage 
   }
   if (pinned.diagnosticsSummary) {
     lines.push(`Diagnostics: ${pinned.diagnosticsSummary}`);
+  }
+  if (pinned.taskState) {
+    lines.push(`Task state: ${pinned.taskState.state}`);
+    lines.push(`Completed steps: ${pinned.taskState.completedSteps.join(', ') || 'none'}`);
+    lines.push(`Next steps: ${pinned.taskState.nextSteps.join(', ') || 'none'}`);
+    if (pinned.taskState.blockers.length > 0) {
+      lines.push(`Blockers: ${pinned.taskState.blockers.join('; ')}`);
+    }
+    lines.push('Do not redo completed steps. Continue with the next required step.');
   }
   return { role: 'system', content: `[Pinned context — always included]\n${lines.join('\n')}` };
 }

@@ -114,6 +114,7 @@ export interface AgentOptions {
   contextProfile?: ContextProfile;
   profileReasoning?: boolean;
   finishCheck?: (summary: FinishCheckSummary) => FinishGateResult | Promise<FinishGateResult>;
+  taskState?: { state: string; completedSteps: number[]; nextSteps: number[]; blockers: string[] };
 }
 
 export class AgentService {
@@ -148,7 +149,7 @@ export class AgentService {
   ): Promise<AgentResult> {
     let messages: ChatMessage[] = [
       { role: 'system', content: buildExecutorSystemPrompt(this.options.rules, this.options.family) },
-      { role: 'user', content: buildExecutorSpec(request, plan, this.options.planFilePath) },
+      { role: 'user', content: buildExecutorSpec(request, plan, this.options.planFilePath, this.options.taskState) },
     ];
     const readCallPaths = new Map<string, string>();
     const readMessageIndex = new Map<string, number>();

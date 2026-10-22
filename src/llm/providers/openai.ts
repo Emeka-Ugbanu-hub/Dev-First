@@ -16,6 +16,7 @@ export interface OpenAIProviderConfig {
   baseUrl: string;
   deepSeek?: boolean;
   ollama?: boolean;
+  ollamaReasoningViaV1?: boolean;
   providerId?: string;
   timeouts?: Partial<FetchTimeouts>;
 }
@@ -26,7 +27,7 @@ export class OpenAIProvider implements LLMProvider {
   constructor(private readonly config: OpenAIProviderConfig) {}
 
   async *chat(messages: ChatMessage[], options: ChatOptions): AsyncIterable<StreamEvent> {
-    if (this.config.ollama && options.reasoning) {
+    if (this.config.ollama && options.reasoning && !this.config.ollamaReasoningViaV1) {
       yield* this.chatOllama(messages, options);
       return;
     }

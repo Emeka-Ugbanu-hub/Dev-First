@@ -15,9 +15,45 @@ export interface OllamaCapability {
 }
 
 const ollamaCapabilityCache = new Map<string, OllamaCapability>();
+const ollamaOpenAIReasoningCache = new Map<string, string[]>();
 
 export function resetOllamaCapabilityCache(): void {
   ollamaCapabilityCache.clear();
+  ollamaOpenAIReasoningCache.clear();
+}
+
+/** Probe Ollama's OpenAI-compatible endpoint only when native effort levels are absent. */
+export async function ollamaOpenAIReasoningLevels(baseUrl: string, modelId: string): Promise<string[]> {
+  const key = `${baseUrl.replace(/\/+$/, '')}|${modelId}`;
+  const cached = ollamaOpenAIReasoningCache.get(key);
+  if (cached) return cached;
+  const levels: string[] = [];
+  try {
+    const url = new URL(baseUrl);
+    url.pathname = `${url.pathname.replace(/\/v1\/?$/i, '').replace(/\/$/, '')}/v1/chat/completions`;
+    url.search = '';
+    url.hash = '';
+    for (const effort of ['low', 'medium', 'high']) {
+      const response = await fetch(url.toString(), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: modelId,
+          messages: [{ role: 'user', content: 'Reply with one word.' }],
+          max_tokens: 1,
+          stream: false,
+          reasoning_effort: effort,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (response.ok) levels.push(effort);
+    }
+    ollamaOpenAIReasoningCache.set(key, levels);
+    return levels;
+  } catch {
+    ollamaOpenAIReasoningCache.set(key, levels);
+    return levels;
+  }
 }
 
 export function isAnthropicAdaptiveModel(modelId: string): boolean {
@@ -108,9 +144,15 @@ export async function fetchOllamaCapability(
       : [];
     const advertised = capabilities.includes('thinking');
     const rawValues = Array.isArray(json.thinking?.values) ? json.thinking.values : undefined;
+    const allBooleans = Boolean(rawValues?.length) && rawValues!.every((value) => typeof value === 'boolean');
+    const allStrings = Boolean(rawValues?.length) && rawValues!.every((value) => typeof value === 'string');
     const mapped = rawValues?.length === 1 && rawValues[0] === false
       ? []
-      : rawValues?.map((value) => value === true ? 'on' : value === false ? 'off' : String(value));
+      : allBooleans
+        ? rawValues!.map((value) => value ? 'on' : 'off')
+        : allStrings
+          ? rawValues!.map((value) => String(value))
+          : undefined;
     const levels = mapped && mapped.length > 0 ? mapped : advertised ? ['off', 'on'] : undefined;
     const defaultValue = json.thinking?.default;
     const info: OllamaCapability = {

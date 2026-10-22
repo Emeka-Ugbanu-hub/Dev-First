@@ -5,6 +5,7 @@ import { createProvider } from './index';
 import { ProviderPreset, effectiveBaseUrl, findPreset } from './presets';
 import type { LLMProvider } from './types';
 import { modelInfo, reasoningLevelsFor } from './catalog';
+import { fetchOllamaCapability, ollamaOpenAIReasoningLevels } from './adaptive';
 
 export interface ActiveProvider {
   preset: ProviderPreset;
@@ -26,11 +27,20 @@ interface ResolvedConnection {
   apiKey?: string;
 }
 
-function resolve(connection: ResolvedConnection, config: DevFirstConfig): ActiveProvider {
+async function resolve(connection: ResolvedConnection, config: DevFirstConfig): Promise<ActiveProvider> {
   const baseUrl = effectiveBaseUrl(connection.preset, connection.baseUrl);
+  let ollamaReasoningViaV1 = false;
+  if (connection.preset.id === 'ollama') {
+    const capability = await fetchOllamaCapability(baseUrl, connection.model);
+    const nativeLevels = capability?.reasoningLevels ?? reasoningLevelsFor(connection.preset.id, connection.model);
+    if (capability?.thinking && !nativeLevels.some((level) => !['off', 'on'].includes(level))) {
+      ollamaReasoningViaV1 = (await ollamaOpenAIReasoningLevels(baseUrl, connection.model)).length > 0;
+    }
+  }
   const provider = createProvider(
     { ...config, preset: connection.preset.id, provider: connection.preset.provider, baseUrl },
     connection.apiKey,
+    { ollamaReasoningViaV1 },
   );
   const catalog = modelInfo(connection.preset.id, connection.model);
   return {
@@ -52,7 +62,7 @@ export async function activeProvider(
   if (current) {
     const apiKey = await getApiKeyForPreset(context, current);
     if (!current.requiresKey || apiKey) {
-      return resolve({ preset: current, baseUrl: config.baseUrl, model: config.model, apiKey }, config);
+      return await resolve({ preset: current, baseUrl: config.baseUrl, model: config.model, apiKey }, config);
     }
   }
 
@@ -67,7 +77,7 @@ export async function activeProvider(
     if (preset.requiresKey && !apiKey) {
       continue;
     }
-    return resolve(
+    return await resolve(
       {
         preset,
         baseUrl: entry.baseUrl,
@@ -103,7 +113,7 @@ export async function roleProvider(
   if (preset.requiresKey && !apiKey) {
     return undefined;
   }
-  return resolve({
+    return await resolve({
     preset,
     baseUrl: saved?.baseUrl ?? (preset.id === config.preset ? config.baseUrl : ''),
     model: modelSetting || saved?.lastModel || preset.defaultModel || '',

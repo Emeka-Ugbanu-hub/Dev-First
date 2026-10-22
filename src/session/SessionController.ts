@@ -30,6 +30,9 @@ import {
   RunReviewFile,
   RunStatus,
   SelectionContext,
+  DurableTaskState,
+  TaskRouteEvent,
+  TaskStateStatus,
   TerminalApprovalDecision,
   TerminalApprovalRequest,
   TodoItem,
@@ -51,8 +54,9 @@ import {
   storeLiveModelsUpdatedAt,
 } from '../llm/catalog';
 import { HttpError } from '../llm/errors';
-import { adaptiveKind } from '../llm/adaptive';
+import { adaptiveKind, resetOllamaCapabilityCache } from '../llm/adaptive';
 import { SessionStore, SessionContextEntry, StoredSession } from './SessionStore';
+import { classifyIncomingMessage, classifyMessageRoute } from './messageRouting';
 import {
   ContextMetadataUpdate,
   buildContextEntry,
@@ -398,10 +402,20 @@ export class SessionController {
     quote?: string;
     images?: string[];
     pastes?: PastedContent[];
+    newTask?: boolean;
     createdAt: number;
   }> = [];
   private readonly runJournal: RunJournalStore;
   private currentRun: RunRecord | undefined;
+  private taskState: DurableTaskState = {
+    taskId: randomId('task'),
+    state: 'idle',
+    completedSteps: [],
+    nextSteps: [],
+    blockers: [],
+    lastHeartbeatAt: Date.now(),
+  };
+  private routeLog: TaskRouteEvent[] = [];
   private recoveryRun: RunRecord | undefined;
   private recoveryDrift = false;
   private stepHashChain: Promise<void> = Promise.resolve();
@@ -434,6 +448,8 @@ export class SessionController {
         return;
       }
       this.taskWatchdogTriggered = true;
+      this.taskState = { ...this.taskState, state: 'stalled', lastHeartbeatAt: Date.now(), blockers: ['No provider or tool activity within the recovery window.'] };
+      void this.persistNow();
       this.addNotice('Task stopped after prolonged inactivity. Completed work was preserved; you can ask a new question or continue.');
       this.abortController.abort();
       this.endTaskWatchdog();
@@ -441,6 +457,7 @@ export class SessionController {
   }
 
   private touchTaskWatchdog(): void {
+    this.taskState = { ...this.taskState, lastHeartbeatAt: Date.now(), blockers: [] };
     if (this.taskWatchdog) {
       this.taskWatchdogLastActivity = Date.now();
     }
@@ -546,6 +563,7 @@ export class SessionController {
       model: config.model,
       pasteFileLines: config.pasteFileLines,
       queued: this.queuedRecords(),
+      taskState: this.taskState,
       ...(recovery ? { recovery } : {}),
     };
   }
@@ -693,9 +711,19 @@ export class SessionController {
       .map((record) => ({
         id: record.id,
         text: record.text,
+        newTask: record.newTask,
         createdAt: typeof record.createdAt === 'number' ? record.createdAt : Date.now(),
       }));
     this.runningQueued = undefined;
+    this.taskState = stored.taskState ?? {
+      taskId: randomId('task'),
+      state: this.plan ? 'awaiting_approval' : 'idle',
+      completedSteps: [],
+      nextSteps: this.plan?.steps?.map((_, index) => index) ?? [],
+      blockers: [],
+      lastHeartbeatAt: Date.now(),
+    };
+    this.routeLog = Array.isArray(stored.routeLog) ? stored.routeLog.slice(-100) : [];
     this.currentRun = undefined;
     this.sessionPending = normalizeStoredPending(stored.pending);
     this.recoveredAnswers.clear();
@@ -740,6 +768,8 @@ export class SessionController {
       lastRequest: this.lastRequest,
       contextTokens: this.contextTokens,
       queued: this.queuedRecords(),
+      taskState: this.taskState,
+      routeLog: this.routeLog.slice(-100),
       ...(this.sessionPending ? { pending: this.sessionPending } : {}),
     };
   }
@@ -1598,7 +1628,14 @@ export class SessionController {
   }
 
   private takePendingUserMessage(): string | undefined {
-    const next = this.queuedMessages.shift();
+    const index = this.queuedMessages.findIndex((message) => !message.newTask);
+    if (index < 0) {
+      return undefined;
+    }
+    const [next] = this.queuedMessages.splice(index, 1);
+    if (!next) {
+      return undefined;
+    }
     if (!next) {
       return undefined;
     }
@@ -1796,6 +1833,12 @@ export class SessionController {
         : {}),
       ...(pending ? { pending } : {}),
       changedFiles,
+      taskState: {
+        state: this.taskState.state,
+        completedSteps: this.taskState.completedSteps,
+        nextSteps: this.taskState.nextSteps,
+        blockers: this.taskState.blockers,
+      },
       ...(this.diagnosticsSummary ? { diagnosticsSummary: this.diagnosticsSummary } : {}),
     };
   }
@@ -2204,9 +2247,62 @@ export class SessionController {
     const cappedImages = (images ?? []).slice(0, 4);
     const root = workspaceRoot();
     const materialized = await this.savePastesToFiles(text, pastes, root);
+    let route = classifyIncomingMessage(
+      materialized,
+      this.taskState,
+      this.phase === 'planning' || this.phase === 'executing',
+    );
+    let routeResponse: string | undefined;
+    const messageId = randomId('msg');
+    const stateBefore = this.taskState.state;
+    // Preflight every message before planner preparation. The model decides
+    // the semantic route; the local result is only a failure fallback.
+    const provider = await this.buildProvider();
+    if (provider) {
+      const config = getConfig();
+      const decision = await classifyMessageRoute(provider, config.model, materialized, this.taskState, this.plan);
+      if (decision) {
+        route = decision.route;
+        routeResponse = decision.response;
+      }
+    }
+    if (route === 'smalltalk' || route === 'acknowledgement') {
+      const message: UiMessage = {
+        id: messageId,
+        role: 'user',
+        text,
+        images: cappedImages,
+        ...(pastes?.length ? { pastes } : {}),
+      };
+      this.uiMessages.push(message);
+      this.post({ type: 'addMessage', message });
+      this.addAssistantMessage(routeResponse || (route === 'acknowledgement' ? 'Got it.' : 'How can I help?'));
+      this.recordRoute(messageId, route, stateBefore);
+      return;
+    }
+    if (route === 'cancel-plan' && this.plan?.status === 'draft') {
+      const message: UiMessage = { id: messageId, role: 'user', text, images: cappedImages, ...(pastes?.length ? { pastes } : {}) };
+      this.uiMessages.push(message);
+      this.post({ type: 'addMessage', message });
+      this.discardPlan();
+      this.addAssistantMessage('Draft plan discarded — nothing was changed.');
+      this.recordRoute(messageId, route, stateBefore);
+      return;
+    }
+    if (route === 'cancel-plan') {
+      route = 'continue-task';
+    }
+    if (route === 'answer' || route === 'refine-plan') {
+      // These are handled by the normal planner conversation when idle. While
+      // execution is active, preserve them as follow-ups for the next turn.
+      route = this.phase === 'planning' || this.phase === 'executing' ? 'follow-up' : route;
+    }
+    if (route === 'continue-task') {
+      route = this.phase === 'planning' || this.phase === 'executing' ? 'follow-up' : 'new-task';
+    }
     if (this.phase === 'planning' || this.phase === 'executing') {
       const queued: UiMessage = {
-        id: randomId('msg'),
+        id: messageId,
         role: 'user',
         text,
         queued: true,
@@ -2220,10 +2316,12 @@ export class SessionController {
         quote,
         images: cappedImages,
         pastes,
+        newTask: route === 'new-task',
         createdAt: Date.now(),
       });
       this.uiMessages.push(queued);
       this.post({ type: 'addMessage', message: queued });
+      this.recordRoute(messageId, route, stateBefore);
       this.persist();
       return;
     }
@@ -2262,7 +2360,17 @@ export class SessionController {
     // the transcript responds instantly; the stage line explains the wait.
     this.lastRequest = effective;
     const userMessage = this.addUserMessage(effective, attachment, quote, cappedImages);
+    this.taskState = {
+      taskId: randomId('task'),
+      state: 'planning',
+      taskSummary: effective,
+      completedSteps: [],
+      nextSteps: [],
+      blockers: [],
+      lastHeartbeatAt: Date.now(),
+    };
     this.setPhase('planning');
+    this.recordRoute(userMessage.id, route, stateBefore);
     this.beginTaskWatchdog();
     this.ensureStreamingMessage();
     this.setStage('PLANNING — preparing local model…');
@@ -2544,6 +2652,9 @@ export class SessionController {
     if (!next) {
       return;
     }
+    if (next.newTask && this.plan?.status === 'draft') {
+      this.discardPlan();
+    }
     this.runningQueued = { id: next.id, text: next.text, createdAt: next.createdAt };
     const uiMessage = this.uiMessages.find((message) => message.id === next.id);
     if (uiMessage) {
@@ -2755,6 +2866,12 @@ export class SessionController {
       contextProfile,
       profileReasoning: executorReasoningSupported,
       finishCheck: (summary) => this.checkRunFinish(summary),
+      taskState: {
+        state: this.taskState.state,
+        completedSteps: this.taskState.completedSteps,
+        nextSteps: this.taskState.nextSteps,
+        blockers: this.taskState.blockers,
+      },
     });
 
     await this.settleWarmup();
@@ -2880,6 +2997,9 @@ export class SessionController {
   }
 
   private invalidateDerivedCaches(): void {
+    // Model names and Ollama Modelfiles can keep the same identifier while
+    // changing capabilities. Force the next capability lookup to refresh.
+    resetOllamaCapabilityCache();
     this.rulesBaseCache = null;
     this.toolRegistryCache = null;
     this.plannerToolCache = null;
@@ -3577,6 +3697,29 @@ export class SessionController {
       ...(this.lastUserMessageId ? { requestId: this.lastUserMessageId } : {}),
       updatedAt: Date.now(),
     };
+    const state: TaskStateStatus = phase === 'planning'
+      ? 'planning'
+      : phase === 'executing'
+        ? 'executing'
+        : this.plan?.status === 'draft'
+          ? 'awaiting_approval'
+          : this.taskState.state === 'stalled'
+            ? 'stalled'
+            : this.taskState.state === 'completed'
+              ? 'completed'
+            : 'idle';
+    this.taskState = {
+      ...this.taskState,
+      state,
+      approvedPlan: this.plan
+        ? { version: this.plan.version, title: this.plan.title ?? 'Plan', steps: this.plan.steps ?? [] }
+        : this.taskState.approvedPlan,
+      completedSteps: this.currentRun?.completedSteps ?? this.taskState.completedSteps,
+      nextSteps: this.plan?.steps?.map((_, index) => index)
+        .filter((index) => !(this.currentRun?.completedSteps ?? []).includes(index))
+        ?? this.taskState.nextSteps,
+      lastHeartbeatAt: Date.now(),
+    };
     this.post({ type: 'phase', phase });
     this.phaseListener?.(phase);
   }
@@ -3733,7 +3876,15 @@ export class SessionController {
 
   private updateTodos(todos: TodoItem[]): void {
     const previous = this.todos;
-    this.todos = mergeTodoCheckpoints(previous, todos);
+    const completed = new Set(this.currentRun?.completedSteps ?? []);
+    const guarded = todos.map((todo) => {
+      const planIndex = this.plan?.steps?.findIndex((step) => step.trim() === todo.text.trim()) ?? -1;
+      if (planIndex >= 0 && completed.has(planIndex) && todo.status !== 'cancelled') {
+        return { ...todo, status: 'done' as const };
+      }
+      return todo;
+    });
+    this.todos = mergeTodoCheckpoints(previous, guarded);
     this.post({ type: 'todos', todos: this.todos });
     this.persist();
     this.recordRunProgress();
@@ -3794,6 +3945,14 @@ export class SessionController {
     if (plan === this.plan) {
       this.completedRunBoundary = true;
       plan.status = 'completed';
+      this.taskState = {
+        ...this.taskState,
+        state: 'completed',
+        completedSteps: this.currentRun?.completedSteps ?? this.taskState.completedSteps,
+        nextSteps: [],
+        blockers: [],
+        lastHeartbeatAt: Date.now(),
+      };
       this.post({ type: 'plan', plan });
       this.plan = null;
       this.post({ type: 'plan', plan: null });
@@ -4223,7 +4382,7 @@ export class SessionController {
       });
     }
     for (const message of this.queuedMessages) {
-      records.push({ id: message.id, text: message.text, status: 'queued', createdAt: message.createdAt });
+      records.push({ id: message.id, text: message.text, status: 'queued', newTask: message.newTask, createdAt: message.createdAt });
     }
     return records;
   }
@@ -4234,6 +4393,21 @@ export class SessionController {
       return;
     }
     await this.saveRun(run);
+  }
+
+  private recordRoute(messageId: string, route: TaskRouteEvent['route'], stateBefore: TaskStateStatus): void {
+    this.routeLog = [
+      ...this.routeLog,
+      {
+        messageId,
+        route,
+        stateBefore,
+        stateAfter: this.taskState.state,
+        completedStepsCount: this.taskState.completedSteps.length,
+        createdAt: Date.now(),
+      },
+    ].slice(-100);
+    void this.persistNow();
   }
 
   private refreshRunProcesses(): void {
@@ -4459,6 +4633,14 @@ export class SessionController {
       .map((todo, index) => (todo.status === 'done' ? index : -1))
       .filter((index) => index >= 0);
     run.completedSteps = [...new Set([...run.completedSteps, ...done])].sort((a, b) => a - b);
+    this.taskState = {
+      ...this.taskState,
+      taskId: this.taskState.taskId || run.id,
+      state: this.taskState.state,
+      completedSteps: run.completedSteps,
+      nextSteps: (this.plan?.steps ?? []).map((_, index) => index).filter((index) => !run.completedSteps.includes(index)),
+      lastHeartbeatAt: Date.now(),
+    };
     const active = this.todos.findIndex((todo) => todo.status === 'in_progress' || todo.status === 'pending');
     run.stepIndex = active >= 0 ? active : this.todos.length;
     run.updatedAt = Date.now();

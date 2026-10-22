@@ -146,6 +146,37 @@ export interface QueuedPromptRecord {
   id: string;
   text: string;
   status: 'queued' | 'running' | 'paused' | 'completed' | 'cancelled';
+  newTask?: boolean;
+  createdAt: number;
+}
+
+export type TaskStateStatus =
+  | 'idle'
+  | 'planning'
+  | 'awaiting_approval'
+  | 'executing'
+  | 'verifying'
+  | 'completed'
+  | 'failed'
+  | 'stalled';
+
+export interface DurableTaskState {
+  taskId: string;
+  state: TaskStateStatus;
+  taskSummary?: string;
+  approvedPlan?: { version: number; title: string; steps: string[] };
+  completedSteps: number[];
+  nextSteps: number[];
+  blockers: string[];
+  lastHeartbeatAt: number;
+}
+
+export interface TaskRouteEvent {
+  messageId: string;
+  route: 'smalltalk' | 'acknowledgement' | 'question' | 'answer' | 'refine-plan' | 'cancel-plan' | 'continue-task' | 'explanation' | 'steer' | 'follow-up' | 'new-task';
+  stateBefore: TaskStateStatus;
+  stateAfter: TaskStateStatus;
+  completedStepsCount: number;
   createdAt: number;
 }
 
@@ -366,6 +397,7 @@ export interface UiState {
   model: string;
   pasteFileLines: number;
   queued?: QueuedPromptRecord[];
+  taskState?: DurableTaskState;
   recovery?: { run?: RunRecord; runDrift?: boolean; processesAlive?: number[]; pending?: PendingDecisionRecord };
 }
 

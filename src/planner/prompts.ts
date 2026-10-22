@@ -151,6 +151,7 @@ export const COMPACTION_PROMPT = `You are compacting the conversation of a codin
 
 Include:
 - The original goal and the approved plan
+- The durable task state: task id, current state, completed steps, next steps, blockers, and last known heartbeat
 - What has been completed so far (files created/modified, exact paths)
 - One line per file created or modified with its exact path and current state
 - Key decisions made and why
@@ -222,7 +223,12 @@ export function buildPlannerContext(currentPlan: Plan | null): string | undefine
   return parts.join('\n\n');
 }
 
-export function buildExecutorSpec(request: string, plan: Plan, planFilePath?: string): string {
+export function buildExecutorSpec(
+  request: string,
+  plan: Plan,
+  planFilePath?: string,
+  taskState?: { state: string; completedSteps: number[]; nextSteps: number[]; blockers: string[] },
+): string {
   const skipped = new Set(plan.skippedSteps ?? []);
   const visibleSteps = plan.steps?.filter((_, index) => !skipped.has(index));
   const skippedSteps = plan.steps?.filter((_, index) => skipped.has(index)) ?? [];
@@ -233,6 +239,11 @@ export function buildExecutorSpec(request: string, plan: Plan, planFilePath?: st
   if (skippedSteps.length > 0) {
     parts.push(
       `Steps the developer intentionally excluded — do NOT do them:\n${skippedSteps.map((step) => `- ${step}`).join('\n')}`,
+    );
+  }
+  if (taskState) {
+    parts.push(
+      `Current durable task state: ${taskState.state}\nCompleted step indexes: ${taskState.completedSteps.join(', ') || 'none'}\nNext step indexes: ${taskState.nextSteps.join(', ') || 'none'}\n${taskState.blockers.length ? `Blockers: ${taskState.blockers.join('; ')}` : 'No blockers.'}\nDo not redo completed steps; move to the next required step.`,
     );
   }
   parts.push(`Original request: ${request}`);
