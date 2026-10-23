@@ -2246,6 +2246,13 @@ export class SessionController {
     }
     const cappedImages = (images ?? []).slice(0, 4);
     const root = workspaceRoot();
+    const attachment: MessageAttachment | undefined = selection
+      ? { path: selection.path, startLine: selection.startLine, endLine: selection.endLine }
+      : undefined;
+    // Render the submitted message before any paste materialization, provider
+    // startup, or routing request. This keeps the transcript responsive even
+    // when a local model is cold or the route probe is slow.
+    const submittedMessage = this.addUserMessage(text, attachment, quote, cappedImages);
     const materialized = await this.savePastesToFiles(text, pastes, root);
     let route = classifyIncomingMessage(
       materialized,
@@ -2253,7 +2260,7 @@ export class SessionController {
       this.phase === 'planning' || this.phase === 'executing',
     );
     let routeResponse: string | undefined;
-    const messageId = randomId('msg');
+    const messageId = submittedMessage.id;
     const stateBefore = this.taskState.state;
     // Preflight every message before planner preparation. The model decides
     // the semantic route; the local result is only a failure fallback.
@@ -2267,23 +2274,11 @@ export class SessionController {
       }
     }
     if (route === 'smalltalk' || route === 'acknowledgement') {
-      const message: UiMessage = {
-        id: messageId,
-        role: 'user',
-        text,
-        images: cappedImages,
-        ...(pastes?.length ? { pastes } : {}),
-      };
-      this.uiMessages.push(message);
-      this.post({ type: 'addMessage', message });
       this.addAssistantMessage(routeResponse || (route === 'acknowledgement' ? 'Got it.' : 'How can I help?'));
       this.recordRoute(messageId, route, stateBefore);
       return;
     }
     if (route === 'cancel-plan' && this.plan?.status === 'draft') {
-      const message: UiMessage = { id: messageId, role: 'user', text, images: cappedImages, ...(pastes?.length ? { pastes } : {}) };
-      this.uiMessages.push(message);
-      this.post({ type: 'addMessage', message });
       this.discardPlan();
       this.addAssistantMessage('Draft plan discarded — nothing was changed.');
       this.recordRoute(messageId, route, stateBefore);
@@ -2301,16 +2296,8 @@ export class SessionController {
       route = this.phase === 'planning' || this.phase === 'executing' ? 'follow-up' : 'new-task';
     }
     if (this.phase === 'planning' || this.phase === 'executing') {
-      const queued: UiMessage = {
-        id: messageId,
-        role: 'user',
-        text,
-        queued: true,
-        images: cappedImages,
-        ...(pastes?.length ? { pastes } : {}),
-      };
       this.queuedMessages.push({
-        id: queued.id,
+        id: submittedMessage.id,
         text: materialized,
         selection,
         quote,
@@ -2319,8 +2306,6 @@ export class SessionController {
         newTask: route === 'new-task',
         createdAt: Date.now(),
       });
-      this.uiMessages.push(queued);
-      this.post({ type: 'addMessage', message: queued });
       this.recordRoute(messageId, route, stateBefore);
       this.persist();
       return;
@@ -2346,10 +2331,6 @@ export class SessionController {
 
     const config = getConfig();
     const deferKnowledgeRefresh = Boolean((findPreset(config.preset) ?? PRESETS[0]).local);
-    const attachment: MessageAttachment | undefined = selection
-      ? { path: selection.path, startLine: selection.startLine, endLine: selection.endLine }
-      : undefined;
-
     if (this.plan && this.plan.status !== 'draft') {
       this.plan = null;
       this.post({ type: 'plan', plan: null });
@@ -2359,7 +2340,7 @@ export class SessionController {
     // Post the user message and the assistant bubble before any slow setup so
     // the transcript responds instantly; the stage line explains the wait.
     this.lastRequest = effective;
-    const userMessage = this.addUserMessage(effective, attachment, quote, cappedImages);
+    const userMessage = submittedMessage;
     this.taskState = {
       taskId: randomId('task'),
       state: 'planning',
