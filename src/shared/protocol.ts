@@ -173,7 +173,7 @@ export interface DurableTaskState {
 
 export interface TaskRouteEvent {
   messageId: string;
-  route: 'smalltalk' | 'acknowledgement' | 'question' | 'answer' | 'refine-plan' | 'cancel-plan' | 'continue-task' | 'explanation' | 'steer' | 'follow-up' | 'new-task';
+  route: 'smalltalk' | 'acknowledgement' | 'question' | 'answer' | 'refine-plan' | 'cancel-plan' | 'continue-task' | 'needs-clarification' | 'explanation' | 'steer' | 'follow-up' | 'new-task';
   stateBefore: TaskStateStatus;
   stateAfter: TaskStateStatus;
   completedStepsCount: number;

@@ -1,4 +1,4 @@
-import type { ChatMessage, LLMProvider } from '../llm/types';
+import type { ChatMessage, LLMProvider, ToolCall, ToolDef } from '../llm/types';
 import { chatWithRetry } from '../llm/retry';
 import { parseJsonLoose } from '../util/json';
 import type { DurableTaskState, Plan, TaskRouteEvent } from '../shared/protocol';
@@ -18,13 +18,30 @@ export function classifyIncomingMessage(
   return 'follow-up';
 }
 
-export type ModelMessageRoute = 'smalltalk' | 'acknowledgement' | 'question' | 'answer' | 'refine-plan' | 'cancel-plan' | 'continue-task' | 'new-task';
+export type ModelMessageRoute = 'smalltalk' | 'acknowledgement' | 'question' | 'answer' | 'refine-plan' | 'cancel-plan' | 'continue-task' | 'needs-clarification' | 'new-task';
 
 const ROUTES = new Set<ModelMessageRoute>([
-  'smalltalk', 'acknowledgement', 'question', 'answer', 'refine-plan', 'cancel-plan', 'continue-task', 'new-task',
+  'smalltalk', 'acknowledgement', 'question', 'answer', 'refine-plan', 'cancel-plan', 'continue-task', 'needs-clarification', 'new-task',
 ]);
 
-const ROUTER_PROMPT = `Classify the latest developer message for the current Dev-First task. Return JSON only: {"route":"...","response":"..."}. Allowed routes: smalltalk (greeting or casual conversation), acknowledgement (brief confirmation or thanks), question (asks about the codebase or a general explanation), answer (asks for an explanation while an existing task is active), refine-plan (changes the current draft plan), cancel-plan (discards the current draft), continue-task (steers or supplies information for the current task), new-task (unrelated request or a new change). Use the latest message and current plan/state; do not infer from single words alone. For smalltalk or acknowledgement, include a short natural response. For other routes, response may be empty.`;
+const ROUTER_PROMPT = `Classify the latest developer message for the current Dev-First task. Call classify_route exactly once. Do not answer the developer and do not emit prose. Use the message meaning and current task state, not single keyword matches. Routes: smalltalk (greeting/casual conversation), acknowledgement (brief confirmation/thanks), question (codebase or general explanation), answer (explanation while an existing task is active), refine-plan (changes the current draft plan), cancel-plan (discards the current draft), continue-task (steers the current task), needs-clarification (the request is genuinely ambiguous and needs one decision), new-task (unrelated change request).`;
+
+const ROUTE_TOOL: ToolDef = {
+  name: 'classify_route',
+  description: 'Return the single route for the latest developer message.',
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      route: {
+        type: 'string',
+        enum: ['smalltalk', 'acknowledgement', 'question', 'answer', 'refine-plan', 'cancel-plan', 'continue-task', 'needs-clarification', 'new-task'],
+      },
+      response: { type: 'string', description: 'Short reply only for smalltalk or acknowledgement; otherwise empty.' },
+    },
+    required: ['route'],
+  },
+};
 
 export interface ModelRouteDecision {
   route: ModelMessageRoute;
@@ -39,42 +56,59 @@ export async function classifyMessageRoute(
   plan: Plan | null | undefined,
   signal?: AbortSignal,
 ): Promise<ModelRouteDecision | undefined> {
-  const messages: ChatMessage[] = [
-    { role: 'system', content: ROUTER_PROMPT },
-    {
-      role: 'user',
-      content: JSON.stringify({
-        message: text,
-        taskState: {
-          state: state.state,
-          taskSummary: state.taskSummary,
-          completedSteps: state.completedSteps,
-          nextSteps: state.nextSteps,
-          blockers: state.blockers,
-        },
-        draftPlan: plan?.status === 'draft' ? {
-          title: plan.title,
-          steps: plan.steps,
-          expectedFiles: plan.expectedFiles?.map((file) => file.path),
-        } : undefined,
-      }),
+  const request = JSON.stringify({
+    message: text.slice(0, 2000),
+    taskState: {
+      state: state.state,
+      taskSummary: state.taskSummary?.slice(0, 500),
+      completedSteps: state.completedSteps.slice(-8),
+      nextSteps: state.nextSteps.slice(0, 8),
+      blockers: state.blockers.slice(-4),
     },
-  ];
-  let raw = '';
-  try {
-    for await (const event of chatWithRetry(provider, messages, {
-      model,
-      temperature: 0,
-      maxTokens: 32,
-      reasoning: { enabled: false },
-      signal,
-    }, { attempts: 1, retryOnEmpty: false })) {
-      if (event.type === 'text') raw += event.text;
+    draftPlan: plan?.status === 'draft' ? {
+      title: plan.title,
+      steps: plan.steps?.slice(0, 8),
+      expectedFiles: plan.expectedFiles?.slice(0, 12).map((file) => file.path),
+    } : undefined,
+  });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const messages: ChatMessage[] = [
+      { role: 'system', content: ROUTER_PROMPT },
+      { role: 'user', content: request },
+      ...(attempt > 0 ? [{ role: 'user' as const, content: 'The previous route result was invalid. Call classify_route with one allowed route now.' }] : []),
+    ];
+    let raw = '';
+    let decision: ModelRouteDecision | undefined;
+    try {
+      for await (const event of chatWithRetry(provider, messages, {
+        model,
+        tools: [ROUTE_TOOL],
+        temperature: 0,
+        maxTokens: 48,
+        reasoning: { enabled: false },
+        signal,
+      }, { attempts: 1, retryOnEmpty: false })) {
+        if (event.type === 'text') raw += event.text;
+        if (event.type === 'toolCall' && event.toolCall.name === ROUTE_TOOL.name) {
+          decision = parseRouteArguments(event.toolCall);
+        }
+      }
+    } catch {
+      continue;
     }
-  } catch {
-    return undefined;
+    if (!decision) {
+      const parsed = parseJsonLoose(raw) as { route?: unknown; response?: unknown } | undefined;
+      if (typeof parsed?.route === 'string' && ROUTES.has(parsed.route as ModelMessageRoute)) {
+        decision = { route: parsed.route as ModelMessageRoute, response: typeof parsed.response === 'string' ? parsed.response.trim() : undefined };
+      }
+    }
+    if (decision) return decision;
   }
-  const parsed = parseJsonLoose(raw) as { route?: unknown; response?: unknown } | undefined;
+  return undefined;
+}
+
+function parseRouteArguments(call: ToolCall): ModelRouteDecision | undefined {
+  const parsed = parseJsonLoose(call.arguments) as { route?: unknown; response?: unknown } | undefined;
   return typeof parsed?.route === 'string' && ROUTES.has(parsed.route as ModelMessageRoute)
     ? { route: parsed.route as ModelMessageRoute, response: typeof parsed.response === 'string' ? parsed.response.trim() : undefined }
     : undefined;
