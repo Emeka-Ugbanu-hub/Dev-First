@@ -2310,6 +2310,25 @@ body.vscode-light .hljs-meta {
 
 /* ---------- Thinking row ---------- */
 
+.phase-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 22px;
+  margin: 1px 0 8px;
+  border-left: 2px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+  padding-left: 9px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.phase-status-icon {
+  color: var(--vscode-focusBorder, #3794ff);
+  font-size: 12px;
+  animation: thinking-pulse 1.5s ease-in-out infinite;
+}
+
 .thinking-row {
   margin: 1px 0 8px;
   border-left: 2px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.25));

@@ -2253,6 +2253,10 @@ export class SessionController {
     // startup, or routing request. This keeps the transcript responsive even
     // when a local model is cold or the route probe is slow.
     const submittedMessage = this.addUserMessage(text, attachment, quote, cappedImages);
+    const ownsRouteStage = !this.streamingMessageId;
+    if (ownsRouteStage) {
+      this.setStage('Thinking…');
+    }
     const materialized = await this.savePastesToFiles(text, pastes, root);
     let route = classifyIncomingMessage(
       materialized,
@@ -2272,15 +2276,28 @@ export class SessionController {
         route = decision.route;
         routeResponse = decision.response;
       }
+    } else if (ownsRouteStage) {
+      this.endStreaming();
     }
     if (route === 'smalltalk' || route === 'acknowledgement') {
-      this.addAssistantMessage(routeResponse || (route === 'acknowledgement' ? 'Got it.' : 'How can I help?'));
+      const response = routeResponse || (route === 'acknowledgement' ? 'Got it.' : 'How can I help?');
+      if (ownsRouteStage) {
+        this.appendStreamingText(response);
+        this.endStreaming();
+      } else {
+        this.addAssistantMessage(response);
+      }
       this.recordRoute(messageId, route, stateBefore);
       return;
     }
     if (route === 'cancel-plan' && this.plan?.status === 'draft') {
       this.discardPlan();
-      this.addAssistantMessage('Draft plan discarded — nothing was changed.');
+      if (ownsRouteStage) {
+        this.appendStreamingText('Draft plan discarded — nothing was changed.');
+        this.endStreaming();
+      } else {
+        this.addAssistantMessage('Draft plan discarded — nothing was changed.');
+      }
       this.recordRoute(messageId, route, stateBefore);
       return;
     }

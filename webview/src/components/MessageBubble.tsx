@@ -138,7 +138,13 @@ function MessageBubbleComponent({
   return (
     <div className="message-row assistant">
       <div className="bubble assistant-bubble">
-        {(message.reasoning || message.streaming) && (
+        {message.stage && !message.reasoning && (
+          <div className="phase-status" role="status" aria-live="polite">
+            <span className="codicon codicon-lightbulb phase-status-icon" />
+            <span>{message.stage}</span>
+          </div>
+        )}
+        {message.reasoning && (
           <ThinkingRow
             text={message.reasoning ?? ''}
             streaming={Boolean(message.streaming)}
