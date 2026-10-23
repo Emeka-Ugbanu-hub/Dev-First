@@ -619,7 +619,17 @@ export function activate(context: vscode.ExtensionContext): void {
           }
           return { enabled: true, effort: effort as 'low' | 'medium' | 'high' };
         },
-        getTools: () => session.plannerToolDefs(),
+        getTools: async () => {
+          const allowed = new Set([
+            'read_file',
+            'list_files',
+            'search_text',
+            'find_symbol',
+            'document_symbols',
+            'go_to_definition',
+          ]);
+          return (await session.plannerToolDefs()).filter((tool) => allowed.has(tool.name));
+        },
         executeTool:
           executeTool ?? (() => Promise.resolve('Error: read-only tools are unavailable.')),
       });

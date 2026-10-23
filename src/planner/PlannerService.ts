@@ -63,6 +63,8 @@ export interface PlannerOptions {
   reasoningSwitch?: boolean;
   contextLimitTokens?: number;
   workspaceRoot?: string;
+  /** Keep question/answer turns in read-and-respond mode. */
+  questionMode?: boolean;
 }
 
 export class PlannerService {
@@ -80,8 +82,12 @@ export class PlannerService {
     signal: AbortSignal,
   ): Promise<PlannerResult> {
     const context = buildPlannerContext(currentPlan);
-    const turnTools = plannerToolSet(this.options.tools, { reasoningSwitch: this.options.reasoningSwitch });
-    const systemPrompt = [buildPlannerSystemPrompt(this.options.rules, this.options.family), context]
+    const turnTools = plannerToolSet(this.options.tools, { reasoningSwitch: this.options.reasoningSwitch })
+      .filter((tool) => !this.options.questionMode || (tool.name !== 'submit_plan' && tool.name !== 'dismiss_plan'));
+    const questionGuard = this.options.questionMode
+      ? 'QUESTION MODE: answer the latest question in chat. You may use read-only tools to gather evidence, but never call submit_plan or dismiss_plan, never propose an execution plan, and never change files.'
+      : undefined;
+    const systemPrompt = [buildPlannerSystemPrompt(this.options.rules, this.options.family), context, questionGuard]
       .filter(Boolean)
       .join('\n\n');
     const messages: ChatMessage[] = [
@@ -145,6 +151,13 @@ export class PlannerService {
         const definition = available.find((tool) => tool.name === call.name) ?? submitPlanTool;
         return { ...call, arguments: normalizeToolArguments(call.arguments, definition.parameters) };
       });
+      if (this.options.questionMode && normalizedCalls.some((call) => call.name === 'submit_plan' || call.name === 'dismiss_plan')) {
+        messages.push({
+          role: 'user',
+          content: 'QUESTION MODE: do not create or discard a plan. Answer the question in text, using read-only evidence if needed.',
+        });
+        continue;
+      }
       messages.push({
         role: 'assistant',
         content: text,

@@ -19,6 +19,7 @@ import {
 } from './mapStore';
 import { generateArchitectureMap } from './mapGenerate';
 import { buildStructuralMap } from './structuralMap';
+import { summarizeFiles, summarizeModules } from './fileSummaries';
 
 export interface ArchitecturePanelDeps {
   extensionUri: vscode.Uri;
@@ -56,6 +57,71 @@ function relativeFile(root: string, value: string): string {
     : value.replace(/\\/g, '/').replace(/^\.\//, '');
 }
 
+function architectureDomain(file: string, fact?: FileFacts): string {
+  const parts = file.replace(/\\/g, '/').split('/').filter(Boolean);
+  const ignored = new Set(['src', 'app', 'lib', 'packages']);
+  const lowerFile = file.toLowerCase();
+  if (fact?.sql.length || /(^|\/)(db|database|prisma|migrations?|repositories?)(\/|$)/.test(lowerFile)) return 'Database';
+  if (fact?.handlers.length || fact?.httpClients.length || /(^|\/)(api|server|routes?|controllers?|services?|middleware)(\/|$)/.test(lowerFile)) return 'Backend';
+  if (/(^|\/)(functions?|lambda|workers?|jobs?|queues?)(\/|$)/.test(lowerFile)) return 'Functions';
+  if (/(^|\/)(cloud|infra|infrastructure|deploy|terraform|\.github)(\/|$)/.test(lowerFile)) return 'Cloud';
+  if (/\.(jsx?|tsx?|vue|svelte|astro|css|scss)$/.test(lowerFile) && /\.(tsx?|jsx?)$/.test(lowerFile)) return 'Frontend';
+  const segment = parts.slice(0, -1).find((part) => !ignored.has(part.toLowerCase())) ?? 'Core';
+  const value = segment.toLowerCase();
+  if (/^(front|client|component|page|screen|view|ui)/.test(value)) return 'Frontend';
+  if (/^(back|server|api|route|controller|service|middleware)/.test(value)) return 'Backend';
+  if (/^(db|database|data|prisma|sql|migration|repository|repo)/.test(value)) return 'Database';
+  if (/^(cloud|infra|infrastructure|deploy|terraform|aws|azure|gcp)/.test(value)) return 'Cloud';
+  if (/^(function|functions|lambda|worker|jobs|queue)/.test(value)) return 'Functions';
+  return segment;
+}
+
+function mergeArchitectureMaps(
+  base: StoredArchitectureMap,
+  detail: import('./mapValidate').StructuredMap,
+  domain: string,
+  root: string,
+  model: string,
+): StoredArchitectureMap {
+  const prefix = domain.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  const existing = new Set(base.structured.nodes.map((node) => node.id));
+  const idMap = new Map<string, string>();
+  const nodes = detail.nodes.map((node) => {
+    if (node.id === 'project' || node.id === 'root') {
+      return undefined;
+    }
+    let id = `${prefix}_${node.id}`;
+    while (existing.has(id)) id = `${id}_`;
+    existing.add(id);
+    idMap.set(node.id, id);
+    return {
+      ...node,
+      id,
+      group: node.group ? `${domain}/${node.group}` : domain,
+    };
+  }).filter((node): node is NonNullable<typeof node> => Boolean(node));
+  const edges = detail.edges.flatMap((edge) => {
+    const from = idMap.get(edge.from);
+    const to = idMap.get(edge.to);
+    if (!from || !to || from === to) return [];
+    return [{ ...edge, from, to }];
+  });
+  const structured = {
+    nodes: [...base.structured.nodes, ...nodes],
+    edges: [...base.structured.edges, ...edges],
+  };
+  const filesHash = base.filesHash;
+  return {
+    ...base,
+    model,
+    generatedAt: Date.now(),
+    filesHash,
+    mermaid: buildMermaidMap(structured),
+    paths: mapPathsOf(structured, (relative) => existsSync(path.join(root, relative))),
+    structured,
+  };
+}
+
 export const EMPTY_NO_MODEL = 'no-model';
 export const EMPTY_NO_FACTS = 'no-facts';
 export const EMPTY_NOT_DRAWN = 'not-drawn';
@@ -71,6 +137,10 @@ export class ArchitecturePanel {
   private groupIndex = new Map<string, string[]>();
   private currentStale = false;
   private disposed = false;
+  private latestFacts: FileFacts[] = [];
+  private latestActive: { provider: LLMProvider; model: string } | undefined;
+  private latestTools: ToolDef[] = [];
+  private readonly generatedScopes = new Set<string>();
   private readonly projectName: string;
 
   private constructor(
@@ -159,6 +229,9 @@ export class ArchitecturePanel {
       if (target && this.stored) {
         this.levelPath = target;
         this.postMap(this.stored, this.currentStale);
+        if (target.length > 1 && !this.generatedScopes.has(target.join('/'))) {
+          void this.generateLazyScope(target);
+        }
       }
       return;
     }
@@ -221,6 +294,7 @@ export class ArchitecturePanel {
     const controller = new AbortController();
     this.controller = controller;
     const hasMap = Boolean(this.stored);
+    this.latestActive = active;
     this.post({
       type: 'generating',
       progress: 'Reading files…',
@@ -270,6 +344,8 @@ export class ArchitecturePanel {
       // keeps architecture useful when a local model is slow, unavailable, or
       // returns malformed JSON.
       const structural = buildStructuralMap(facts, this.deps.root, this.projectName);
+      this.latestFacts = facts;
+      this.latestTools = tools;
       const baselineCoverage: ArchitectureMapCoverage = {
         ...scanCoverage,
         indexedFiles: facts.length,
@@ -293,13 +369,13 @@ export class ArchitecturePanel {
       try {
         await writeStoredMap(this.deps.state, baseline);
       } catch {}
-      this.postMap(baseline, false);
       this.post({
         type: 'generating',
-        progress: 'Enriching the verified map…',
+        progress: 'Generating the AI overview…',
         hasMap: true,
         project: this.projectName,
       });
+      this.postMap(baseline, false);
       const raw = await generateArchitectureMap(digest, {
         provider: active.provider,
         model: active.model,
@@ -333,7 +409,7 @@ export class ArchitecturePanel {
       }
       this.lastRaw = raw;
       const parsed = parseStructuredMap(raw);
-      if (!parsed) {
+      if (!parsed || parsed.nodes.length < 2) {
         this.post({
           type: 'generating',
           progress: 'Model returned an unusable structure; keeping the verified map.',
@@ -404,12 +480,129 @@ export class ArchitecturePanel {
       }
       this.levelPath = [];
       this.postMap(map, false);
+      await this.generateArchitectureDomains(map, facts, active, tools, controller);
     } finally {
       this.generating = false;
       if (this.controller === controller) {
         this.controller = undefined;
       }
     }
+  }
+
+  private async generateArchitectureDomains(
+    overview: StoredArchitectureMap,
+    facts: FileFacts[],
+    active: { provider: LLMProvider; model: string },
+    tools: ToolDef[],
+    controller: AbortController,
+  ): Promise<void> {
+    const domains = [...new Set(facts
+      .map((fact) => architectureDomain(relativeFile(this.deps.root, fact.file), fact))
+      .filter((domain) => domain !== 'root'))];
+    for (let index = 0; index < domains.length; index++) {
+      if (this.disposed || controller.signal.aborted) return;
+      const domain = domains[index];
+      const domainFacts = facts.filter((fact) => architectureDomain(relativeFile(this.deps.root, fact.file), fact) === domain);
+      if (domainFacts.length === 0) continue;
+      this.post({
+        type: 'generating',
+        progress: `Generating ${domain} (${index + 1}/${domains.length})…`,
+        hasMap: true,
+        project: this.projectName,
+      });
+      const summaries = await summarizeFiles(
+        active.provider,
+        active.model,
+        this.deps.state,
+        domainFacts.map((fact) => ({ path: relativeFile(this.deps.root, fact.file), fact })),
+        controller.signal,
+        (file) => this.post({ type: 'generating', progress: `${domain}: summarizing ${file}`, hasMap: true, project: this.projectName }),
+        path.resolve(this.deps.root),
+      );
+      const moduleGroups = new Map<string, Array<{ path: string; summary: string }>>();
+      for (const fact of domainFacts) {
+        const file = relativeFile(this.deps.root, fact.file);
+        const parts = file.split('/').filter(Boolean);
+        const module = parts.length > 1 ? parts.slice(0, -1).join('/') : domain;
+        const list = moduleGroups.get(module) ?? [];
+        list.push({ path: file, summary: summaries[file] ?? 'No cached summary available.' });
+        moduleGroups.set(module, list);
+      }
+      const moduleSummaries = await summarizeModules(
+        active.provider,
+        active.model,
+        this.deps.state,
+        [...moduleGroups.entries()].map(([key, files]) => ({ key, files })),
+        controller.signal,
+        (module) => this.post({ type: 'generating', progress: `${domain}: reducing ${module}`, hasMap: true, project: this.projectName }),
+        path.resolve(this.deps.root),
+      );
+      const domainRaw = await generateArchitectureMap(buildMapDigest(domainFacts, this.deps.root, summaries, moduleSummaries), {
+        provider: active.provider,
+        model: active.model,
+        reasoning: await this.deps.getReasoning?.(),
+        tools,
+        executeTool: this.deps.executeTool,
+        signal: controller.signal,
+        maxSteps: 12,
+        onProgress: (text, done) => {
+          if (!done && !this.disposed && !controller.signal.aborted) {
+            this.post({ type: 'generating', progress: `${domain}: ${text}`, hasMap: true, project: this.projectName });
+          }
+        },
+      });
+      if (!domainRaw || this.disposed || controller.signal.aborted) continue;
+      const parsed = parseStructuredMap(domainRaw);
+      if (!parsed || parsed.nodes.length < 2) continue;
+      const merged = mergeArchitectureMaps(this.stored ?? overview, parsed, domain, this.deps.root, active.model);
+      this.stored = merged;
+      try {
+        await writeStoredMap(this.deps.state, merged);
+      } catch {}
+      this.postMap(merged, false);
+      this.post({ type: 'generating', progress: `${domain} ready`, hasMap: true, project: this.projectName });
+    }
+  }
+
+  private async generateLazyScope(scope: string[]): Promise<void> {
+    const active = this.latestActive;
+    const facts = this.latestFacts;
+    if (!active || facts.length === 0 || this.disposed || !this.stored) return;
+    const key = scope.join('/');
+    this.generatedScopes.add(key);
+    const domain = scope[0];
+    const scopedFacts = facts.filter((fact) => {
+      const file = relativeFile(this.deps.root, fact.file);
+      const parts = file.split('/').filter(Boolean);
+      return architectureDomain(file, fact) === domain && parts.includes(scope[scope.length - 1]);
+    });
+    if (scopedFacts.length === 0) return;
+    const controller = new AbortController();
+    this.post({ type: 'generating', progress: `Loading ${key}…`, hasMap: true, project: this.projectName });
+    const raw = await generateArchitectureMap(buildMapDigest(scopedFacts, this.deps.root), {
+      provider: active.provider,
+      model: active.model,
+      reasoning: await this.deps.getReasoning?.(),
+      tools: this.latestTools,
+      executeTool: this.deps.executeTool,
+      signal: controller.signal,
+      maxSteps: 12,
+      onProgress: (text, done) => {
+        if (!done && !this.disposed) {
+          this.post({ type: 'generating', progress: `${key}: ${text}`, hasMap: true, project: this.projectName });
+        }
+      },
+    });
+    if (!raw || this.disposed || !this.stored) return;
+    const parsed = parseStructuredMap(raw);
+    if (!parsed || parsed.nodes.length < 2) return;
+    const merged = mergeArchitectureMaps(this.stored, parsed, domain, this.deps.root, active.model);
+    this.stored = merged;
+    try {
+      await writeStoredMap(this.deps.state, merged);
+    } catch {}
+    this.postMap(merged, false);
+    this.post({ type: 'generating', progress: `${key} ready`, hasMap: true, project: this.projectName });
   }
 
   private async getActive(): Promise<{ provider: LLMProvider; model: string } | undefined> {

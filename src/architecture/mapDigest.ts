@@ -192,7 +192,12 @@ function truncateDigest(value: string): string {
   return (lastNewline > 0 ? clipped.slice(0, lastNewline) : clipped).replace(/\s+$/, '');
 }
 
-export function buildMapDigest(facts: FileFacts[], root: string): string {
+export function buildMapDigest(
+  facts: FileFacts[],
+  root: string,
+  summaries: Record<string, string> = {},
+  moduleSummaries: Record<string, string> = {},
+): string {
   const sections: string[] = [];
   const workspace = baseName(decodePath(root)) || 'workspace';
   sections.push(`Workspace: ${workspace}\nIndexed files: ${facts.length}`);
@@ -208,5 +213,17 @@ export function buildMapDigest(facts: FileFacts[], root: string): string {
   }
 
   sections.push(`Signals:\n${signalLines(facts, root).join('\n')}`);
+  const summaryLines = Object.entries(summaries)
+    .filter(([, summary]) => summary.trim())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([file, summary]) => `- ${file}: ${summary}`);
+  if (summaryLines.length > 0) {
+    sections.push(`Verified file summaries:\n${summaryLines.join('\n')}`);
+  }
+  const moduleLines = Object.entries(moduleSummaries)
+    .map(([module, summary]) => `- ${module}: ${summary}`);
+  if (moduleLines.length > 0) {
+    sections.push(`Verified module summaries:\n${moduleLines.join('\n')}`);
+  }
   return truncateDigest(sections.join('\n\n'));
 }

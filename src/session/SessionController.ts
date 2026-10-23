@@ -2347,6 +2347,7 @@ export class SessionController {
     }
 
     const config = getConfig();
+    const questionMode = route === 'question' || route === 'answer';
     const deferKnowledgeRefresh = Boolean((findPreset(config.preset) ?? PRESETS[0]).local);
     if (this.plan && this.plan.status !== 'draft') {
       this.plan = null;
@@ -2434,6 +2435,7 @@ export class SessionController {
         reasoningSwitch: this.reasoningSwitchEnabled(),
         contextLimitTokens: this.effectiveContextLimit(),
         workspaceRoot: root,
+        questionMode,
       });
       this.abortController = new AbortController();
       const warmupPromise = this.settleWarmup();

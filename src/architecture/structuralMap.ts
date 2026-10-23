@@ -9,10 +9,21 @@ export interface StructuralMapResult {
 }
 
 function relativeFile(root: string, file: string): string {
-  const relative = path.relative(path.resolve(root), path.resolve(file));
+  let candidate = file.trim();
+  if (/^file:/i.test(candidate)) {
+    try {
+      candidate = decodeURIComponent(new URL(candidate).pathname);
+    } catch {
+      candidate = candidate.replace(/^file:\/\//i, '');
+    }
+  }
+  if (/^\/[A-Za-z]:\//.test(candidate)) {
+    candidate = candidate.slice(1);
+  }
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return (relative && !relative.startsWith('..') && !path.isAbsolute(relative)
     ? relative
-    : file).replace(/\\/g, '/').replace(/^\.\//, '');
+    : candidate).replace(/\\/g, '/').replace(/^\.\//, '');
 }
 
 function nodeId(value: string): string {
