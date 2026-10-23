@@ -18,6 +18,7 @@ import {
   ArchitectureMapCoverage,
 } from './mapStore';
 import { generateArchitectureMap } from './mapGenerate';
+import { buildStructuralMap } from './structuralMap';
 
 export interface ArchitecturePanelDeps {
   extensionUri: vscode.Uri;
@@ -265,6 +266,40 @@ export class ArchitecturePanel {
         hasMap,
         project: this.projectName,
       });
+      // Publish a verified scanner-based map before model enrichment. This
+      // keeps architecture useful when a local model is slow, unavailable, or
+      // returns malformed JSON.
+      const structural = buildStructuralMap(facts, this.deps.root, this.projectName);
+      const baselineCoverage: ArchitectureMapCoverage = {
+        ...scanCoverage,
+        indexedFiles: facts.length,
+        representedFiles: structural.representedFiles,
+        unresolvedRelationships: structural.unresolvedRelationships,
+      };
+      const baseline: StoredArchitectureMap = {
+        version: 3,
+        workspaceRoot: path.resolve(this.deps.root),
+        filesHash: architectureFilesHash(facts.map((fact) => fact.file)),
+        mermaid: buildMermaidMap(structural.map),
+        paths: mapPathsOf(structural.map, (relative) => existsSync(path.join(this.deps.root, relative))),
+        structured: structural.map,
+        model: active.model,
+        generatedAt: Date.now(),
+        coverage: baselineCoverage,
+      };
+      this.stored = baseline;
+      this.currentStale = false;
+      this.levelPath = [];
+      try {
+        await writeStoredMap(this.deps.state, baseline);
+      } catch {}
+      this.postMap(baseline, false);
+      this.post({
+        type: 'generating',
+        progress: 'Enriching the verified map…',
+        hasMap: true,
+        project: this.projectName,
+      });
       const raw = await generateArchitectureMap(digest, {
         provider: active.provider,
         model: active.model,
@@ -288,20 +323,24 @@ export class ArchitecturePanel {
       }
       if (!raw) {
         this.post({
-          type: 'error',
-          message: 'The architecture map could not be generated. Try again.',
-          hasMap: Boolean(this.stored),
+          type: 'generating',
+          progress: 'Model enrichment unavailable; keeping the verified map.',
+          hasMap: true,
+          project: this.projectName,
         });
+        this.postMap(baseline, false);
         return;
       }
       this.lastRaw = raw;
       const parsed = parseStructuredMap(raw);
       if (!parsed) {
         this.post({
-          type: 'error',
-          message: 'The model did not return a usable structure. Try again.',
-          hasMap: Boolean(this.stored),
+          type: 'generating',
+          progress: 'Model returned an unusable structure; keeping the verified map.',
+          hasMap: true,
+          project: this.projectName,
         });
+        this.postMap(baseline, false);
         return;
       }
       const indexedFiles = new Set(facts.map((fact) => relativeFile(this.deps.root, fact.file)));
