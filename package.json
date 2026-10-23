@@ -2,7 +2,7 @@
   "name": "dev-first",
   "displayName": "Dev-First",
   "description": "Plan-first AI coding agent — every request becomes a plan you approve before a single line changes.",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "publisher": "dev-first",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "media/icon.png",
