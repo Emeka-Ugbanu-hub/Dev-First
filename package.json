@@ -516,6 +516,16 @@
           "default": "off",
           "markdownDescription": "Legacy fallback for model reasoning. Use the composer reasoning control to choose a value supported by the selected model."
         },
+        "devFirst.plannerThinking": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "off",
+            "on"
+          ],
+          "default": "auto",
+          "markdownDescription": "Internal composer reasoning mode. Use the composer control rather than this setting."
+        },
         "devFirst.parallelTools": {
           "type": "boolean",
           "default": true,
