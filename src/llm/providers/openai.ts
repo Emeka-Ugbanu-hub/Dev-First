@@ -27,7 +27,7 @@ export class OpenAIProvider implements LLMProvider {
   constructor(private readonly config: OpenAIProviderConfig) {}
 
   async *chat(messages: ChatMessage[], options: ChatOptions): AsyncIterable<StreamEvent> {
-    if (this.config.ollama && options.reasoning && !this.config.ollamaReasoningViaV1) {
+    if (this.config.ollama && !this.config.ollamaReasoningViaV1) {
       yield* this.chatOllama(messages, options);
       return;
     }
@@ -211,7 +211,6 @@ export class OpenAIProvider implements LLMProvider {
 
   private async *chatOllama(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamEvent> {
     const reasoning = options.reasoning;
-    if (!reasoning) return;
     const baseUrl = this.config.baseUrl.replace(/\/v1\/?$/i, '');
     const body: Record<string, unknown> = {
       model: options.model,
@@ -225,9 +224,11 @@ export class OpenAIProvider implements LLMProvider {
       // messages. Ollama still re-evaluates the prompt, but avoids a cold
       // model reload on every request.
       keep_alive: '10m',
-      think: reasoning.enabled
-        ? reasoning.effort === 'off' ? false : reasoning.effort === 'on' ? true : reasoning.effort ?? true
-        : false,
+      ...(reasoning ? {
+        think: reasoning.enabled
+          ? reasoning.effort === 'off' ? false : reasoning.effort === 'on' ? true : reasoning.effort ?? true
+          : false,
+      } : {}),
     };
     if (options.tools?.length) {
       body.tools = options.tools.map((tool) => ({
