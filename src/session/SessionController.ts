@@ -70,6 +70,7 @@ import {
   toolContextMetadata,
 } from './contextIndex';
 import { RunJournalStore } from './RunJournalStore';
+import { EventLedger } from './EventLedger';
 import {
   FILE_EDIT_TOOLS,
   absoluteWorkspacePath,
@@ -107,6 +108,7 @@ import { usageTotal } from '../llm/usage';
 import { DevFirstConfig, deleteApiKey, getApiKeyForPreset, getConfig, saveApiKey, workspaceRoot } from '../config';
 import { createProvider } from '../llm';
 import { activeProvider, roleProvider } from '../llm/activeProvider';
+import type { ActiveProvider, ModelRole } from '../llm/activeProvider';
 import { PRESETS, ProviderPreset, connectionNotice, effectiveBaseUrl, findPreset } from '../llm/presets';
 import { ConnectionsStore, StoredConnection, connectionQualifies } from './connections';
 import { formatSelectionAttachment } from '../util/selection';
@@ -137,6 +139,7 @@ import { reliabilityStateForPlan, reliabilityVerification } from '../agent/relia
 import { ApprovalMemory, ExternalDirectoryConsent } from '../agent/approvals';
 import { runSubagent } from '../agent/subagent';
 import { SemanticIndex } from '../indexing/SemanticIndex';
+import { CodebaseIndex } from '../indexing/CodebaseIndex';
 import { LocalEmbedder } from '../indexing/LocalEmbedder';
 import { McpManager } from '../mcp/McpManager';
 import { BrowserSession } from '../browser/BrowserSession';
@@ -146,6 +149,7 @@ import { sha1Of, writeFileAtomic } from '../util/atomicWrite';
 import { architectureFilesHash } from '../architecture/mapStore';
 import { selectPlannerConversation, composePlannerRequest, relevanceBudget } from '../planner/relevance';
 import type { PinnedPlannerContext } from '../planner/relevance';
+import { buildTaskEvidencePack } from '../planner/taskEvidence';
 import { chatWithRetry } from '../llm/retry';
 import { summarizeWithWorker } from '../agent/contextShunt';
 import type { ContextShuntInput } from '../agent/contextShunt';
@@ -346,6 +350,7 @@ export class SessionController {
   private lastUserMessageId: string | undefined;
   private abortController: AbortController | null = null;
   private reasoningOverride: string | undefined;
+  private activeReasoningModel: { presetId: string; model: string } | undefined;
   private reasoningChanges = 0;
   private streamingMessageId: string | null = null;
   private activeStatusId: string | undefined;
@@ -357,6 +362,7 @@ export class SessionController {
   private readonly checkpoints: CheckpointManager;
   private readonly fileSnapshots: FileSnapshotStore;
   private semanticIndex: SemanticIndex | undefined;
+  private readonly codebaseIndex: CodebaseIndex;
   private localEmbedder: LocalEmbedder | undefined;
   private browser: BrowserSession | undefined;
   private selection: SelectionContext | null = null;
@@ -367,6 +373,9 @@ export class SessionController {
   private lastExactUsage: UsageTotals | undefined;
   private compressionBlocks: CompressionBlock[] = [];
   private plannerConversationCache: { fingerprint: string; messages: ChatMessage[] } | null = null;
+  private backgroundCompaction: { fingerprint: string; summary: string } | null = null;
+  private backgroundCompactionInFlight = false;
+  private backgroundCompactionTimer: NodeJS.Timeout | undefined;
   private readonly contextShuntCache = new Map<string, string>();
   private compressionsThisTurn = 0;
   private lastCheckpointId: string | undefined;
@@ -406,6 +415,7 @@ export class SessionController {
     createdAt: number;
   }> = [];
   private readonly runJournal: RunJournalStore;
+  private readonly eventLedger: EventLedger;
   private currentRun: RunRecord | undefined;
   private taskState: DurableTaskState = {
     taskId: randomId('task'),
@@ -426,6 +436,8 @@ export class SessionController {
   private rulesBaseCache: { projectRules: string | undefined; memory: string } | null = null;
   private toolRegistryCache: { planner: ToolDef[]; executor: ToolDef[] } | null = null;
   private plannerToolCache: ToolDef[] | null = null;
+  private questionToolCache: ToolDef[] | null = null;
+  private preparedProvider: { key: string; provider: LLMProvider } | undefined;
   private lastWarmupAt = 0;
   private warmupInFlight = false;
   private warmupPromise: Promise<void> | null = null;
@@ -480,6 +492,15 @@ export class SessionController {
       path.join(context.globalStorageUri.fsPath, 'checkpoints'),
     );
     this.fileSnapshots = new FileSnapshotStore(path.join(context.globalStorageUri.fsPath, 'file-snapshots'));
+    this.codebaseIndex = new CodebaseIndex({
+      root: workspaceRoot() ?? process.cwd(),
+      storageFile: path.join(context.globalStorageUri.fsPath, 'codebase-index.json'),
+      onProgress: (message) => {
+        // Background indexing must never create an empty assistant row. Only
+        // surface progress when a request is already displaying a stage.
+        if (this.streamingMessageId && this.phase !== 'idle') this.setStage(message);
+      },
+    });
     this.registry = new ModelRegistry(path.join(context.globalStorageUri.fsPath, 'models-cache.json'));
     this.connections = new ConnectionsStore(context.globalState);
     this.memory = new MemoryStore(workspaceRoot() ?? process.cwd(), context.globalStorageUri.fsPath);
@@ -487,7 +508,9 @@ export class SessionController {
     this.background.onChange(() => this.refreshRunProcesses());
     this.store = new SessionStore(path.join(context.globalStorageUri.fsPath, 'sessions'));
     this.runJournal = new RunJournalStore(path.join(context.globalStorageUri.fsPath, 'runs'));
+    this.eventLedger = new EventLedger(path.join(context.globalStorageUri.fsPath, 'event-ledger'), this.sessionId);
     void this.initializeSession();
+    this.codebaseIndex.startBackgroundRefresh();
     void this.cleanupPasteFiles();
     this.disposables.push(diffManager.onDidChangePendingChanges(() => this.pushChanges()));
     if (typeof diffManager.onDidChangeHistory === 'function') {
@@ -504,6 +527,12 @@ export class SessionController {
     }
     if (typeof vscode.workspace.createFileSystemWatcher === 'function') {
       try {
+        const codebaseWatcher = vscode.workspace.createFileSystemWatcher('**/*');
+        const invalidateCodebase = (uri: vscode.Uri) => this.codebaseIndex.invalidate(uri.fsPath);
+        codebaseWatcher.onDidChange(invalidateCodebase);
+        codebaseWatcher.onDidCreate(invalidateCodebase);
+        codebaseWatcher.onDidDelete(invalidateCodebase);
+        this.disposables.push(codebaseWatcher);
         for (const pattern of ['**/AGENTS.md', '**/.dev-first/**']) {
           const watcher = vscode.workspace.createFileSystemWatcher(pattern);
           const invalidate = () => this.invalidateDerivedCaches();
@@ -604,6 +633,7 @@ export class SessionController {
       const stored = await this.store.load(target.id);
       if (stored) {
         this.applySession(stored);
+        await this.eventLedger.hydrate();
         await this.restoreSessionContext();
         await this.recoverRuns();
         await this.cleanupStaleConnectionNotice();
@@ -653,6 +683,7 @@ export class SessionController {
 
   private applySession(stored: StoredSession): void {
     this.sessionId = stored.id;
+    this.eventLedger.setSession(this.sessionId);
     this.sessionTitle = stored.title;
     this.sessionCreatedAt = stored.createdAt;
     this.uiMessages = (Array.isArray(stored.messages) ? stored.messages : [])
@@ -833,6 +864,7 @@ export class SessionController {
 
   private resetSessionState(): void {
     this.sessionId = newSessionId();
+    this.eventLedger.setSession(this.sessionId);
     this.sessionTitle = 'New session';
     this.sessionCreatedAt = Date.now();
     this.uiMessages = [];
@@ -1739,7 +1771,7 @@ export class SessionController {
     );
   }
 
-  private async preparePlannerConversation(provider: LLMProvider): Promise<ChatMessage[]> {
+  private async preparePlannerConversation(provider: LLMProvider, model = getConfig().model): Promise<ChatMessage[]> {
     const pendingDecisionIds = this.sessionPending ? [this.sessionPending.id] : this.currentRun?.pending ? [this.currentRun.pending.id] : [];
     const fingerprint = sha1Of(JSON.stringify({
       conversation: this.conversation,
@@ -1754,6 +1786,7 @@ export class SessionController {
       contextLimit: this.effectiveContextLimit(),
       diagnosticsSummary: this.diagnosticsSummary,
       changedFiles: this.currentRun?.changedFiles,
+      evidence: buildTaskEvidencePack(this.context.globalState, this.lastRequest ?? '', 3600, workspaceRoot()),
     }));
     if (this.plannerConversationCache?.fingerprint === fingerprint) {
       this.completedRunBoundary = false;
@@ -1768,14 +1801,15 @@ export class SessionController {
       budget: relevanceBudget(this.buildContextProfile().tier),
       pinned: this.buildPinnedContext(),
       completedRunBoundary: this.completedRunBoundary,
+      evidence: buildTaskEvidencePack(this.context.globalState, this.lastRequest ?? '', 3600, workspaceRoot()),
     });
     this.completedRunBoundary = false;
-    const messages = await this.maybeCompactPlanner(request.messages, provider);
+    const messages = await this.maybeCompactPlanner(request.messages, provider, model);
     this.plannerConversationCache = { fingerprint, messages };
     return messages.map((message) => ({ ...message }));
   }
 
-  private async maybeCompactPlanner(messages: ChatMessage[], provider: LLMProvider): Promise<ChatMessage[]> {
+  private async maybeCompactPlanner(messages: ChatMessage[], provider: LLMProvider, model = getConfig().model): Promise<ChatMessage[]> {
     if (!getConfig().autoCompact) {
       return messages;
     }
@@ -1787,6 +1821,12 @@ export class SessionController {
     if (!check.needed || check.recentStart <= 2) {
       return messages;
     }
+    const compactionFingerprint = sha1Of(JSON.stringify(messages.slice(2, check.recentStart)));
+    if (this.backgroundCompaction?.fingerprint === compactionFingerprint) {
+      const prepared = buildCompactedMessages(messages, this.backgroundCompaction.summary, check.recentStart);
+      this.backgroundCompaction = null;
+      return prepared;
+    }
     // Trim-first: planning usually only needs the pinned head plus the recent
     // window, so drop the stale middle without paying for a summarize call.
     const trimmed = [...messages.slice(0, 2), ...messages.slice(check.recentStart)];
@@ -1794,10 +1834,17 @@ export class SessionController {
     if (estimateTokens(trimmed) <= threshold) {
       return trimmed;
     }
+    // On compact local models, a second summarizer request competes with the
+    // planner on the same model and delays the first useful response. The
+    // deterministic checkpoint keeps the important head and recent request
+    // without another model round trip.
+    if (this.buildContextProfile().tier === 'compact') {
+      return buildDeterministicCheckpoint(messages, check.recentStart);
+    }
     try {
       const summary = await summarizeMessages(
         provider,
-        getConfig().model,
+        model,
         messages.slice(2, check.recentStart),
         this.abortController?.signal ?? new AbortController().signal,
       );
@@ -1818,6 +1865,7 @@ export class SessionController {
       : this.lastRequest;
     const pending = this.sessionPending ?? this.currentRun?.pending;
     const changedFiles = (this.currentRun?.changedFiles ?? []).map((file) => file.path);
+    const ledger = this.eventLedger.condensed(1800);
     return {
       latestUserMessage: latestText,
       ...(this.plan
@@ -1839,8 +1887,58 @@ export class SessionController {
         nextSteps: this.taskState.nextSteps,
         blockers: this.taskState.blockers,
       },
+      ...(ledger ? { ledger } : {}),
       ...(this.diagnosticsSummary ? { diagnosticsSummary: this.diagnosticsSummary } : {}),
     };
+  }
+
+  /** Prepare a summary while idle. It never runs for compact profiles and
+   * never blocks a new request; deterministic compaction remains the fallback. */
+  private scheduleBackgroundCompaction(): void {
+    if (this.backgroundCompactionInFlight || this.phase !== 'idle' || this.buildContextProfile().tier === 'compact') {
+      return;
+    }
+    if (this.backgroundCompactionTimer) clearTimeout(this.backgroundCompactionTimer);
+    this.backgroundCompactionTimer = setTimeout(() => {
+      this.backgroundCompactionTimer = undefined;
+      void this.prepareBackgroundCompaction();
+    }, 250);
+  }
+
+  private async prepareBackgroundCompaction(): Promise<void> {
+    if (this.backgroundCompactionInFlight || this.phase !== 'idle') return;
+    const profile = this.buildContextProfile();
+    const request = composePlannerRequest({
+      conversation: projectCompressedMessages(this.conversation, this.compressionBlocks),
+      contextIndex: this.contextIndex,
+      archived: this.archivedConversation,
+      archivedContextIndex: this.archivedContextIndex,
+      budget: relevanceBudget(profile.tier),
+      pinned: this.buildPinnedContext(),
+    });
+    const check = checkCompaction(request.messages, this.effectiveContextLimit(), {
+      profile,
+      reasoning: this.profileSupportsReasoning(),
+    });
+    if (!check.needed || check.recentStart <= 2) return;
+    const fingerprint = sha1Of(JSON.stringify(request.messages.slice(2, check.recentStart)));
+    this.backgroundCompactionInFlight = true;
+    try {
+      const mainProvider = await this.buildProvider();
+      const plannerSelection = await this.resolveRoleSelection('planner', mainProvider);
+      if (!plannerSelection || this.phase !== 'idle') return;
+      const summary = await summarizeMessages(
+        plannerSelection.provider,
+        plannerSelection.model,
+        request.messages.slice(2, check.recentStart),
+        new AbortController().signal,
+      );
+      if (summary && this.phase === 'idle') this.backgroundCompaction = { fingerprint, summary };
+    } catch {
+      // The next request uses the existing deterministic checkpoint.
+    } finally {
+      this.backgroundCompactionInFlight = false;
+    }
   }
 
   private async editMessage(id: string, text: string, restoreWorkspace: boolean): Promise<void> {
@@ -2253,6 +2351,7 @@ export class SessionController {
     // startup, or routing request. This keeps the transcript responsive even
     // when a local model is cold or the route probe is slow.
     const submittedMessage = this.addUserMessage(text, attachment, quote, cappedImages);
+    this.eventLedger.append('message', { messageId: submittedMessage.id, text: text.slice(0, 600) });
     const ownsRouteStage = !this.streamingMessageId;
     if (ownsRouteStage) {
       this.setStage('Thinking…');
@@ -2303,6 +2402,26 @@ export class SessionController {
     }
     if (route === 'cancel-plan') {
       route = 'continue-task';
+    }
+    if ((route === 'question' || route === 'answer') && provider && this.phase !== 'planning' && this.phase !== 'executing') {
+      if (!root) {
+        this.addNotice('Open a folder before asking a codebase question.');
+        this.recordRoute(messageId, route, stateBefore);
+        return;
+      }
+      const answered = await this.answerQuestionDirectly(
+        provider,
+        materialized,
+        submittedMessage,
+        cappedImages,
+        selection,
+        quote,
+      );
+      this.recordRoute(messageId, route, stateBefore);
+      if (!answered) {
+        this.addNotice('The question could not be answered. Try a more specific file, symbol, or topic.');
+      }
+      return;
     }
     if (route === 'answer' || route === 'refine-plan') {
       // These are handled by the normal planner conversation when idle. While
@@ -2385,6 +2504,7 @@ export class SessionController {
       // model startup does not wait behind unrelated local reads.
       this.setStage('PLANNING — loading tools and context…');
       const providerPromise = this.buildProvider();
+      const plannerSelectionPromise = providerPromise.then((main) => this.resolveRoleSelection('planner', main));
       const requestContextPromise = (async () => {
         const quotePrefix = quote?.trim() ? `[context] ${quote.trim()} [/context]\n\n` : '';
         let llmText = quotePrefix + (await this.expandSessionMentions(await this.expandFileMentions(effective, root)));
@@ -2402,25 +2522,33 @@ export class SessionController {
         this.buildPlannerToolRegistry(),
         this.registry.load(),
       ]);
-      const [provider, llmText, [rules, plannerTools]] = await Promise.all([
+      const [provider, llmText, [rules, plannerTools], plannerSelection] = await Promise.all([
         providerPromise,
         requestContextPromise,
         preparationPromise,
+        plannerSelectionPromise,
       ]);
       if (!provider) {
         return;
       }
+      if (!plannerSelection) {
+        this.addError('The configured planner model is unavailable; no plan was started. Check its provider and model settings.');
+        return;
+      }
+      this.preparedProvider = { key: this.providerCacheKey(config), provider };
       this.lastRequest = llmText;
       this.appendUserConversation(userMessage, llmText, cappedImages);
-      const preset = findPreset(config.preset) ?? PRESETS[0];
-      const registryInfo = this.registry.lookup(preset.provider, config.model);
-      const catalogInfo = modelInfo(preset.id, config.model);
-      const family = promptFamilyFor(preset.provider, config.model);
+      const plannerProvider = plannerSelection.provider;
+      const plannerModel = plannerSelection.model;
+      const preset = plannerSelection.preset;
+      const registryInfo = this.registry.lookup(preset.provider, plannerModel);
+      const catalogInfo = modelInfo(preset.id, plannerModel);
+      const family = promptFamilyFor(preset.provider, plannerModel);
 
       const plannerReasoningSupported =
         Boolean(catalogInfo?.reasoning) || (registryInfo?.supportsReasoning ?? false) ||
-        (this.selectedModelMetadata(preset.id, config.model, preset.provider).reasoningLevels?.length ?? 0) > 0;
-      const planner = new PlannerService(provider, config.model, {
+        (this.selectedModelMetadata(preset.id, plannerModel, preset.provider).reasoningLevels?.length ?? 0) > 0;
+      const planner = new PlannerService(plannerProvider, plannerModel, {
         maxSteps: this.plannerStepLimit(config, preset),
         tools: plannerTools,
         rules,
@@ -2430,17 +2558,18 @@ export class SessionController {
           turn: 0,
           previousToolNames: [],
           previousToolFailed: false,
-        }),
-        resolveReasoning: (context) => this.plannerReasoningOptions(plannerReasoningSupported, preset.id, context),
+        }, plannerModel),
+        resolveReasoning: (context) => this.plannerReasoningOptions(plannerReasoningSupported, preset.id, context, plannerModel),
         reasoningSwitch: this.reasoningSwitchEnabled(),
         contextLimitTokens: this.effectiveContextLimit(),
         workspaceRoot: root,
         questionMode,
       });
       this.abortController = new AbortController();
-      const warmupPromise = this.settleWarmup();
-      const plannerConversationPromise = this.preparePlannerConversation(provider);
-      await Promise.all([warmupPromise, plannerConversationPromise]);
+      // Warmup is best-effort; never hold the first planner token behind it.
+      void this.settleWarmup();
+      const plannerConversationPromise = this.preparePlannerConversation(plannerProvider, plannerModel);
+      await plannerConversationPromise;
       this.setStage('PLANNING — processing code context…');
 
       const result = await planner.plan(
@@ -2480,16 +2609,19 @@ export class SessionController {
           this.planVersion += 1;
           this.plan = result.plan;
           this.recordContextMetadata(planContextMetadata(result.plan));
-          if (getConfig().memory) {
-            const convention = await this.matchStoredConvention(result.plan);
-            if (convention) {
-              result.plan.convention = convention.statement;
-            }
-          }
           await this.savePlanFile(this.plan, this.lastRequest);
           this.post({ type: 'plan', plan: this.plan });
           this.persist();
           this.needsInputListener?.('a plan is ready for your approval');
+          if (getConfig().memory) {
+            const convention = await this.matchStoredConvention(result.plan);
+            if (convention) {
+              result.plan.convention = convention.statement;
+              await this.savePlanFile(this.plan, this.lastRequest);
+              this.post({ type: 'plan', plan: this.plan });
+              this.persist();
+            }
+          }
         }
       } else if (result.dismissed) {
         const hadDraft = this.plan !== null;
@@ -2504,7 +2636,7 @@ export class SessionController {
         if (result.stopped === 'same-plan') {
           this.addNotice('The planner could not fill in the plan details. Try rephrasing or splitting the request.');
         } else if (result.exhausted) {
-          this.addNotice('The planner reached its step limit. Try rephrasing or splitting the request.');
+          this.addNotice('The planner stopped before producing a ready plan. Try rephrasing or splitting the request.');
         } else if (!result.text.trim()) {
           this.addNotice('The model produced no output — its context may be full. Try Compact, or a smaller request.');
         }
@@ -2530,6 +2662,7 @@ export class SessionController {
       this.reasoningOverride = undefined;
       this.reasoningChanges = 0;
       this.runningQueued = undefined;
+      this.scheduleBackgroundCompaction();
       this.processNextQueued();
     }
   }
@@ -2609,7 +2742,11 @@ export class SessionController {
     if (!this.plan) {
       return;
     }
-    const provider = await this.buildProvider();
+    const config = getConfig();
+    const key = this.providerCacheKey(config);
+    const provider = this.preparedProvider?.key === key
+      ? this.preparedProvider.provider
+      : await this.buildProvider();
     if (!provider) {
       return;
     }
@@ -2680,7 +2817,11 @@ export class SessionController {
       this.addNotice('Open a folder first.');
       return;
     }
-    const provider = await this.buildProvider();
+    const config = getConfig();
+    const key = this.providerCacheKey(config);
+    const provider = this.preparedProvider?.key === key
+      ? this.preparedProvider.provider
+      : await this.buildProvider();
     if (!provider) {
       return;
     }
@@ -2764,17 +2905,31 @@ export class SessionController {
       await this.knowledgeRefresh.catch(() => undefined);
     }
     this.setStage('IMPLEMENTING — loading tools…');
-    const rules = await this.buildRules(root, this.lastRequest);
-    const registry = await this.buildToolRegistry();
-    await this.registry.load();
-    const preset = findPreset(config.preset) ?? PRESETS[0];
-    const registryInfo = this.registry.lookup(preset.provider, config.model);
-    const catalogInfo = modelInfo(preset.id, config.model);
-    const family = promptFamilyFor(preset.provider, config.model);
+    const rulesPromise = this.buildRules(root, this.lastRequest);
+    const registryPromise = this.buildToolRegistry();
+    const registryLoadPromise = this.registry.load();
+    const editorSelectionPromise = this.resolveRoleSelection('editor', provider);
+    const [rules, registry, editorSelection] = await Promise.all([
+      rulesPromise,
+      registryPromise,
+      editorSelectionPromise,
+    ]);
+    await registryLoadPromise;
+    if (!editorSelection) {
+      this.addError('The configured editor model is unavailable; execution stayed stopped and no files were changed.');
+      return;
+    }
+    const executionProvider = editorSelection.provider;
+    const executionModel = editorSelection.model;
+    const preset = editorSelection.preset;
+    this.activeReasoningModel = { presetId: preset.id, model: executionModel };
+    const registryInfo = this.registry.lookup(preset.provider, executionModel);
+    const catalogInfo = modelInfo(preset.id, executionModel);
+    const family = promptFamilyFor(preset.provider, executionModel);
     const executorReasoningSupported =
       Boolean(catalogInfo?.reasoning) || (registryInfo?.supportsReasoning ?? false) ||
-      (this.selectedModelMetadata(preset.id, config.model, preset.provider).reasoningLevels?.length ?? 0) > 0;
-    const executorReasoning = this.reasoningOptions(executorReasoningSupported, preset.id);
+      (this.selectedModelMetadata(preset.id, executionModel, preset.provider).reasoningLevels?.length ?? 0) > 0;
+    const executorReasoning = this.reasoningOptions(executorReasoningSupported, preset.id, executionModel);
     const reasoningLabel = executorReasoning
       ? executorReasoning.effort ?? (executorReasoning.enabled ? 'on' : 'off')
       : undefined;
@@ -2797,7 +2952,7 @@ export class SessionController {
         sessionId: this.sessionId,
         request: this.lastRequest,
         provider: preset.provider,
-        model: config.model,
+        model: executionModel,
         status: 'approved',
         planVersion: this.planVersion,
         stepIndex: 0,
@@ -2825,6 +2980,8 @@ export class SessionController {
     await this.saveRunNow();
     if (approve) {
       plan.status = 'approved';
+      this.eventLedger.setTask(this.taskState.taskId);
+      this.eventLedger.append('plan', { version: plan.version, title: plan.title ?? '', steps: plan.steps ?? [] });
       this.recordContextMetadata(planContextMetadata(plan));
       this.post({ type: 'plan', plan });
       this.persist();
@@ -2852,7 +3009,7 @@ export class SessionController {
       this.recordRunProgress();
     }
 
-    const agent = new AgentService(provider, config.model, this.buildToolbox(), {
+    const agent = new AgentService(executionProvider, executionModel, this.buildToolbox(), {
       maxSteps: config.maxSteps,
       tools: registry.executor,
       rules,
@@ -2861,10 +3018,12 @@ export class SessionController {
       contextLimitTokens: this.effectiveContextLimit(),
       parallelTools: config.parallelTools,
       reasoning: executorReasoning,
-      resolveReasoning: (context) => this.executionReasoningOptions(executorReasoningSupported, preset.id, context),
+      resolveReasoning: (context) => this.executionReasoningOptions(executorReasoningSupported, preset.id, context, executionModel),
       planFilePath: plan.filePath,
       contextProfile,
       profileReasoning: executorReasoningSupported,
+      retrievalPasses: contextProfile.tier === 'compact' ? 1 : 2,
+      ...(this.eventLedger.condensed(1400) ? { ledger: this.eventLedger.condensed(1400) } : {}),
       finishCheck: (summary) => this.checkRunFinish(summary),
       taskState: {
         state: this.taskState.state,
@@ -2874,7 +3033,8 @@ export class SessionController {
       },
     });
 
-    await this.settleWarmup();
+    // Approved execution should start immediately; warmup is only a hint.
+    void this.settleWarmup();
     this.setStage('IMPLEMENTING — applying approved changes…');
     try {
       const result = await agent.run(plan, this.lastRequest, this.abortController.signal, {
@@ -2938,6 +3098,7 @@ export class SessionController {
       this.endStreaming();
       this.setPhase(this.diffManager.hasPendingChanges() ? 'review' : 'idle');
       this.abortController = null;
+      this.activeReasoningModel = undefined;
       this.reasoningOverride = undefined;
       this.reasoningChanges = 0;
       this.pushChanges();
@@ -3003,6 +3164,7 @@ export class SessionController {
     this.rulesBaseCache = null;
     this.toolRegistryCache = null;
     this.plannerToolCache = null;
+    this.questionToolCache = null;
     this.plannerConversationCache = null;
   }
 
@@ -3085,18 +3247,18 @@ export class SessionController {
     return parts.length > 0 ? `${text}\n\n${parts.join('\n\n')}` : text;
   }
 
-  private reasoningOptions(supported: boolean, presetId: string): ReasoningOptions | undefined {
+  private reasoningOptions(supported: boolean, presetId: string, modelId = getConfig().model): ReasoningOptions | undefined {
     const config = getConfig();
     const providerId = findPreset(presetId)?.provider ?? config.provider;
-    const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
-    const selected = this.selectedReasoningEffort(presetId, config.model, levels);
+    const levels = this.selectedModelMetadata(presetId, modelId, providerId).reasoningLevels ?? [];
+    const selected = this.selectedReasoningEffort(presetId, modelId, levels);
     const effort = this.reasoningOverride
       ? clampReasoningLevel(this.reasoningOverride, selected, levels)
       : selected;
     if (!supported || levels.length === 0) {
       return undefined;
     }
-    const kind = adaptiveKind(presetId, config.model, modelInfo(presetId, config.model));
+    const kind = adaptiveKind(presetId, modelId, modelInfo(presetId, modelId));
     const adaptive = kind ? { kind } : {};
     if (effort === 'off') {
       if (presetId === 'deepseek') return { enabled: false };
@@ -3112,17 +3274,18 @@ export class SessionController {
     supported: boolean,
     presetId: string,
     context: ReasoningRouteContext,
+    modelId = getConfig().model,
   ): ReasoningOptions | undefined {
     const config = getConfig();
     const options = config.plannerThinking === 'auto'
-      ? this.autoReasoningOptions(supported, presetId)
-      : this.reasoningOptions(supported, presetId);
+      ? this.autoReasoningOptions(supported, presetId, modelId)
+      : this.reasoningOptions(supported, presetId, modelId);
     // One reasoning mode governs planning and execution. A run-level override
     // remains authoritative when the model explicitly changes it mid-run.
     if (this.reasoningOverride || config.plannerThinking === 'on') return options;
-    if (config.plannerThinking === 'off') return this.disableReasoning(options, presetId);
+    if (config.plannerThinking === 'off') return this.disableReasoning(options, presetId, modelId);
     const providerId = findPreset(presetId)?.provider ?? config.provider;
-    const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
+    const levels = this.selectedModelMetadata(presetId, modelId, providerId).reasoningLevels ?? [];
     return routeReasoning(options, levels, context);
   }
 
@@ -3130,11 +3293,12 @@ export class SessionController {
     supported: boolean,
     presetId: string,
     context?: ReasoningRouteContext,
+    modelId = getConfig().model,
   ): ReasoningOptions | undefined {
     const config = getConfig();
     const options = config.plannerThinking === 'auto'
-      ? this.autoReasoningOptions(supported, presetId)
-      : this.reasoningOptions(supported, presetId);
+      ? this.autoReasoningOptions(supported, presetId, modelId)
+      : this.reasoningOptions(supported, presetId, modelId);
     if (!options || !options.enabled || this.reasoningOverride) {
       return options;
     }
@@ -3143,13 +3307,13 @@ export class SessionController {
       return options;
     }
     if (mode === 'off') {
-      return this.disableReasoning(options, presetId);
+      return this.disableReasoning(options, presetId, modelId);
     }
     // Auto uses the same bounded router for local and hosted models. The
     // initial planning request gets an explicit planning context so a binary
     // off/on model starts off and can turn on only after strong evidence.
     const providerId = findPreset(presetId)?.provider ?? config.provider;
-    const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
+    const levels = this.selectedModelMetadata(presetId, modelId, providerId).reasoningLevels ?? [];
     return routeReasoning(options, levels, context ?? {
       phase: 'planning',
       turn: 0,
@@ -3158,23 +3322,23 @@ export class SessionController {
     });
   }
 
-  private disableReasoning(options: ReasoningOptions | undefined, presetId: string): ReasoningOptions | undefined {
+  private disableReasoning(options: ReasoningOptions | undefined, presetId: string, modelId = getConfig().model): ReasoningOptions | undefined {
     if (!options) return options;
     if (presetId === 'deepseek') return { enabled: false };
     const config = getConfig();
     const providerId = findPreset(presetId)?.provider ?? config.provider;
-    const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
+    const levels = this.selectedModelMetadata(presetId, modelId, providerId).reasoningLevels ?? [];
     if (options.effort === 'off' || (!levels.includes('off') && !levels.includes('none'))) return options;
     if (levels.includes('none')) return { ...options, effort: 'none' };
     return { ...options, effort: 'off' };
   }
 
-  private autoReasoningOptions(supported: boolean, presetId: string): ReasoningOptions | undefined {
-    const options = this.reasoningOptions(supported, presetId);
+  private autoReasoningOptions(supported: boolean, presetId: string, modelId = getConfig().model): ReasoningOptions | undefined {
+    const options = this.reasoningOptions(supported, presetId, modelId);
     if (!options || !options.enabled || (options.effort !== 'off' && options.effort !== 'none')) return options;
     const config = getConfig();
     const providerId = findPreset(presetId)?.provider ?? config.provider;
-    const levels = this.selectedModelMetadata(presetId, config.model, providerId).reasoningLevels ?? [];
+    const levels = this.selectedModelMetadata(presetId, modelId, providerId).reasoningLevels ?? [];
     const ceiling = [...levels].reverse().find((level) => level !== 'off' && level !== 'none');
     if (!ceiling) return options;
     if (presetId === 'deepseek') return { ...options, enabled: true };
@@ -3183,8 +3347,11 @@ export class SessionController {
 
   private setRunReasoning(level: string): string {
     const config = getConfig();
-    const preset = findPreset(config.preset) ?? PRESETS[0];
-    const metadata = this.selectedModelMetadata(preset.id, config.model, preset.provider);
+    const preset = this.activeReasoningModel
+      ? findPreset(this.activeReasoningModel.presetId) ?? (findPreset(config.preset) ?? PRESETS[0])
+      : (findPreset(config.preset) ?? PRESETS[0]);
+    const modelId = this.activeReasoningModel?.model ?? config.model;
+    const metadata = this.selectedModelMetadata(preset.id, modelId, preset.provider);
     const levels = metadata.reasoningLevels ?? [];
     const requested = level.trim();
     if (levels.length === 0) {
@@ -3196,7 +3363,7 @@ export class SessionController {
     if (this.reasoningChanges >= 5) {
       return 'Error: reasoning effort can change at most 5 times per run.';
     }
-    const selected = this.selectedReasoningEffort(preset.id, config.model, levels, metadata.reasoningDefault);
+    const selected = this.selectedReasoningEffort(preset.id, modelId, levels, metadata.reasoningDefault);
     const applied = clampReasoningLevel(requested, selected, levels);
     this.reasoningOverride = requested;
     this.reasoningChanges += 1;
@@ -3311,6 +3478,20 @@ export class SessionController {
     return this.plannerToolCache;
   }
 
+  private async buildQuestionToolRegistry(): Promise<ToolDef[]> {
+    if (this.questionToolCache) return this.questionToolCache;
+    const readOnly = new Set([
+      'read_file', 'list_files', 'search_text', 'semantic_search', 'find_symbol',
+      'document_symbols', 'find_references', 'go_to_definition', 'hover',
+      'go_to_implementation', 'incoming_calls', 'outgoing_calls',
+      'inspect_file_context', 'investigate_issue', 'bounded_investigation',
+      'web_fetch', 'web_search', 'list_processes', 'memory_recall', 'verify_change',
+    ]);
+    this.questionToolCache = (await this.buildPlannerToolRegistry())
+      .filter((tool) => readOnly.has(tool.name));
+    return this.questionToolCache;
+  }
+
   private registerToolPreflights(executor: ToolDef[]): void {
     this.toolPreflights.clear();
     for (const definition of executor) {
@@ -3379,6 +3560,42 @@ export class SessionController {
     this.post({ type: 'connection', connection: this.buildConnectionState() });
     this.connectionNoticeId = this.addNotice(connectionNotice(preset), 'openSettings').id;
     return undefined;
+  }
+
+  /** Resolve an optional role without changing the active connection. Empty
+   * role settings deliberately fall back to the already-created main provider. */
+  private async resolveRoleSelection(
+    role: Exclude<ModelRole, 'main'>,
+    main: LLMProvider | undefined,
+  ): Promise<ActiveProvider | undefined> {
+    const config = getConfig();
+    const configured = role === 'planner'
+      ? Boolean(config.plannerPreset.trim() || config.plannerModel.trim())
+      : role === 'editor'
+        ? Boolean(config.editorPreset.trim() || config.editorModel.trim())
+        : role === 'scanner'
+          ? Boolean(config.scanPreset.trim() || config.scanModel.trim() || config.scanAiModel.trim())
+          : Boolean(config.architecturePreset.trim() || config.architectureModel.trim());
+    if (!configured) {
+      if (!main) return undefined;
+      const preset = findPreset(config.preset) ?? PRESETS[0];
+      return {
+        preset,
+        label: preset.label,
+        provider: main,
+        baseUrl: config.baseUrl,
+        model: config.model,
+      };
+    }
+    // An explicitly configured role must not silently fall back to the main
+    // model: that would make a provider/key mistake invisible and could send
+    // edits to the wrong model. The caller handles the unavailable role as a
+    // safe stop.
+    return await roleProvider(this.context, role);
+  }
+
+  private providerCacheKey(config: DevFirstConfig): string {
+    return [config.provider, config.preset, config.model, config.baseUrl].join('|');
   }
 
   private static readonly WARMUP_MIN_INTERVAL_MS = 4 * 60 * 1000;
@@ -3574,6 +3791,117 @@ export class SessionController {
     });
   }
 
+  private async answerQuestionDirectly(
+    provider: LLMProvider,
+    text: string,
+    submittedMessage: UiMessage,
+    images: string[],
+    selection?: SelectionContext,
+    quote?: string,
+  ): Promise<boolean> {
+    this.lastRequest = text;
+    let userText = text;
+    if (selection) userText += formatSelectionAttachment(selection);
+    const editor = this.editorContext();
+    if (editor) userText += editor;
+    this.appendUserConversation(submittedMessage, userText, images);
+    this.setStage('ANSWER — locating relevant files…');
+    let codebaseEvidence = '';
+    try {
+      codebaseEvidence = await this.codebaseIndex.evidence(text, 8);
+    } catch {
+      // The normal read/search tools remain the fallback if indexing is not
+      // available (for example while a workspace is being replaced).
+    }
+    const request = composePlannerRequest({
+      conversation: this.conversation,
+      contextIndex: this.contextIndex,
+      archived: this.archivedConversation,
+      archivedContextIndex: this.archivedContextIndex,
+      budget: { maxOlder: 3, maxTokens: 1200 },
+      evidence: buildTaskEvidencePack(this.context.globalState, text, 3000, workspaceRoot()),
+    });
+    if (codebaseEvidence) {
+      request.messages.push({ role: 'system', content: codebaseEvidence });
+    }
+    const readOnlyNames = new Set([
+      'read_file', 'list_files', 'search_text', 'semantic_search', 'find_symbol',
+      'document_symbols', 'find_references', 'go_to_definition', 'hover',
+      'go_to_implementation', 'incoming_calls', 'outgoing_calls',
+      'inspect_file_context', 'investigate_issue', 'bounded_investigation',
+      'web_fetch', 'web_search', 'list_processes', 'memory_recall', 'verify_change',
+    ]);
+    const tools = (await this.buildQuestionToolRegistry())
+      .filter((tool) => readOnlyNames.has(tool.name));
+    const controller = new AbortController();
+    const previousController = this.abortController;
+    this.abortController = controller;
+    this.ensureStreamingMessage();
+    this.setStage('ANSWER — selecting relevant context…');
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content: 'You are answering the developer\'s latest question about the codebase. Answer directly in chat. Use only the read-only tools provided when evidence is missing. Never create a plan, edit files, run commands, or discuss implementation approval. Use earlier context only when it is relevant to the latest question. Preserve the developer\'s explanation style: explain WHAT it is, HOW it works, and WHY it behaves that way when those parts help; add a concise Mermaid flow diagram when the answer spans multiple components or steps. Include a TRADEOFF only when there is a real alternative worth comparing, and state what the alternative improves and costs. Include CONCEPT, RISKS, or CONTEXT only when they materially improve understanding. These sections are optional: do not force headings or a diagram onto a simple question. Base every claim on the current message or verified evidence.',
+      },
+      ...request.messages,
+    ];
+    let answer = '';
+    try {
+      // One initial read pass plus one bounded refinement keeps small local
+      // models from wandering through the repository while still allowing a
+      // first tool result to guide one targeted follow-up.
+      const maxReadRounds = this.buildContextProfile().tier === 'compact' ? 2 : 3;
+      for (let turn = 0; turn < maxReadRounds; turn++) {
+        this.setStage(turn === 0 ? 'ANSWER — waiting for response…' : 'ANSWER — processing read results…');
+        let textDelta = '';
+        let reasoning = '';
+        const calls: ToolCall[] = [];
+        for await (const event of chatWithRetry(provider, messages, {
+          model: getConfig().model,
+          tools: tools.length > 0 ? tools : undefined,
+          maxTokens: 1400,
+          temperature: 0.2,
+          reasoning: { enabled: false },
+          contextTokens: Math.min(this.effectiveContextLimit(), 4096),
+          signal: controller.signal,
+        }, { attempts: 1, retryOnEmpty: false })) {
+          if (event.type === 'text') {
+            textDelta += event.text;
+            this.appendStreamingText(event.text);
+          } else if (event.type === 'reasoning') {
+            reasoning += event.text;
+          } else if (event.type === 'toolCall' && readOnlyNames.has(event.toolCall.name)) {
+            calls.push(event.toolCall);
+          }
+        }
+        answer += textDelta;
+        if (calls.length === 0) {
+          const result = answer.trim();
+          if (!result) return false;
+          this.appendConversation({ id: this.streamingMessageId ?? undefined, role: 'assistant', content: result });
+          this.endStreaming();
+          return true;
+        }
+        messages.push({ role: 'assistant', content: textDelta, toolCalls: calls, ...(reasoning ? { reasoning } : {}) });
+        for (const call of calls) {
+          this.setStage(`ANSWER — reading ${call.name}…`);
+          const result = await this.executePlannerTool(call);
+          messages.push({ role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
+        }
+      }
+      this.endStreaming();
+      return Boolean(answer.trim());
+    } catch (error) {
+      if (!(error instanceof Error && error.name === 'AbortError')) {
+        this.addError(`Question failed: ${errorMessage(error)}`);
+      }
+      this.endStreaming();
+      return false;
+    } finally {
+      this.abortController = previousController;
+    }
+  }
+
   private requestApproval(command: string, cwd: string): Promise<TerminalApprovalDecision> {
     const id = randomId('term');
     this.currentApproval = { id, command, cwd };
@@ -3720,6 +4048,13 @@ export class SessionController {
         ?? this.taskState.nextSteps,
       lastHeartbeatAt: Date.now(),
     };
+    this.eventLedger.setTask(this.taskState.taskId);
+    this.eventLedger.append('state', {
+      state: this.taskState.state,
+      completedSteps: this.taskState.completedSteps,
+      nextSteps: this.taskState.nextSteps,
+      blockers: this.taskState.blockers,
+    });
     this.post({ type: 'phase', phase });
     this.phaseListener?.(phase);
   }
@@ -3953,6 +4288,13 @@ export class SessionController {
         blockers: [],
         lastHeartbeatAt: Date.now(),
       };
+      this.eventLedger.setTask(this.taskState.taskId);
+      this.eventLedger.append('state', {
+        state: this.taskState.state,
+        completedSteps: this.taskState.completedSteps,
+        nextSteps: this.taskState.nextSteps,
+        blockers: this.taskState.blockers,
+      });
       this.post({ type: 'plan', plan });
       this.plan = null;
       this.post({ type: 'plan', plan: null });
@@ -4204,6 +4546,7 @@ export class SessionController {
     }
     message.stage = text;
     this.post({ type: 'stage', id: message.id, text });
+    this.eventLedger.append('stage', { stage: text });
   }
 
   private clearStage(message: UiMessage): void {
@@ -4283,11 +4626,10 @@ export class SessionController {
   }
 
   private plannerStepLimit(config: DevFirstConfig, preset: ProviderPreset): number {
-    if (!preset.local || config.plannerMaxSteps <= 0) {
-      return config.plannerMaxSteps;
-    }
-    const profile = this.buildContextProfile();
-    return profile.tier === 'compact' ? Math.min(config.plannerMaxSteps, 8) : config.plannerMaxSteps;
+    // Planning continues until the model submits a ready plan, answers, or a
+    // convergence/watchdog guard stops it. Execution remains separately
+    // bounded by maxSteps.
+    return 0;
   }
 
   private reservedOutputTokens(): number {
@@ -4407,6 +4749,20 @@ export class SessionController {
         createdAt: Date.now(),
       },
     ].slice(-100);
+    this.eventLedger.setTask(this.taskState.taskId);
+    this.eventLedger.append('route', {
+      messageId,
+      route,
+      stateBefore,
+      stateAfter: this.taskState.state,
+      completedStepsCount: this.taskState.completedSteps.length,
+    });
+    this.eventLedger.append('state', {
+      state: this.taskState.state,
+      completedSteps: this.taskState.completedSteps,
+      nextSteps: this.taskState.nextSteps,
+      blockers: this.taskState.blockers,
+    });
     void this.persistNow();
   }
 
@@ -4464,6 +4820,8 @@ export class SessionController {
     run.activeTool = tool;
     run.updatedAt = Date.now();
     await this.captureRunTargets(run, tool, argsJson, root);
+    this.eventLedger.setTask(this.taskState.taskId);
+    this.eventLedger.append('tool', { tool, status: 'started', target: operation.target ?? '' });
     void this.saveRunNow();
     return operation.id;
   }
@@ -4528,6 +4886,7 @@ export class SessionController {
     }
     run.activeTool = undefined;
     run.updatedAt = Date.now();
+    this.eventLedger.append('tool', { tool: operation?.tool ?? 'unknown', status: ok ? 'succeeded' : 'failed', changedFiles: run.changedFiles?.map((file) => file.path) ?? [] });
     void this.saveRunNow();
   }
 
@@ -4641,6 +5000,13 @@ export class SessionController {
       nextSteps: (this.plan?.steps ?? []).map((_, index) => index).filter((index) => !run.completedSteps.includes(index)),
       lastHeartbeatAt: Date.now(),
     };
+    this.eventLedger.setTask(this.taskState.taskId);
+    this.eventLedger.append('state', {
+      state: this.taskState.state,
+      completedSteps: this.taskState.completedSteps,
+      nextSteps: this.taskState.nextSteps,
+      blockers: this.taskState.blockers,
+    });
     const active = this.todos.findIndex((todo) => todo.status === 'in_progress' || todo.status === 'pending');
     run.stepIndex = active >= 0 ? active : this.todos.length;
     run.updatedAt = Date.now();

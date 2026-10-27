@@ -763,7 +763,8 @@ export class ToolBox {
     const base = args.path ? await this.resolvePath(args.path, context) : this.options.root;
     const isRegex = Boolean(args.is_regex);
     const caseSensitive = Boolean(args.case_sensitive);
-    const maxResults = clampInt(args.max_results, 1, MAX_SEARCH_RESULTS) ?? 50;
+    const compactProfile = getConfig().contextProfile === 'compact';
+    const maxResults = clampInt(args.max_results, 1, MAX_SEARCH_RESULTS) ?? (compactProfile ? 24 : 50);
     if (isRegex) {
       try {
         new RegExp(query);
@@ -976,9 +977,9 @@ export class ToolBox {
       return { text: 'Error: command is required.', spilled: false };
     }
     const planning = Boolean(context.planning);
-    if (planning && !isSafeCommand(command)) {
+    if (planning && !(isSafeCommand(command) || await isSafeWorkspaceNavigation(command, this.options.root))) {
       return {
-        text: "Not allowed during planning. Approve the plan and I'll run this during execution (with command approval).",
+        text: 'This command was blocked because it is not an allowed read-only operation. Relative workspace navigation (for example, `cd functions && find .`) is allowed; writes, destructive commands, redirects, and unsafe shell execution are not.',
         spilled: false,
       };
     }
@@ -3673,6 +3674,33 @@ const SAFE_GIT_BRANCH_FLAGS = new Set([
 const SAFE_NPM_SCRIPTS = new Set(['lint', 'typecheck']);
 const FORBIDDEN_WORDS = new Set(['rm', 'sudo']);
 const SHELL_SEPARATOR = /\s*(?:&&|\|\||;|\|)\s*/;
+
+async function isSafeWorkspaceNavigation(command: string, root: string): Promise<boolean> {
+  if (/[<>]|\$\(|`/.test(command)) return false;
+  const rootReal = await fs.realpath(root).catch(() => undefined);
+  if (!rootReal) return false;
+  let cwd = rootReal;
+  let navigated = false;
+  for (const segment of command.trim().split(SHELL_SEPARATOR)) {
+    const tokens = segment.trim().split(/\s+/);
+    if (!tokens[0]) return false;
+    if (tokens[0] !== 'cd') {
+      if (!isSafeCommand(segment)) return false;
+      continue;
+    }
+    const target = tokens[1] ?? '';
+    if (!target || tokens.length > 2 || target === '~' || target.startsWith('/') || target.split('/').includes('..')) {
+      return false;
+    }
+    const resolved = await fs.realpath(path.resolve(cwd, target)).catch(() => undefined);
+    if (!resolved) return false;
+    const relative = path.relative(rootReal, resolved);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) return false;
+    cwd = resolved;
+    navigated = true;
+  }
+  return navigated;
+}
 
 export function isSafeCommand(command: string): boolean {
   // Planning may suppress harmless permission noise from read-only discovery

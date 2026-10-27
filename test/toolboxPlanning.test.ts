@@ -19,7 +19,7 @@ function toolbox(): ToolBox {
 }
 
 const GUIDANCE =
-  "Not allowed during planning. Approve the plan and I'll run this during execution (with command approval).";
+  'This command was blocked because it is not an allowed read-only operation. Relative workspace navigation (for example, `cd functions && find .`) is allowed; writes, destructive commands, redirects, and unsafe shell execution are not.';
 
 describe('run_terminal_command during planning', () => {
   it('declines an unsafe command with guidance and no approval request', async () => {
@@ -44,6 +44,30 @@ describe('run_terminal_command during planning', () => {
 
     expect(result).toContain('planning-check');
     expect(result).toContain('Exit code: 0');
+    expect(approval).not.toHaveBeenCalled();
+  });
+
+  it('allows relative workspace navigation before a read-only command', async () => {
+    const approval = vi.fn(async () => 'allow' as const);
+    const result = await toolbox().execute(
+      'run_terminal_command',
+      JSON.stringify({ command: 'cd src && pwd' }),
+      { requestTerminalApproval: approval, planning: true },
+    );
+
+    expect(result).toContain('Exit code: 0');
+    expect(approval).not.toHaveBeenCalled();
+  });
+
+  it('blocks parent navigation during planning', async () => {
+    const approval = vi.fn(async () => 'allow' as const);
+    const result = await toolbox().execute(
+      'run_terminal_command',
+      JSON.stringify({ command: 'cd .. && find . -maxdepth 1' }),
+      { requestTerminalApproval: approval, planning: true },
+    );
+
+    expect(result).toContain('blocked');
     expect(approval).not.toHaveBeenCalled();
   });
 

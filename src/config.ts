@@ -17,7 +17,6 @@ export interface DevFirstConfig {
   baseUrl: string;
   model: string;
   maxSteps: number;
-  plannerMaxSteps: number;
   terminalTimeout: number;
   headerTimeout: number;
   streamIdleTimeout: number;
@@ -60,6 +59,10 @@ export interface DevFirstConfig {
   scanPreset: string;
   scanModel: string;
   scanReasoningEffort: ReasoningEffortSetting | '';
+  plannerPreset: string;
+  plannerModel: string;
+  editorPreset: string;
+  editorModel: string;
   architecturePreset: string;
   architectureModel: string;
   architectureReasoningEffort: ReasoningEffortSetting | '';
@@ -87,7 +90,6 @@ export function getConfig(): DevFirstConfig {
     baseUrl: config.get<string>('baseUrl', ''),
     model: config.get<string>('model', 'gpt-4o'),
     maxSteps: config.get<number>('maxSteps', 60),
-    plannerMaxSteps: config.get<number>('plannerMaxSteps', 12),
     terminalTimeout: config.get<number>('terminalTimeout', 120),
     headerTimeout: Math.max(0, config.get<number>('headerTimeout', 120)),
     streamIdleTimeout: Math.max(0, config.get<number>('streamIdleTimeout', 120)),
@@ -134,6 +136,10 @@ export function getConfig(): DevFirstConfig {
     scanPreset: config.get<string>('scanPreset', ''),
     scanModel: config.get<string>('scanModel', ''),
     scanReasoningEffort: config.get<ReasoningEffortSetting | ''>('scanReasoningEffort', ''),
+    plannerPreset: config.get<string>('plannerPreset', ''),
+    plannerModel: config.get<string>('plannerModel', ''),
+    editorPreset: config.get<string>('editorPreset', ''),
+    editorModel: config.get<string>('editorModel', ''),
     architecturePreset: config.get<string>('architecturePreset', ''),
     architectureModel: config.get<string>('architectureModel', ''),
     architectureReasoningEffort: config.get<ReasoningEffortSetting | ''>('architectureReasoningEffort', ''),

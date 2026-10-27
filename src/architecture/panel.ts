@@ -18,7 +18,7 @@ import {
   ArchitectureMapCoverage,
 } from './mapStore';
 import { generateArchitectureMap } from './mapGenerate';
-import { buildStructuralMap } from './structuralMap';
+import { buildStructuralMap, selectArchitectureFacts } from './structuralMap';
 import { summarizeFiles, summarizeModules } from './fileSummaries';
 
 export interface ArchitecturePanelDeps {
@@ -324,7 +324,9 @@ export class ArchitecturePanel {
         this.post({ type: 'empty', reason: EMPTY_NO_FACTS, project: this.projectName });
         return;
       }
-      const digest = buildMapDigest(facts, this.deps.root);
+      const selectedFacts = selectArchitectureFacts(facts, this.deps.root);
+      const architectureFacts = selectedFacts.length > 0 ? selectedFacts : facts;
+      const digest = buildMapDigest(architectureFacts, this.deps.root);
       let tools: ToolDef[] = [];
       try {
         tools = await this.deps.getTools();
@@ -343,8 +345,8 @@ export class ArchitecturePanel {
       // Publish a verified scanner-based map before model enrichment. This
       // keeps architecture useful when a local model is slow, unavailable, or
       // returns malformed JSON.
-      const structural = buildStructuralMap(facts, this.deps.root, this.projectName);
-      this.latestFacts = facts;
+      const structural = buildStructuralMap(architectureFacts, this.deps.root, this.projectName);
+      this.latestFacts = architectureFacts;
       this.latestTools = tools;
       const baselineCoverage: ArchitectureMapCoverage = {
         ...scanCoverage,
@@ -419,7 +421,7 @@ export class ArchitecturePanel {
         this.postMap(baseline, false);
         return;
       }
-      const indexedFiles = new Set(facts.map((fact) => relativeFile(this.deps.root, fact.file)));
+      const indexedFiles = new Set(architectureFacts.map((fact) => relativeFile(this.deps.root, fact.file)));
       const validated = {
         ...parsed,
         nodes: parsed.nodes.map((node) => {
@@ -447,13 +449,39 @@ export class ArchitecturePanel {
           return Boolean(edge.evidence?.length);
         }),
       };
-      const representedFiles = facts.filter((fact) => {
+      // An architecture overview should not display orphaned guesses. Keep
+      // the project root and nodes participating in at least one evidenced
+      // relationship; isolated files remain available through the scanner
+      // coverage and deeper drill-down views.
+      const connected = new Set<string>(['project', 'root']);
+      for (const edge of validated.edges) {
+        connected.add(edge.from);
+        connected.add(edge.to);
+      }
+      validated.nodes = validated.nodes.filter((node) => connected.has(node.id));
+      const validNodeIds = new Set(validated.nodes.map((node) => node.id));
+      validated.edges = validated.edges.filter((edge) => validNodeIds.has(edge.from) && validNodeIds.has(edge.to));
+      const representedFiles = architectureFacts.filter((fact) => {
         const file = relativeFile(this.deps.root, fact.file);
         return validated.nodes.some((node) => {
           const nodePath = node.path && node.path.replace(/\\/g, '/').replace(/^\.\//, '');
           return nodePath && (nodePath === file || file.startsWith(`${nodePath}/`));
         });
       }).length;
+      // A model response that mentions only a handful of folders is not an
+      // architecture map for the project. Keep the scanner truth instead of
+      // replacing it with a sparse or invented diagram.
+      const evidenceEdges = validated.edges.filter((edge) => edge.evidence?.length).length;
+      if (representedFiles < Math.max(2, Math.ceil(architectureFacts.length * 0.35)) || evidenceEdges === 0) {
+        this.post({
+          type: 'generating',
+          progress: 'AI overview did not cover enough verified files; keeping the complete scanner map.',
+          hasMap: true,
+          project: this.projectName,
+        });
+        this.postMap(baseline, false);
+        return;
+      }
       const coverage: ArchitectureMapCoverage = {
         ...scanCoverage,
         indexedFiles: facts.length,
@@ -480,7 +508,7 @@ export class ArchitecturePanel {
       }
       this.levelPath = [];
       this.postMap(map, false);
-      await this.generateArchitectureDomains(map, facts, active, tools, controller);
+      await this.generateArchitectureDomains(map, architectureFacts, active, tools, controller);
     } finally {
       this.generating = false;
       if (this.controller === controller) {

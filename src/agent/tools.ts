@@ -57,7 +57,7 @@ export const searchTextTool: ToolDef = {
       path: { type: 'string', description: 'Directory to search in, relative to the workspace root (optional).' },
       is_regex: { type: 'boolean', description: 'Treat query as a regular expression (optional, default false).' },
       case_sensitive: { type: 'boolean', description: 'Case-sensitive matching (optional, default false).' },
-      max_results: { type: 'number', description: 'Maximum matches to return (optional, default 50).' },
+      max_results: { type: 'number', description: 'Maximum matches to return (optional; compact profiles default to 24).' },
     },
     required: ['query'],
   },

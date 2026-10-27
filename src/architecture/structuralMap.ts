@@ -30,15 +30,52 @@ function nodeId(value: string): string {
   return `file_${value.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'root'}`;
 }
 
+const ENTRY_STEMS = new Set(['index', 'main', 'app', 'server', 'entry']);
+
+function isSupportOnlyFile(file: string): boolean {
+  const lower = file.toLowerCase();
+  const base = path.posix.basename(lower);
+  return /(^|\/)(__tests?|tests?|specs?|fixtures?|mocks?|__mocks__|snapshots?)(\/|$)/.test(lower)
+    || /\.(test|spec)\.[^.]+$/.test(base)
+    || /\.(d\.ts|snap)$/.test(base)
+    || /(^|\/)(generated|coverage|dist|build|node_modules)(\/|$)/.test(lower)
+    || /\.(generated|gen)\.[^.]+$/.test(base);
+}
+
+export function selectArchitectureFacts(facts: FileFacts[], root: string): FileFacts[] {
+  return facts.filter((fact) => {
+    const file = relativeFile(root, fact.file);
+    if (!file || isSupportOnlyFile(file)) return false;
+    const stem = path.posix.basename(file).replace(/\.[^.]+$/, '').toLowerCase();
+    if (ENTRY_STEMS.has(stem)) return true;
+    if (fact.imports.length || fact.exports.length || fact.functions.length) return true;
+    if (fact.handlers.length || fact.httpClients.length || fact.sql.length || fact.listeners.length) return true;
+    return !/((^|\/)(config|configs|types|constants|styles?)(\/|$)|\.(json|ya?ml|toml|ini|css|scss|less)$)/i.test(file);
+  });
+}
+
 function labelFor(file: string): string {
   const base = path.basename(file);
   return base.replace(/\.[^.]+$/, '') || base;
 }
 
-function groupFor(file: string): string {
+function semanticDomain(file: string, fact: FileFacts): string {
+  const lower = file.toLowerCase();
+  if (fact.sql.length > 0 || /(^|\/)(db|database|prisma|migrations?|repositories?)(\/|$)/.test(lower)) return 'Database';
+  if (fact.handlers.length > 0 || fact.httpClients.length > 0 || /(^|\/)(api|server|routes?|controllers?|services?|middleware)(\/|$)/.test(lower)) return 'Backend';
+  if (/(^|\/)(functions?|lambda|workers?|jobs?|queues?)(\/|$)/.test(lower)) return 'Functions';
+  if (/(^|\/)(cloud|infra|infrastructure|deploy|terraform|\.github)(\/|$)/.test(lower)) return 'Cloud';
+  if (/(components?|pages?|screens?|views?|hooks?|contexts?|ui|styles?)(\/|$)/.test(lower)) return 'Frontend';
+  if (/\.(tsx?|jsx?|vue|svelte|astro|css|scss)$/.test(lower) && !/(config|types?|constants?)[/.]/.test(lower)) return 'Frontend';
+  return 'Core';
+}
+
+function groupFor(file: string, fact: FileFacts): string {
+  const domain = semanticDomain(file, fact);
   const directory = path.posix.dirname(file);
-  if (directory === '.') return 'Root';
-  return directory.split('/').filter(Boolean).slice(0, 3).join('/');
+  const parts = directory === '.' ? [] : directory.split('/').filter(Boolean);
+  const module = parts.filter((part) => !['src', 'app', 'lib', 'packages'].includes(part.toLowerCase())).slice(-1)[0];
+  return module && module.toLowerCase() !== domain.toLowerCase() ? `${domain}/${module}` : domain;
 }
 
 function resolveImport(source: string, specifier: string, known: Set<string>): string | undefined {
@@ -67,7 +104,7 @@ export function buildStructuralMap(facts: FileFacts[], root: string, projectName
   for (const entry of files) {
     const id = nodeId(entry.file);
     nodeByFile.set(entry.file, id);
-    nodes.push({ id, label: labelFor(entry.file), group: groupFor(entry.file), path: entry.file });
+    nodes.push({ id, label: labelFor(entry.file), group: groupFor(entry.file, entry.fact), path: entry.file });
   }
 
   const edges: StructuredEdge[] = [];
@@ -97,7 +134,7 @@ export function buildStructuralMap(facts: FileFacts[], root: string, projectName
     const stem = path.basename(entry.file).replace(/\.[^.]+$/, '').toLowerCase();
     const target = nodeByFile.get(entry.file);
     if (!target || !entryStems.has(stem)) continue;
-    edges.push({ from: 'project', to: target, label: 'starts', evidence: [{ path: entry.file, line: 1 }] });
+    edges.push({ from: 'project', to: target, label: 'contains', evidence: [{ path: entry.file, line: 1 }] });
   }
 
   return {

@@ -2,7 +2,7 @@
   "name": "dev-first",
   "displayName": "Dev-First",
   "description": "Plan-first AI coding agent — every request becomes a plan you approve before a single line changes.",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "publisher": "dev-first",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "media/icon.png",
@@ -365,11 +365,6 @@
           "default": 60,
           "description": "Maximum tool steps per execution run."
         },
-        "devFirst.plannerMaxSteps": {
-          "type": "number",
-          "default": 12,
-          "description": "Maximum exploration steps while planning."
-        },
         "devFirst.terminalTimeout": {
           "type": "number",
           "default": 120,
@@ -651,6 +646,26 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Reasoning effort for scanner operations. Empty uses a speed-first default and does not inherit the main composer."
+        },
+        "devFirst.plannerPreset": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional provider preset for planning. Empty keeps planning on the main connection."
+        },
+        "devFirst.plannerModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional model ID for planning. Empty uses the planner preset's selected model."
+        },
+        "devFirst.editorPreset": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional provider preset for approved execution/editing. Empty keeps execution on the main connection."
+        },
+        "devFirst.editorModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional model ID for approved execution/editing. Empty uses the editor preset's selected model."
         },
         "devFirst.architecturePreset": {
           "type": "string",

@@ -104,8 +104,10 @@ export class PlannerService {
     let readinessNudged = false;
     let previousToolNames: string[] = [];
     let previousToolFailed = false;
+    let previousSignature = '';
+    let repeatedSignatureCount = 0;
 
-    for (let step = 0; step < this.options.maxSteps; step++) {
+    for (let step = 0; this.options.maxSteps <= 0 || step < this.options.maxSteps; step++) {
       if (signal.aborted) {
         const abort = new Error('Aborted');
         abort.name = 'AbortError';
@@ -151,6 +153,17 @@ export class PlannerService {
         const definition = available.find((tool) => tool.name === call.name) ?? submitPlanTool;
         return { ...call, arguments: normalizeToolArguments(call.arguments, definition.parameters) };
       });
+      const signature = normalizedCalls.map((call) => `${call.name}:${call.arguments}`).join('|');
+      if (signature && signature === previousSignature) {
+        repeatedSignatureCount += 1;
+      } else {
+        previousSignature = signature;
+        repeatedSignatureCount = 1;
+      }
+      if (repeatedSignatureCount >= 3) {
+        callbacks.onNotice?.('Stopped planner repetition: the same tool request repeated without new evidence.');
+        return { text: lastText, exhausted: false, stopped: 'same-plan' };
+      }
       if (this.options.questionMode && normalizedCalls.some((call) => call.name === 'submit_plan' || call.name === 'dismiss_plan')) {
         messages.push({
           role: 'user',
@@ -257,7 +270,7 @@ export class PlannerService {
                 'LOOP RECOVERY: submit_plan was rejected twice. Do not gather more context. Call submit_plan now with the missing fields filled in.',
             });
           } else if (readinessNudged) {
-            return { text: lastText, exhausted: true, stopped: 'same-plan' };
+            return { text: lastText, exhausted: false, stopped: 'same-plan' };
           }
           continue;
         }

@@ -47,6 +47,14 @@ const CONTEXT_NUDGE_TURN_GAP = 5;
 
 import { PARALLEL_SAFE } from './parallelTools';
 
+const RETRIEVAL_SAFE = new Set([
+  ...PARALLEL_SAFE,
+  'inspect_file_context',
+  'investigate_issue',
+  'bounded_investigation',
+  'verify_change',
+]);
+
 const STALE_READ_MARKER = '[outdated — this file changed after it was read; re-read it if needed]';
 
 function normalizeLoopText(text: string): string {
@@ -115,6 +123,9 @@ export interface AgentOptions {
   profileReasoning?: boolean;
   finishCheck?: (summary: FinishCheckSummary) => FinishGateResult | Promise<FinishGateResult>;
   taskState?: { state: string; completedSteps: number[]; nextSteps: number[]; blockers: string[] };
+  ledger?: string;
+  /** Maximum bounded read-only evidence refinement rounds before editing. */
+  retrievalPasses?: number;
 }
 
 export class AgentService {
@@ -170,11 +181,20 @@ export class AgentService {
     let lastProgressAt = Date.now();
     let toolCallIndex = 0;
     let completedTodoSteps = 0;
+    let retrievalPasses = 0;
     const callIndexById = new Map<string, number>();
     const deferredLoopWarnings = new Map<string, string>();
     const seenToolEvidence = new Set<string>();
     const progressLog: Array<{ callIndex: number; description: string; fingerprint: string }> = [];
     const observedChecks = new Set(this.toolbox.adaptiveVerificationSnapshot?.().verificationRan ?? []);
+
+    const localization = await this.localizePlanTargets(plan, signal, callbacks);
+    if (localization) {
+      messages.push({ role: 'system', content: localization });
+    }
+    if (this.options.ledger) {
+      messages.push({ role: 'system', content: this.options.ledger });
+    }
 
     const progressDescription = (): string =>
       progressLog.length > 0 ? progressLog[progressLog.length - 1].description : 'run start';
@@ -627,6 +647,15 @@ export class AgentService {
           messages.push({ role: 'user', content: deferredWarning });
         }
       }
+      const readOnlyTurn = normalizedCalls.length > 0 && normalizedCalls.every((call) => RETRIEVAL_SAFE.has(call.name));
+      const retrievalLimit = Math.max(0, this.options.retrievalPasses ?? 2);
+      if (readOnlyTurn && turnMadeProgress && retrievalPasses < retrievalLimit) {
+        retrievalPasses += 1;
+        messages.push({
+          role: 'system',
+          content: `Retrieval pass ${retrievalPasses}/${retrievalLimit} completed. Use the new evidence to localize the exact symbol or range before editing; do not repeat an identical read.`,
+        });
+      }
       const convergence = this.convergence.observe({
         signature: normalizedCalls.map((call) => `${call.name}:${call.arguments}`).join('|'),
         producedOutput: true,
@@ -681,6 +710,39 @@ export class AgentService {
       });
       return compacted;
     }
+  }
+
+  private async localizePlanTargets(
+    plan: Plan,
+    signal: AbortSignal,
+    callbacks: AgentCallbacks,
+  ): Promise<string | undefined> {
+    const targets = [...new Set((plan.expectedFiles ?? [])
+      .map((file) => file.path.trim())
+      .filter(Boolean))].slice(0, 8);
+    if (targets.length === 0) return undefined;
+    const context = {
+      requestTerminalApproval: async (): Promise<TerminalApprovalDecision> => 'deny',
+      requestExternalDirectoryApproval: async (): Promise<boolean> => false,
+      signal,
+    };
+    const results = await Promise.all(targets.map(async (file) => {
+      try {
+        const text = await this.toolbox.execute('document_symbols', JSON.stringify({ path: file }), context);
+        if (text.startsWith('Error:')) return undefined;
+        return `File ${file}:\n${text.slice(0, 1200)}`;
+      } catch {
+        return undefined;
+      }
+    }));
+    const useful = results.filter((value): value is string => Boolean(value));
+    if (useful.length === 0) return undefined;
+    callbacks.onNotice?.(`Localized ${useful.length} planned file${useful.length === 1 ? '' : 's'} to their symbols before editing.`);
+    return [
+      '[Deterministic edit localization]',
+      'The following symbol trees came from the language service. Use them to target exact functions; verify contents before changing them.',
+      ...useful,
+    ].join('\n\n').slice(0, 7000);
   }
 
   private async forceCompact(

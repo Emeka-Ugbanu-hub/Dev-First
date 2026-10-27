@@ -41,6 +41,7 @@ export interface PinnedPlannerContext {
   pending?: PendingDecisionRecord;
   changedFiles: string[];
   diagnosticsSummary?: string;
+  ledger?: string;
   taskState?: { state: string; completedSteps: number[]; nextSteps: number[]; blockers: string[] };
 }
 
@@ -206,6 +207,13 @@ function selectWithAnchors(
   const older = conversation.slice(0, recentStart);
   const metadata = metadataFor(conversation, contextIndex);
   const anchors = anchorsFor(content(latest), pendingDecisionIds);
+  // Low-information turns should never pull an old task back into the
+  // request. Keep only the immediate exchange instead of forwarding the
+  // entire recent tail to a small model. This is intentionally structural,
+  // not a fixed acknowledgement-word list.
+  if (content(latest).trim().length <= 16 && anchors.paths.size === 0 && anchors.symbols.size === 0 && anchors.terms.size <= 1) {
+    return { messages: conversation.slice(-2), retrieved: false, ambiguous: false };
+  }
   const candidates: Candidate[] = older.map((message, index) => {
     const entry = metadata(message, index);
     const recency = (index / Math.max(1, older.length)) * RECENCY_WEIGHT;
@@ -280,6 +288,9 @@ export function pinnedContextMessage(pinned: PinnedPlannerContext): ChatMessage 
   if (pinned.diagnosticsSummary) {
     lines.push(`Diagnostics: ${pinned.diagnosticsSummary}`);
   }
+  if (pinned.ledger) {
+    lines.push(pinned.ledger);
+  }
   if (pinned.taskState) {
     lines.push(`Task state: ${pinned.taskState.state}`);
     lines.push(`Completed steps: ${pinned.taskState.completedSteps.join(', ') || 'none'}`);
@@ -302,6 +313,8 @@ export interface PlannerRequestInput {
   pinned?: PinnedPlannerContext;
   compact?: (messages: ChatMessage[]) => ChatMessage[];
   completedRunBoundary?: boolean;
+  /** Deterministic, request-scoped scanner evidence. */
+  evidence?: string;
 }
 
 export interface PlannerRequestResult {
@@ -326,6 +339,9 @@ export function composePlannerRequest(input: PlannerRequestInput): PlannerReques
   }
   if (input.pinned) {
     messages.push(pinnedContextMessage(input.pinned));
+  }
+  if (input.evidence) {
+    messages.push({ role: 'system', content: input.evidence });
   }
   if (selection.summary) {
     messages.push({ role: 'system', content: selection.summary });

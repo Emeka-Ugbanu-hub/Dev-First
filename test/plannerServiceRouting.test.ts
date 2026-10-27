@@ -258,7 +258,7 @@ describe('PlannerService single-turn intent handling', () => {
     const result = await planner(provider).plan(request, null, 1, callbacks(), new AbortController().signal);
 
     expect(result.plan).toBeUndefined();
-    expect(result.exhausted).toBe(true);
+    expect(result.exhausted).toBe(false);
     expect(result.stopped).toBe('same-plan');
     expect(provider.calls).toHaveLength(3);
     expect(provider.calls[2].messages.some(
