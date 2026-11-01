@@ -1,15 +1,21 @@
 import { createHash } from 'node:crypto';
 import type { MapPaths, StructuredMap } from './mapValidate';
-import type { ArchitectureScanCoverage } from '../scan/duplication';
+import type { ArchitectureScanCoverage, FileFacts } from '../scan/duplication';
 
 export interface ArchitectureMapCoverage extends ArchitectureScanCoverage {
   indexedFiles: number;
   representedFiles: number;
   unresolvedRelationships: number;
+  isolatedFiles?: number;
+  unclassifiedFiles?: number;
+  excludedFiles?: number;
+  fingerprint?: string;
 }
 
+export const ARCHITECTURE_MAP_VERSION = 5 as const;
+
 export interface StoredArchitectureMap {
-  version: 3;
+  version: typeof ARCHITECTURE_MAP_VERSION;
   /** Absolute workspace root that produced this map. Older maps omit this and are ignored by the panel. */
   workspaceRoot?: string;
   filesHash: string;
@@ -28,6 +34,26 @@ export function architectureFilesHash(files: string[]): string {
   return createHash('sha1').update(unique.join('\n')).digest('hex');
 }
 
+/** Hash architecture-relevant facts so content edits invalidate the stored map. */
+export function architectureFactsHash(facts: FileFacts[]): string {
+  const entries = facts
+    .map((fact) => ({
+      file: fact.file,
+      imports: fact.imports,
+      exports: fact.exports,
+      handlers: fact.handlers,
+      sql: fact.sql,
+      httpClients: fact.httpClients,
+      httpCalls: fact.httpCalls,
+      listeners: fact.listeners,
+      storageKeys: fact.storageKeys,
+      rustModules: fact.rustModules,
+      tauriCommandRegistrations: fact.tauriCommandRegistrations,
+    }))
+    .sort((a, b) => a.file.localeCompare(b.file));
+  return createHash('sha1').update(JSON.stringify(entries)).digest('hex');
+}
+
 export function readStoredMap(state: {
   get<T>(key: string): T | undefined;
 }): StoredArchitectureMap | undefined {
@@ -36,7 +62,7 @@ export function readStoredMap(state: {
     return undefined;
   }
   const candidate = stored as Partial<StoredArchitectureMap> & { paths?: unknown };
-  if (candidate.version !== 3) {
+  if (candidate.version !== ARCHITECTURE_MAP_VERSION) {
     return undefined;
   }
   if (
@@ -80,7 +106,7 @@ export function readStoredMap(state: {
     return undefined;
   }
   return {
-    version: 3,
+    version: ARCHITECTURE_MAP_VERSION,
     ...(typeof candidate.workspaceRoot === 'string' ? { workspaceRoot: candidate.workspaceRoot } : {}),
     filesHash: candidate.filesHash,
     mermaid: candidate.mermaid,
@@ -96,6 +122,10 @@ export function readStoredMap(state: {
       oversizedSourceFiles: coverage.oversizedSourceFiles as number,
       scanLimitReached: coverage.scanLimitReached,
       unresolvedRelationships: coverage.unresolvedRelationships as number,
+      ...(typeof coverage.isolatedFiles === 'number' ? { isolatedFiles: coverage.isolatedFiles } : {}),
+      ...(typeof coverage.unclassifiedFiles === 'number' ? { unclassifiedFiles: coverage.unclassifiedFiles } : {}),
+      ...(typeof coverage.excludedFiles === 'number' ? { excludedFiles: coverage.excludedFiles } : {}),
+      ...(typeof coverage.fingerprint === 'string' ? { fingerprint: coverage.fingerprint } : {}),
     },
   };
 }

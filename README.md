@@ -23,9 +23,9 @@ The developer directs the work throughout: the agent can inspect, explain, sugge
 
 ### Architecture mapping
 
-The Architecture view gives the project a visual map of its domains, subsystems, components, and relationships. It helps answer questions such as “where does this request start?”, “which part owns this behavior?”, and “what could this change affect?”
+The Architecture view gives the project a visual map of its layers, modules, files, routes, and verified relationships. It helps answer questions such as “where does this request start?”, “which part owns this behavior?”, and “what could this change affect?”
 
-You can generate, refresh, and open the map from the Dev-First view. The map records coverage and can show when the underlying project has changed, so it remains a guide to the current codebase rather than an old snapshot. Use a dedicated architecture provider and model when a separate model is better suited to system-level understanding.
+The map is built deterministically from scanner facts and imports, so it needs no model or provider call and produces the same result for the same code. Drill from project to layer to module to file; routes and IPC commands appear where they are handled, and connections outside a group stay visible in the related-groups panel, while system targets such as events, database, storage, and external services appear separately with their connected files. Module levels use a file list with in/out counts and focused relationships, so large folders do not become a graph that needs zooming and panning. Folder roles follow the deepest semantic folder, so `utils/services/billing` is placed under Services/Billing instead of staying under Utils. Ambiguous files are inferred from imports and file evidence when possible, and otherwise stay visible under Unclassified. The map records coverage, unresolved relationships, and when the underlying project has changed.
 
 ### Scanner
 
@@ -57,7 +57,6 @@ Use a hosted provider or a local model through Ollama or LM Studio. Connect one 
 
 - **Main model:** chat, planning, and execution.
 - **Scanner model:** code and risk scanning.
-- **Architecture model:** architecture mapping and system understanding.
 - **Autocomplete model:** inline completions, with chat fallback when supported.
 
 Each role can have its own provider, model, and supported reasoning level, or inherit the main connection. Live model metadata is used when available, with cached information when a provider is temporarily unavailable.
@@ -85,7 +84,7 @@ You can add workspace rules, reusable skills, commands, and project notes under 
 
 1. Install the extension and open the **Dev-First** view in VS Code.
 2. Connect a provider in the panel. Hosted providers use their API key; Ollama and LM Studio can run locally without one.
-3. Choose the main model, then optionally choose separate Scanner, Architecture, and Autocomplete models in settings.
+3. Choose the main model, then optionally choose separate Scanner and Autocomplete models in settings.
 4. Ask a question or describe the work.
 
 Useful commands include **Open Chat**, **New Session**, **Explain Selection**, **Fix Selection**, **Scan File**, **Open Architecture**, **Refresh Architecture**, **Build Semantic Index**, **Select Model**, and **Export Transcript**.
@@ -100,13 +99,14 @@ Open the **gear icon** for the in-panel settings view: **Provider** (connection 
 | --- | --- | --- |
 | `devFirst.preset` | `openai` | Provider preset: `openai`, `anthropic`, `gemini`, `openrouter`, `groq`, `deepseek`, `ollama`, `lmstudio`, `custom` (normally set from the panel) |
 | `devFirst.model` | `gpt-4o` | Model id used for chat, planning, and execution |
+| `devFirst.plannerModel` | `""` | Separate model for planning; empty keeps the main model |
+| `devFirst.plannerPreset` | `""` | Provider preset used by the planner when set |
+| `devFirst.editorModel` | `""` | Separate model for approved execution; empty keeps the main model |
+| `devFirst.editorPreset` | `""` | Provider preset used for approved execution when set |
 | `devFirst.baseUrl` | provider default | Custom API base URL (e.g. OpenRouter, Ollama) |
 | `devFirst.scanPreset` | `""` | Provider for scanner operations; empty inherits the main connection |
 | `devFirst.scanModel` | `""` | Model for scanner operations; empty uses the scanner connection model |
 | `devFirst.scanReasoningEffort` | `""` | Reasoning effort for the scanner model; empty inherits the main setting |
-| `devFirst.architecturePreset` | `""` | Provider for architecture mapping; empty inherits the main connection |
-| `devFirst.architectureModel` | `""` | Model for architecture mapping; empty uses the architecture connection model |
-| `devFirst.architectureReasoningEffort` | `""` | Reasoning effort for the architecture model; empty inherits the main setting |
 
 ### Safety, behavior, and accuracy
 
@@ -130,7 +130,7 @@ Open the **gear icon** for the in-panel settings view: **Provider** (connection 
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `devFirst.adaptiveVerify` | `true` | Escalate verification automatically after edits: diagnostics, related files, closest tests, then the project typecheck or test command |
+| `devFirst.adaptiveVerify` | `true` | Verify as edits land: diagnostics and related-file checks stay immediate, while project typecheck/test/lint runs once at finish; a failed finish asks before completing |
 | `devFirst.typecheckCommand` | `""` | Typecheck command for `verify_change`; empty auto-detects |
 | `devFirst.testCommand` | `""` | Test command for `verify_change`; empty auto-detects |
 | `devFirst.lintCommand` | `""` | Lint command for `verify_change`; empty auto-detects |
@@ -144,6 +144,7 @@ Open the **gear icon** for the in-panel settings view: **Provider** (connection 
 | `devFirst.contextLimitTokens` | `128000` | Fallback context window used only when the model is not in the model catalog |
 | `devFirst.localContextCapTokens` | `32768` | Optional maximum context for local models; `0` disables the cap and the effective limit never exceeds the model or Modelfile context |
 | `devFirst.contextProfile` | `auto` | `auto` derives the tier from the model window, or force `compact`, `standard`, `large` |
+| `devFirst.plannerThinking` | `auto` | Planner thinking policy: `auto` skips planner thinking on local models and uses bounded evidence-based effort routing elsewhere; `off` disables it everywhere; `on` honors the selected effort. Explicit run overrides win |
 | `devFirst.pasteFileLines` | `120` | Pasted text longer than this many lines is saved under `.dev-first/pastes` instead of filling the prompt |
 | `devFirst.warmOnFocus` | `true` | Warm up the local Ollama model when the chat input gains focus, so the first response starts without a cold load |
 

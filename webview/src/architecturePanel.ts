@@ -1,11 +1,71 @@
 import mermaid from 'mermaid';
 
+const MIN_READABLE_SCALE = 0.8;
+
+interface LevelLink {
+  label: string;
+  path?: string;
+  groupPath?: string[];
+  route?: boolean;
+  system?: boolean;
+  labels: string[];
+  count: number;
+}
+
+interface LevelGroupItem {
+  kind: 'group';
+  id: string;
+  label: string;
+  path: string[];
+  fileCount: number;
+  routeCount: number;
+}
+
+interface LevelFileItem {
+  kind: 'file';
+  id: string;
+  label: string;
+  path?: string;
+  route: boolean;
+  inCount: number;
+  outCount: number;
+  uses: LevelLink[];
+  usedBy: LevelLink[];
+}
+
+type LevelItem = LevelGroupItem | LevelFileItem;
+
+interface LevelRelated {
+  label: string;
+  path: string[];
+  count: number;
+  labels: string[];
+}
+
+interface LevelSystemFile {
+  label: string;
+  path: string;
+  labels: string[];
+  count: number;
+}
+
+interface LevelSystemTarget {
+  label: string;
+  path: string[];
+  count: number;
+  files: LevelSystemFile[];
+}
+
 interface MapMessage {
   type: 'map';
   mermaid: string;
   paths: Record<string, string>;
   groups?: Record<string, string[]>;
   breadcrumbs?: Array<{ label: string; path: string[] }>;
+  kind?: 'project' | 'layer' | 'files';
+  items?: LevelItem[];
+  related?: LevelRelated[];
+  systemTargets?: LevelSystemTarget[];
   stale: boolean;
   generatedAt: number;
   model: string;
@@ -17,7 +77,13 @@ interface MapMessage {
     oversizedSourceFiles: number;
     scanLimitReached: boolean;
     unresolvedRelationships: number;
+    isolatedFiles?: number;
+    unclassifiedFiles?: number;
+    excludedFiles?: number;
+    fingerprint?: string;
   };
+  hiddenEdges?: number;
+  totalEdges?: number;
 }
 
 interface EmptyMessage {
@@ -39,7 +105,7 @@ interface ErrorMessage {
   hasMap: boolean;
 }
 
-type IncomingMessage = MapMessage | EmptyMessage | GeneratingMessage | ErrorMessage | { type: 'raw'; text?: string };
+type IncomingMessage = MapMessage | EmptyMessage | GeneratingMessage | ErrorMessage;
 
 declare function acquireVsCodeApi(): { postMessage(message: unknown): void };
 
@@ -52,12 +118,26 @@ const hint = document.getElementById('df-hint');
 const status = document.getElementById('df-status');
 const banner = document.getElementById('df-banner');
 const diagram = document.getElementById('df-diagram');
+const cards = document.getElementById('df-cards');
+const files = document.getElementById('df-files');
+const side = document.getElementById('df-side');
+const backButton = document.getElementById('df-back') as HTMLButtonElement | null;
+const zoomInButton = document.getElementById('df-zoom-in') as HTMLButtonElement | null;
+const zoomOutButton = document.getElementById('df-zoom-out') as HTMLButtonElement | null;
+const zoomFitButton = document.getElementById('df-zoom-fit') as HTMLButtonElement | null;
 
 let paths: Record<string, string> = {};
 let hasMap = false;
 let lastError: ErrorMessage | undefined;
 let groups: Record<string, string[]> = {};
 let crumbs: Array<{ label: string; path: string[] }> = [];
+let levelKind: 'project' | 'layer' | 'files' = 'project';
+let items: LevelItem[] = [];
+let related: LevelRelated[] = [];
+let systemTargets: LevelSystemTarget[] = [];
+let selectedFileId: string | undefined;
+let currentPath: string[] = [];
+let backStack: string[][] = [];
 let viewScale = 1;
 let viewX = 0;
 let viewY = 0;
@@ -206,7 +286,11 @@ function wireNodes(): void {
     const group = id ? groups[id] : undefined;
     if (group) {
       element.classList.add('df-clickable');
-      element.addEventListener('click', () => post({ type: 'drillDown', id }));
+      element.addEventListener('click', () => {
+        backStack.push(currentPath);
+        updateBackButton();
+        post({ type: 'drillDown', id });
+      });
       return;
     }
     const target = id ? paths[id] : undefined;
@@ -229,6 +313,213 @@ function renderCrumbs(): void {
       return `<button type="button" data-index="${index}"${last ? ' disabled' : ''}>${escapeHtml(crumb.label)}</button>`;
     })
     .join('<span>/</span>');
+}
+
+function updateBackButton(): void {
+  if (backButton) {
+    backButton.disabled = backStack.length === 0;
+  }
+}
+
+function goBack(): void {
+  const previous = backStack.pop();
+  if (!previous) {
+    updateBackButton();
+    return;
+  }
+  updateBackButton();
+  post({ type: 'navigate', targetPath: previous });
+}
+
+function goTo(target: string[]): void {
+  if (target.join('/') === currentPath.join('/')) {
+    return;
+  }
+  backStack.push(currentPath);
+  updateBackButton();
+  post({ type: 'navigate', targetPath: target });
+}
+
+function setStateMode(): void {
+  if (diagram) diagram.hidden = false;
+  if (cards) cards.hidden = true;
+  if (files) files.hidden = true;
+  if (side) side.hidden = true;
+  for (const button of [zoomInButton, zoomOutButton, zoomFitButton, exportButton]) {
+    if (button) button.disabled = true;
+  }
+}
+
+function setGraphMode(): void {
+  if (diagram) diagram.hidden = false;
+  if (cards) cards.hidden = true;
+  if (files) files.hidden = true;
+  if (side) side.hidden = true;
+  for (const button of [zoomInButton, zoomOutButton, zoomFitButton]) {
+    if (button) button.disabled = false;
+  }
+  if (exportButton) exportButton.disabled = false;
+}
+
+function setCardsMode(): void {
+  if (diagram) {
+    diagram.hidden = true;
+    diagram.innerHTML = '';
+  }
+  if (cards) cards.hidden = false;
+  if (files) files.hidden = true;
+  if (side) side.hidden = false;
+  for (const button of [zoomInButton, zoomOutButton, zoomFitButton]) {
+    if (button) button.disabled = true;
+  }
+  if (exportButton) exportButton.disabled = true;
+}
+
+function setFilesMode(): void {
+  if (diagram) {
+    diagram.hidden = true;
+    diagram.innerHTML = '';
+  }
+  if (cards) cards.hidden = true;
+  if (files) files.hidden = false;
+  if (side) side.hidden = false;
+  for (const button of [zoomInButton, zoomOutButton, zoomFitButton]) {
+    if (button) button.disabled = true;
+  }
+  if (exportButton) exportButton.disabled = true;
+}
+
+function renderCards(): void {
+  if (!cards) {
+    return;
+  }
+  cards.innerHTML = items
+    .filter((item): item is LevelGroupItem => item.kind === 'group')
+    .map((item) => {
+      const meta = item.routeCount > 0 && item.fileCount === 0
+        ? `${item.routeCount} routes`
+        : `${item.fileCount} files${item.routeCount > 0 ? ` · ${item.routeCount} routes` : ''}`;
+      return `<button type="button" class="df-card" data-nav-path="${escapeHtml(item.path.join('/'))}">
+        <span class="df-card-title">${escapeHtml(item.label)}</span>
+        <span class="df-card-meta">${escapeHtml(meta)}</span>
+      </button>`;
+    })
+    .join('');
+}
+
+function renderFiles(): void {
+  if (!files) {
+    return;
+  }
+  files.innerHTML = items
+    .filter((item): item is LevelFileItem => item.kind === 'file')
+    .map((item) => {
+      const selected = item.id === selectedFileId ? ' df-selected' : '';
+      const open = item.path
+        ? `<button type="button" class="df-file-open" data-open-path="${escapeHtml(item.path)}">Open</button>`
+        : '<span></span>';
+      return `<div class="df-file-row${selected}" data-file-id="${escapeHtml(item.id)}">
+        <span>
+          <span class="df-file-name">${escapeHtml(item.label)}${item.route ? '<span class="df-badge">route</span>' : ''}</span>
+          <span class="df-file-path">${escapeHtml(item.path ?? '')}</span>
+        </span>
+        <span class="df-file-counts">${item.inCount} in · ${item.outCount} out</span>
+        ${open}
+      </div>`;
+    })
+    .join('');
+}
+
+function linkRow(link: LevelLink): string {
+  const meta = `${link.labels.join(', ')}${link.count > 1 ? ` · ${link.count}` : ''}`;
+  if (link.system) {
+    return `<div class="df-link-row df-system-link">
+      <span>${escapeHtml(link.label)} (system)</span>
+      <span class="df-link-meta">${escapeHtml(meta)}</span>
+    </div>`;
+  }
+  if (link.path) {
+    return `<button type="button" class="df-link-row" data-open-path="${escapeHtml(link.path)}">
+      <span>${escapeHtml(link.label)}${link.route ? ' (route)' : ''}</span>
+      <span class="df-link-meta">${escapeHtml(meta)}</span>
+    </button>`;
+  }
+  if (link.groupPath) {
+    return `<button type="button" class="df-link-row" data-nav-path="${escapeHtml(link.groupPath.join('/'))}">
+      <span>${escapeHtml(link.label)}</span>
+      <span class="df-link-meta">${escapeHtml(meta)}</span>
+    </button>`;
+  }
+  return '';
+}
+
+function relatedRows(): string {
+  return related
+    .map((entry) => `<button type="button" class="df-related-row" data-nav-path="${escapeHtml(entry.path.join('/'))}">
+      <span class="df-related-name">${escapeHtml(entry.label)}</span>
+      <span class="df-related-parent">${escapeHtml(entry.path.slice(0, -1).join(' / '))}</span>
+      <span class="df-related-count">${entry.count} ${entry.count === 1 ? 'link' : 'links'}</span>
+    </button>`)
+    .join('');
+}
+
+function systemRows(): string {
+  return systemTargets
+    .map((target) => `<div class="df-system-target">
+      <div class="df-system-head">
+        <span class="df-system-name">${escapeHtml(target.label)}</span>
+        <span class="df-system-count">${target.count} ${target.count === 1 ? 'link' : 'links'}</span>
+      </div>
+      ${target.files.map((file) => `<button type="button" class="df-link-row" data-open-path="${escapeHtml(file.path)}">
+        <span>${escapeHtml(file.label)}</span>
+        <span class="df-link-meta">${escapeHtml(file.labels.join(', '))}</span>
+      </button>`).join('')}
+    </div>`)
+    .join('');
+}
+
+function renderSide(): void {
+  if (!side) {
+    return;
+  }
+  if (levelKind === 'project') {
+    side.hidden = true;
+    side.innerHTML = '';
+    return;
+  }
+  const selected = items.find(
+    (item): item is LevelFileItem => item.kind === 'file' && item.id === selectedFileId,
+  );
+  const parts: string[] = [];
+  if (selected) {
+    parts.push(`<div class="df-side-head">
+      <strong>${escapeHtml(selected.label)}</strong>
+      <span class="df-side-path">${escapeHtml(selected.path ?? '')}</span>
+      ${selected.path ? `<button type="button" class="df-action df-side-open" data-open-path="${escapeHtml(selected.path)}">Open file</button>` : ''}
+    </div>`);
+    parts.push(`<div class="df-side-section"><h3>Uses</h3>${
+      selected.uses.length > 0
+        ? selected.uses.map(linkRow).join('')
+        : '<div class="df-side-empty">No outgoing relationships.</div>'
+    }</div>`);
+    parts.push(`<div class="df-side-section"><h3>Used by</h3>${
+      selected.usedBy.length > 0
+        ? selected.usedBy.map(linkRow).join('')
+        : '<div class="df-side-empty">Nothing imports or calls this file.</div>'
+    }</div>`);
+  } else if (levelKind === 'files') {
+    parts.push('<div class="df-side-empty">Select a file to see what it uses and what uses it.</div>');
+  }
+  if (related.length > 0) {
+    parts.push(`<div class="df-side-section"><h3>Related groups</h3>${relatedRows()}</div>`);
+  } else if (levelKind === 'layer') {
+    parts.push('<div class="df-side-empty">No external relationships from this level.</div>');
+  }
+  if (systemTargets.length > 0) {
+    parts.push(`<div class="df-side-section"><h3>System targets</h3>${systemRows()}</div>`);
+  }
+  side.innerHTML = parts.join('');
+  side.hidden = false;
 }
 
 function applyTransform(): void {
@@ -254,7 +545,9 @@ function fitDiagram(): void {
   if (baseWidth <= 0 || baseHeight <= 0 || container.width <= 0) {
     return;
   }
-  viewScale = Math.max(0.1, Math.min(container.width / baseWidth, container.height / baseHeight, 1.25));
+  // Fit only when the graph is already readable. For dense maps, keep a
+  // minimum scale and let the user pan instead of reducing labels to pixels.
+  viewScale = Math.max(MIN_READABLE_SCALE, Math.min(container.width / baseWidth, container.height / baseHeight, 1.25));
   viewX = Math.max(0, (container.width - baseWidth * viewScale) / 2);
   viewY = Math.max(0, (container.height - baseHeight * viewScale) / 2);
   applyTransform();
@@ -279,16 +572,26 @@ async function renderMap(message: MapMessage): Promise<void> {
   paths = message.paths ?? {};
   groups = message.groups ?? {};
   crumbs = message.breadcrumbs ?? [];
+  levelKind = message.kind ?? 'project';
+  items = message.items ?? [];
+  related = message.related ?? [];
+  systemTargets = message.systemTargets ?? [];
+  if (!items.some((item) => item.kind === 'file' && item.id === selectedFileId)) {
+    selectedFileId = undefined;
+  }
+  currentPath = crumbs[crumbs.length - 1]?.path ?? [];
   hasMap = true;
   renderCrumbs();
+  updateBackButton();
   progressLines = [];
   hideBanner();
   setRefreshing(false);
   const missing = message.coverage
-    ? Math.max(0, message.coverage.indexedFiles - message.coverage.representedFiles)
+    ? Math.max(0, message.coverage.excludedFiles ?? message.coverage.indexedFiles - message.coverage.representedFiles)
     : 0;
   const coverageNotes: string[] = [];
-  if (missing > 0) coverageNotes.push(`${missing} indexed files not shown`);
+  if (message.coverage?.fingerprint) coverageNotes.push(message.coverage.fingerprint);
+  if (missing > 0) coverageNotes.push(`${missing} test/support files excluded`);
   if (message.coverage && message.coverage.unsupportedSourceFiles > 0) {
     coverageNotes.push(`${message.coverage.unsupportedSourceFiles} unsupported`);
   }
@@ -296,40 +599,66 @@ async function renderMap(message: MapMessage): Promise<void> {
     coverageNotes.push(`${message.coverage.parseFailures} parse failures`);
   }
   if (message.coverage?.scanLimitReached) coverageNotes.push('scan limit reached');
+  if (levelKind === 'project' && (message.hiddenEdges ?? 0) > 0) {
+    coverageNotes.push(`${message.hiddenEdges} of ${message.totalEdges ?? 0} relationships hidden`);
+  }
+  if ((message.coverage?.isolatedFiles ?? 0) > 0) {
+    coverageNotes.push(`${message.coverage?.isolatedFiles} files with no links`);
+  }
+  if ((message.coverage?.unclassifiedFiles ?? 0) > 0) {
+    coverageNotes.push(`${message.coverage?.unclassifiedFiles} files need placement`);
+  }
   const coverageHint = coverageNotes.join(' · ');
   setHint(message.stale ? 'code changed — reload to update' : coverageHint);
-  if (!diagram) {
-    return;
-  }
-  if (message.mermaid === lastMermaid) {
-    setStatus('');
-    return;
-  }
-  lastMermaid = message.mermaid;
-  const token = ++renderToken;
-  setStatus('Rendering…');
-  ensureInit();
-  try {
-    const id = `df-architecture-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const { svg } = await mermaid.render(id, message.mermaid);
-    if (token !== renderToken || !diagram) {
+
+  if (levelKind === 'project') {
+    setGraphMode();
+    if (!diagram) {
       return;
     }
-    diagram.innerHTML = svg;
-    wireNodes();
-    viewScale = 1;
-    viewX = 0;
-    viewY = 0;
-    applyTransform();
-    requestAnimationFrame(() => fitDiagram());
-    clearRenderingStatus();
-  } catch {
-    if (token !== renderToken || !diagram) {
+    if (message.mermaid === lastMermaid) {
+      setStatus('');
       return;
     }
-    diagram.innerHTML = `<pre class="df-fallback">${escapeHtml(message.mermaid)}</pre>`;
-    setStatus('Diagram unavailable');
+    lastMermaid = message.mermaid;
+    const token = ++renderToken;
+    setStatus('Rendering…');
+    ensureInit();
+    try {
+      const id = `df-architecture-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const { svg } = await mermaid.render(id, message.mermaid);
+      if (token !== renderToken || !diagram) {
+        return;
+      }
+      diagram.innerHTML = svg;
+      wireNodes();
+      viewScale = 1;
+      viewX = 0;
+      viewY = 0;
+      applyTransform();
+      requestAnimationFrame(() => fitDiagram());
+      clearRenderingStatus();
+    } catch {
+      if (token !== renderToken || !diagram) {
+        return;
+      }
+      diagram.innerHTML = `<pre class="df-fallback">${escapeHtml(message.mermaid)}</pre>`;
+      setStatus('Diagram unavailable');
+    }
+    return;
   }
+
+  lastMermaid = '';
+  renderToken++;
+  if (levelKind === 'layer') {
+    setCardsMode();
+    renderCards();
+  } else {
+    setFilesMode();
+    renderFiles();
+  }
+  renderSide();
+  setStatus('');
 }
 
 function renderEmpty(message: EmptyMessage): void {
@@ -339,19 +668,26 @@ function renderEmpty(message: EmptyMessage): void {
   lastMermaid = '';
   progressLines = [];
   renderToken++;
+  items = [];
+  related = [];
+  systemTargets = [];
+  selectedFileId = undefined;
+  levelKind = 'project';
+  currentPath = [];
+  backStack = [];
+  updateBackButton();
   hideBanner();
   setRefreshing(false);
   setHint('');
   setStatus('');
+  setStateMode();
   if (!diagram) {
     return;
   }
   const note =
-    message.reason === 'no-model'
-      ? '<p class="df-state-note">Connect a model to draw the architecture</p>'
-      : message.reason === 'no-facts'
-        ? '<p class="df-state-note">Nothing indexed yet. Open or scan a source file, then try again.</p><button id="df-generate" class="df-action" type="button">Generate</button>'
-        : '<button id="df-generate" class="df-action" type="button">Generate</button>';
+    message.reason === 'no-facts'
+      ? '<p class="df-state-note">Nothing indexed yet. Open or scan a source file, then retry.</p><button id="df-generate" class="df-action" type="button">Retry</button>'
+      : '<p class="df-state-note">The verified map is ready to rebuild.</p><button id="df-generate" class="df-action" type="button">Retry</button>';
   diagram.innerHTML = `<div class="df-state"><h2>${escapeHtml(projectName)}</h2><p>Draw this codebase</p>${note}</div>`;
 }
 
@@ -366,10 +702,13 @@ function renderGenerating(message: GeneratingMessage): void {
       progressLines.shift();
     }
   }
-  if (message.hasMap && hasMap && diagram?.querySelector('svg')) {
+  if (message.hasMap && hasMap) {
     setStatus(line);
     return;
   }
+  setStateMode();
+  backStack = [];
+  updateBackButton();
   if (!diagram) {
     return;
   }
@@ -381,7 +720,7 @@ function renderGenerating(message: GeneratingMessage): void {
 
 function renderError(message: ErrorMessage): void {
   setRefreshing(false);
-  if (message.hasMap && hasMap && diagram?.querySelector('svg')) {
+  if (message.hasMap && hasMap) {
     setStatus('');
     showBanner(message.message);
     return;
@@ -389,10 +728,13 @@ function renderError(message: ErrorMessage): void {
   hasMap = false;
   setHint('');
   setStatus('');
+  setStateMode();
+  backStack = [];
+  updateBackButton();
   if (!diagram) {
     return;
   }
-  diagram.innerHTML = `<div class="df-state"><h2>${escapeHtml(projectName)}</h2><p class="df-error">${escapeHtml(message.message)}</p><button id="df-retry" class="df-action" type="button">Retry</button> <button id="df-raw" class="df-action" type="button">Show raw output</button></div>`;
+  diagram.innerHTML = `<div class="df-state"><h2>${escapeHtml(projectName)}</h2><p class="df-error">${escapeHtml(message.message)}</p><button id="df-retry" class="df-action" type="button">Retry</button></div>`;
   lastError = message;
 }
 
@@ -417,11 +759,6 @@ window.addEventListener('message', (event: MessageEvent) => {
     renderError(message);
     return;
   }
-  if (message.type === 'raw') {
-    if (diagram) {
-      diagram.innerHTML = `<div class="df-state"><h2>${escapeHtml(projectName)}</h2><p class="df-state-note">Raw model output</p><pre class="df-raw">${escapeHtml(message.text || 'No raw output available.')}</pre><button id="df-raw-back" class="df-action" type="button">Back</button></div>`;
-    }
-  }
 });
 
 diagram?.addEventListener('click', (event) => {
@@ -430,14 +767,59 @@ diagram?.addEventListener('click', (event) => {
     post({ type: 'generate' });
     return;
   }
-  if (target?.closest('#df-raw')) {
-    post({ type: 'showRaw' });
+});
+
+function navPathFrom(element: HTMLElement): string[] | undefined {
+  const raw = element.closest<HTMLElement>('[data-nav-path]')?.getAttribute('data-nav-path');
+  if (raw === null || raw === undefined) {
+    return undefined;
+  }
+  return raw ? raw.split('/') : [];
+}
+
+backButton?.addEventListener('click', goBack);
+
+cards?.addEventListener('click', (event) => {
+  const target = event.target as HTMLElement | null;
+  const path = target ? navPathFrom(target) : undefined;
+  if (path) {
+    goTo(path);
+  }
+});
+
+files?.addEventListener('click', (event) => {
+  const target = event.target as HTMLElement | null;
+  const open = target?.closest<HTMLElement>('[data-open-path]');
+  if (open) {
+    const path = open.getAttribute('data-open-path');
+    if (path) post({ type: 'openPath', path });
     return;
   }
-  if (target?.closest('#df-raw-back')) {
-    if (lastError) {
-      renderError(lastError);
-    }
+  const row = target?.closest<HTMLElement>('[data-file-id]');
+  if (!row) {
+    return;
+  }
+  selectedFileId = row.getAttribute('data-file-id') ?? undefined;
+  files?.querySelectorAll<HTMLElement>('.df-file-row').forEach((element) => {
+    element.classList.toggle('df-selected', element === row);
+  });
+  renderSide();
+});
+
+side?.addEventListener('click', (event) => {
+  const target = event.target as HTMLElement | null;
+  if (!target) {
+    return;
+  }
+  const open = target.closest<HTMLElement>('[data-open-path]');
+  if (open) {
+    const path = open.getAttribute('data-open-path');
+    if (path) post({ type: 'openPath', path });
+    return;
+  }
+  const path = navPathFrom(target);
+  if (path) {
+    goTo(path);
   }
 });
 
@@ -453,6 +835,8 @@ if (refreshButton) {
   refreshButton.addEventListener('click', () => {
     hideBanner();
     setRefreshing(true);
+    backStack = [];
+    updateBackButton();
     post({ type: 'reload' });
   });
 }
@@ -481,7 +865,7 @@ document.getElementById('df-map-crumbs')?.addEventListener('click', (event) => {
   const index = Number(button.getAttribute('data-index'));
   const crumb = crumbs[index];
   if (crumb) {
-    post({ type: 'up', crumbs: crumb.path });
+    goTo(crumb.path);
   }
 });
 

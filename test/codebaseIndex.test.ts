@@ -45,4 +45,12 @@ describe('CodebaseIndex', () => {
     expect(evidence).toContain('login');
     expect(evidence).not.toContain('createSession');
   });
+
+  it('provides a model-free hybrid lookup for symbols and imports', async () => {
+    const { index } = await makeIndex();
+    const results = await index.hybridSearch('UserStore session', 4);
+    expect(results.some((result) => result.path === 'src/auth.ts')).toBe(true);
+    const auth = results.find((result) => result.path === 'src/auth.ts');
+    expect(auth?.imports.some((item) => item.specifier === './users')).toBe(true);
+  });
 });

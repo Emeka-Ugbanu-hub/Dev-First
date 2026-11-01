@@ -39,6 +39,7 @@ const fakeVscode = {
     onDidSaveTextDocument: () => disposable(),
     onDidCloseTextDocument: () => disposable(),
     onDidChangeConfiguration: () => disposable(),
+    onDidChangeWorkspaceFolders: () => disposable(),
     getConfiguration: () => ({ get: (_key, fallback) => fallback, update: async () => {} }),
     registerCodeLensProvider: () => disposable(),
     registerTextDocumentContentProvider: () => disposable(),

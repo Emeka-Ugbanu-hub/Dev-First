@@ -10,11 +10,14 @@ export interface FinishGateInput {
   newDiagnosticErrors: number;
   diagnosticsAvailable: boolean;
   verificationRan: string[];
+  verificationFailures?: string[];
   planRequiredCheck?: 'typecheck' | 'test' | 'lint' | 'build';
   baselinesAvailable?: boolean;
 }
 
-export type FinishGateResult = { ok: true } | { ok: false; issues: string[]; compact: string };
+export type FinishGateResult =
+  | { ok: true }
+  | { ok: false; issues: string[]; compact: string; overridable: boolean };
 
 export function checkFinish(input: FinishGateInput): FinishGateResult {
   const steps = Array.isArray(input.planSteps) ? input.planSteps : [];
@@ -83,6 +86,11 @@ export function checkFinish(input: FinishGateInput): FinishGateResult {
     issues.push(`${newErrors} new diagnostic error${newErrors === 1 ? '' : 's'}`);
   }
 
+  const verificationFailures = (input.verificationFailures ?? []).slice(0, 2);
+  for (const failure of verificationFailures) {
+    issues.push(failure.startsWith('verification') ? failure : `verification failed: ${failure}`);
+  }
+
   const requiredKind = input.planRequiredCheck;
   const verificationRan = input.verificationRan ?? [];
   const requiredRan = requiredKind
@@ -139,6 +147,8 @@ export function checkFinish(input: FinishGateInput): FinishGateResult {
     action = `resolve recent tool failure: ${failures[0]}`;
   } else if (diagnosticsIssue) {
     action = `fix ${newErrors} new diagnostic error${newErrors === 1 ? '' : 's'}`;
+  } else if (verificationFailures.length > 0) {
+    action = 'resolve the failing verification check';
   } else if (requiredKind && !requiredRan) {
     action = requiredCommand
       ? `run required ${requiredKind} check: ${requiredCommand}`
@@ -147,13 +157,30 @@ export function checkFinish(input: FinishGateInput): FinishGateResult {
     action = 'call finish again when the remaining work is complete';
   }
 
+  const verificationFailureLine = verificationFailures.length > 0
+    ? `Verification failure: ${verificationFailures[0].split('\n')[0]}`
+    : '';
   const lines = [
     'Finish check:',
     planLine,
     changedLine,
     diagnosticsLine,
     verificationLine,
+    ...(verificationFailureLine ? [verificationFailureLine] : []),
     `Action required: ${action}`,
   ];
-  return { ok: false, issues, compact: lines.slice(0, 8).join('\n') };
+  // Verification/diagnostic failures and expected-file mismatches can be
+  // overridden by the developer; unfinished work and tool failures cannot.
+  const structural = issues.some((issue) =>
+    issue.startsWith('unfinished step')
+    || issue.startsWith('step still in progress')
+    || issue.startsWith('recent tool failure')
+  );
+  const overridable = issues.length > 0 && !structural && issues.every((issue) =>
+    /^\d+ new diagnostic/.test(issue)
+    || issue.startsWith('verification')
+    || issue.startsWith('required verification')
+    || issue.startsWith('expected file not changed')
+  );
+  return { ok: false, issues, compact: lines.slice(0, 8).join('\n'), overridable };
 }

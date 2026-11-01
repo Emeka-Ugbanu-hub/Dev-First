@@ -1,5 +1,5 @@
 import { ChatMessage, LLMProvider, ReasoningOptions, ReasoningRouteContext, ToolCall, ToolDef, UsageTotals } from '../llm/types';
-import { Plan, QuestionRequest, TerminalApprovalDecision } from '../shared/protocol';
+import { Plan, QuestionRequest, RunStats, TerminalApprovalDecision } from '../shared/protocol';
 import {
   ActivityMeta,
   activityMeta,
@@ -8,7 +8,7 @@ import {
   toolCallArgs,
   toolIcon,
 } from './tools';
-import { ToolBox } from './ToolBox';
+import { ToolBox, type ToolExecutionContext } from './ToolBox';
 import type { VerifyCheckKind } from './verificationPolicy';
 import type { FinishGateResult } from './finishGate';
 import { parseCompoundResult } from './compoundResult';
@@ -29,6 +29,8 @@ import {
   PRESERVE_RECENT_TOKENS,
   buildCompactedMessages,
   buildDeterministicCheckpoint,
+  compactDeterministically,
+  foldMessagesForCompression,
   checkCompaction,
   chooseRecentStart,
   DEFAULT_CONTEXT_LIMIT,
@@ -97,6 +99,9 @@ export interface AgentResult {
   reachedLimit: boolean;
   stoppedByLoop?: boolean;
   stoppedByMistakes?: boolean;
+  verificationWaived?: boolean;
+  planWaived?: boolean;
+  stats?: RunStats;
   incomplete?: { issues: string[]; compact: string };
 }
 
@@ -106,6 +111,7 @@ export interface FinishCheckSummary {
   newDiagnosticErrors: number;
   diagnosticsAvailable: boolean;
   verificationRan: string[];
+  verificationFailures: string[];
 }
 
 export interface AgentOptions {
@@ -121,6 +127,8 @@ export interface AgentOptions {
   planFilePath?: string;
   contextProfile?: ContextProfile;
   profileReasoning?: boolean;
+  /** Local models fold context deterministically instead of paying for a summary call. */
+  deterministicContext?: boolean;
   finishCheck?: (summary: FinishCheckSummary) => FinishGateResult | Promise<FinishGateResult>;
   taskState?: { state: string; completedSteps: number[]; nextSteps: number[]; blockers: string[] };
   ledger?: string;
@@ -132,6 +140,13 @@ export class AgentService {
   private readonly doomLoop = new DoomLoopDetector();
   private readonly mistakes = new MistakeTracker();
   private readonly convergence = new ConvergenceGuard();
+  private runStats: RunStats = {
+    turns: 0,
+    toolCalls: 0,
+    promptTokens: 0,
+    verificationRuns: 0,
+    stopReason: 'finish',
+  };
 
   constructor(
     private readonly provider: LLMProvider,
@@ -158,6 +173,40 @@ export class AgentService {
     signal: AbortSignal,
     callbacks: AgentCallbacks,
   ): Promise<AgentResult> {
+    this.runStats = {
+      turns: 0,
+      toolCalls: 0,
+      promptTokens: 0,
+      verificationRuns: 0,
+      stopReason: 'finish',
+    };
+    const result = await this.runLoop(plan, request, signal, callbacks);
+    const stopReason: RunStats['stopReason'] = result.stoppedByLoop
+      ? 'loop'
+      : result.stoppedByMistakes
+        ? 'mistakes'
+        : result.reachedLimit
+          ? 'step-limit'
+          : result.incomplete
+            ? 'incomplete'
+            : 'finish';
+    const snapshot = this.toolbox.adaptiveVerificationSnapshot?.();
+    return {
+      ...result,
+      stats: {
+        ...this.runStats,
+        verificationRuns: snapshot?.verificationRan.length ?? 0,
+        stopReason,
+      },
+    };
+  }
+
+  private async runLoop(
+    plan: Plan,
+    request: string,
+    signal: AbortSignal,
+    callbacks: AgentCallbacks,
+  ): Promise<AgentResult> {
     let messages: ChatMessage[] = [
       { role: 'system', content: buildExecutorSystemPrompt(this.options.rules, this.options.family) },
       { role: 'user', content: buildExecutorSpec(request, plan, this.options.planFilePath, this.options.taskState) },
@@ -173,6 +222,7 @@ export class AgentService {
     const runChangedPaths = new Set<string>();
     const recentToolFailures: string[] = [];
     let finishContinuations = 0;
+    let finishOverrideAsked = false;
     let lastAssistantText = '';
     let repeatedAssistantText = 0;
     let previousToolNames: string[] = [];
@@ -224,10 +274,12 @@ export class AgentService {
     };
 
     for (let step = 0; step < this.options.maxSteps; step++) {
+      this.runStats.turns += 1;
       if (shouldPrune(estimateTokens(messages), contextLimit, profile)) {
         messages = pruneMessages(messages);
       }
-      messages = await this.maybeCompact(messages, signal, callbacks);
+      const compactionNote = this.compactionStateNote(plan, completedTodoSteps, runChangedPaths, recentToolFailures);
+      messages = await this.maybeCompact(messages, signal, callbacks, compactionNote);
       if (compressedRecently) {
         compressedRecently = false;
         lastNudgeTurn = assistantTurns(messages);
@@ -252,6 +304,7 @@ export class AgentService {
         callbacks.progressSnapshot?.().completedStepCount ?? completedTodoSteps,
         contextLimit,
       );
+      this.runStats.promptTokens += estimateTokens(projectedMessages);
       callbacks.onUsage?.(estimateTokens(projectedMessages));
 
       let text = '';
@@ -314,7 +367,12 @@ export class AgentService {
           }
           if (attempt === 0 && isContextOverflowError(error)) {
             callbacks.onNotice?.('Context limit reached — compacting and retrying…');
-            messages = await this.forceCompact(messages, signal, callbacks);
+            messages = await this.forceCompact(
+              messages,
+              signal,
+              callbacks,
+              this.compactionStateNote(plan, completedTodoSteps, runChangedPaths, recentToolFailures),
+            );
             projectedMessages = projectExecutionMessages(
               messages,
               plan,
@@ -375,6 +433,7 @@ export class AgentService {
         }
         return { ...call, arguments: normalizeToolArguments(call.arguments, definition.parameters) };
       });
+      this.runStats.toolCalls += normalizedCalls.length;
 
       const normalizedResponse = normalizeLoopText(text);
       if (normalizedResponse && normalizedResponse === lastAssistantText) {
@@ -408,11 +467,67 @@ export class AgentService {
         if (call.name === 'finish') {
           const args = toolCallArgs(call);
           const summary = String(args.summary ?? '').trim() || 'Done.';
+          let verification: { ran: string[]; failures: string[] } = { ran: [], failures: [] };
+          if (callbacks.planCheckRequirement) {
+            const context: ToolExecutionContext = {
+              requestTerminalApproval: callbacks.requestTerminalApproval,
+              requestExternalDirectoryApproval: callbacks.requestExternalDirectoryApproval,
+              askUser: callbacks.askUser,
+              signal,
+              planCheckRequirement: callbacks.planCheckRequirement,
+            };
+            callbacks.onStatus?.('verify', `Running ${callbacks.planCheckRequirement} check…`, 'progress');
+            try {
+              verification = (await this.toolbox.finishVerification?.(
+                callbacks.planCheckRequirement,
+                [...runChangedPaths],
+                context,
+              )) ?? verification;
+            } finally {
+              callbacks.onStatus?.('verify', '', undefined, true);
+            }
+            for (const entry of verification.ran) {
+              callbacks.onNotice?.(`Final verification passed: ${entry}`);
+            }
+          }
           const gate = this.options.finishCheck
-            ? await this.options.finishCheck(this.finishCheckSummary(runChangedPaths, recentToolFailures))
+            ? await this.options.finishCheck(
+              this.finishCheckSummary(runChangedPaths, recentToolFailures, verification.failures),
+            )
             : undefined;
           if (gate && !gate.ok) {
             const firstIssue = gate.issues[0] ?? 'finish check failed';
+            // Verification and diagnostics failures are the developer's call;
+            // never auto-loop when they can explicitly accept the result.
+            if (gate.overridable && callbacks.askUser && !finishOverrideAsked) {
+              finishOverrideAsked = true;
+              const answer = await callbacks
+                .askUser({
+                  id: `finish-${call.id}`,
+                  question: `Verification did not pass.\n\n${gate.compact}\n\nFinish anyway?`,
+                  header: 'Finish anyway?',
+                  options: [
+                    { label: 'Finish anyway', description: 'Complete the run without passing verification.' },
+                    { label: 'Keep working', description: 'Let the agent try to fix the failure.' },
+                  ],
+                  multiple: false,
+                })
+                .catch(() => 'Keep working');
+              if (/^finish anyway$/i.test(answer.trim())) {
+                const expectedOnly = gate.issues.length > 0
+                  && gate.issues.every((issue) => issue.startsWith('expected file not changed'));
+                const note = expectedOnly
+                  ? 'Finished with verification incomplete — expected files were not changed.'
+                  : "Finished without passing verification at the developer's request.";
+                callbacks.onNotice?.(note);
+                return {
+                  summary: `${summary}\n\n${note}`,
+                  files: parseFinishFiles(args),
+                  reachedLimit: false,
+                  ...(expectedOnly ? { planWaived: true } : { verificationWaived: true }),
+                };
+              }
+            }
             if (finishContinuations >= 1) {
               callbacks.onNotice?.(`Run ended incomplete — ${firstIssue}`);
               return {
@@ -469,18 +584,66 @@ export class AgentService {
         } else if (call.name === 'compress_context') {
           const args = toolCallArgs(call);
           const focus = typeof args.focus === 'string' ? args.focus : undefined;
+          let controllerResult = '';
           if (callbacks.compressContext) {
             try {
-              result = await callbacks.compressContext(focus);
+              controllerResult = await callbacks.compressContext(focus);
             } catch (error) {
-              result = `Error: ${error instanceof Error ? error.message : String(error)}`;
+              controllerResult = `Error: ${error instanceof Error ? error.message : String(error)}`;
             }
+          }
+          const profile = this.options.contextProfile;
+          const preserve = profile
+            ? preserveBudgetTokens(profile, contextLimit, this.options.profileReasoning ?? false)
+            : PRESERVE_RECENT_TOKENS;
+          let assistantIndex = messages.length;
+          for (let index = messages.length - 1; index >= 0; index--) {
+            const message = messages[index];
+            if (message.role === 'assistant' && message.toolCalls?.some((entry) => entry.id === call.id)) {
+              assistantIndex = index;
+              break;
+            }
+          }
+          const progress = callbacks.progressSnapshot?.();
+          const completedCount = progress?.completedStepCount ?? completedTodoSteps;
+          const stateNote = this.compactionStateNote(
+            plan,
+            completedCount,
+            runChangedPaths,
+            recentToolFailures,
+            focus,
+          );
+          const fold = foldMessagesForCompression(messages, preserve, {
+            minRecentStart: assistantIndex,
+            stateNote,
+            pinned: this.pinnedLedger(messages),
+          });
+          if (fold.folded) {
+            messages = fold.messages;
+            readCallPaths.clear();
+            readMessageIndex.clear();
+            callbacks.onCompaction?.({
+              tokensBefore: fold.beforeTokens,
+              tokensAfter: fold.afterTokens,
+              messagesBefore: fold.beforeMessages,
+              messagesAfter: messages.length,
+            });
+          }
+          const controllerOk = controllerResult.length > 0 && !controllerResult.startsWith('Error:');
+          const percent = fold.folded
+            ? Math.round((1 - fold.afterTokens / Math.max(1, fold.beforeTokens)) * 100)
+            : 0;
+          const foldNote = fold.folded
+            ? `Executor context folded from ~${fold.beforeTokens} to ~${fold.afterTokens} estimated tokens (${percent}% smaller).`
+            : 'No older executor context could be folded; transcript unchanged.';
+          if (fold.folded) {
+            result = [controllerOk ? controllerResult : '', foldNote].filter(Boolean).join('\n');
+          } else if (controllerOk) {
+            result = `${controllerResult}\n${foldNote}`;
           } else {
-            result = 'Error: context compression is not available in this run.';
+            result = controllerResult || foldNote;
           }
-          if (!result.startsWith('Error:')) {
-            compressedRecently = true;
-          }
+          compressedRecently = fold.folded;
         } else {
           try {
             result = await this.toolbox.execute(call.name, call.arguments, {
@@ -489,6 +652,10 @@ export class AgentService {
               askUser: callbacks.askUser,
               signal,
               planCheckRequirement: callbacks.planCheckRequirement,
+              contextPressure: () => ({
+                usedTokens: estimateTokens(messages),
+                limitTokens: this.options.contextLimitTokens,
+              }),
             });
           } catch (error) {
             result = `Error: ${error instanceof Error ? error.message : String(error)}`;
@@ -505,18 +672,27 @@ export class AgentService {
       };
 
       const parallelSafe = this.options.parallelTools !== false;
-      const concurrent = normalizedCalls.filter((call) => PARALLEL_SAFE.has(call.name));
-      const sequential = normalizedCalls.filter((call) => !PARALLEL_SAFE.has(call.name));
-
-      if (parallelSafe && concurrent.length > 1) {
-        await Promise.all(concurrent.map((call) => executeOne(call)));
-      } else {
-        for (const call of concurrent) {
+      // Preserve model order: batch only consecutive read-only calls. Reads
+      // must never be hoisted ahead of an earlier edit in the same turn.
+      for (let index = 0; index < normalizedCalls.length;) {
+        const call = normalizedCalls[index];
+        if (call && parallelSafe && PARALLEL_SAFE.has(call.name)) {
+          const batch: ToolCall[] = [];
+          while (index < normalizedCalls.length && PARALLEL_SAFE.has(normalizedCalls[index].name)) {
+            batch.push(normalizedCalls[index]);
+            index += 1;
+          }
+          if (batch.length > 1) {
+            await Promise.all(batch.map((pending) => executeOne(pending)));
+          } else if (batch[0]) {
+            await executeOne(batch[0]);
+          }
+        } else if (call) {
           await executeOne(call);
+          index += 1;
+        } else {
+          index += 1;
         }
-      }
-      for (const call of sequential) {
-        await executeOne(call);
       }
 
       for (const call of normalizedCalls) {
@@ -668,13 +844,20 @@ export class AgentService {
       }
     }
 
-    return { reachedLimit: true };
+    return {
+      reachedLimit: true,
+      incomplete: {
+        issues: [`reached the ${this.options.maxSteps}-step limit`],
+        compact: `Run ended incomplete — the step limit (${this.options.maxSteps}) was reached. Completed work is preserved. Review the changes, then send a message to continue.`,
+      },
+    };
   }
 
   private async maybeCompact(
     messages: ChatMessage[],
     signal: AbortSignal,
     callbacks: AgentCallbacks,
+    stateNote?: string,
   ): Promise<ChatMessage[]> {
     if (!this.options.autoCompact) {
       return messages;
@@ -688,20 +871,11 @@ export class AgentService {
     if (!check.needed || check.recentStart <= 2) {
       return messages;
     }
-    try {
-      const summary = await summarizeMessages(this.provider, this.model, messages.slice(2, check.recentStart), signal);
-      const compacted = summary
-        ? buildCompactedMessages(messages, summary, check.recentStart)
-        : buildDeterministicCheckpoint(messages, check.recentStart);
-      callbacks.onCompaction?.({
-        tokensBefore: estimateTokens(messages),
-        tokensAfter: estimateTokens(compacted),
-        messagesBefore: messages.length,
-        messagesAfter: compacted.length,
-      });
-      return compacted;
-    } catch {
-      const compacted = buildDeterministicCheckpoint(messages, check.recentStart);
+    const pinned = this.pinnedLedger(messages);
+    if (this.options.deterministicContext) {
+      const threshold = check.threshold
+        ?? (this.options.contextLimitTokens || DEFAULT_CONTEXT_LIMIT) * 0.6;
+      const compacted = compactDeterministically(messages, check.recentStart, threshold, { stateNote, pinned });
       callbacks.onCompaction?.({
         tokensBefore: estimateTokens(messages),
         tokensAfter: estimateTokens(compacted),
@@ -710,6 +884,55 @@ export class AgentService {
       });
       return compacted;
     }
+    try {
+      const summary = await summarizeMessages(this.provider, this.model, messages.slice(2, check.recentStart), signal);
+      const compacted = summary
+        ? buildCompactedMessages(messages, summary, check.recentStart)
+        : buildDeterministicCheckpoint(messages, check.recentStart, 12_000, stateNote, pinned);
+      callbacks.onCompaction?.({
+        tokensBefore: estimateTokens(messages),
+        tokensAfter: estimateTokens(compacted),
+        messagesBefore: messages.length,
+        messagesAfter: compacted.length,
+      });
+      return compacted;
+    } catch {
+      const compacted = buildDeterministicCheckpoint(messages, check.recentStart, 12_000, stateNote, pinned);
+      callbacks.onCompaction?.({
+        tokensBefore: estimateTokens(messages),
+        tokensAfter: estimateTokens(compacted),
+        messagesBefore: messages.length,
+        messagesAfter: compacted.length,
+      });
+      return compacted;
+    }
+  }
+
+  private compactionStateNote(
+    plan: Plan,
+    completed: number,
+    changed: Set<string>,
+    failures: string[],
+    focus?: string,
+  ): string {
+    const stepCount = plan.steps?.length ?? 0;
+    const current = stepCount > 0 ? plan.steps?.[Math.min(completed, stepCount - 1)] : undefined;
+    const changedFiles = [...changed].slice(0, 20);
+    const blockers = [...(this.options.taskState?.blockers ?? []), ...failures.slice(-2)];
+    return [
+      focus ? `Compression focus: ${focus}` : '',
+      current ? `Current step: ${current}` : '',
+      `Completed steps: ${completed} of ${stepCount}`,
+      changedFiles.length > 0 ? `Changed files: ${changedFiles.join(', ')}` : '',
+      blockers.length > 0 ? `Recent blockers: ${blockers.join(' | ')}` : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  private pinnedLedger(messages: ChatMessage[]): ChatMessage[] {
+    const ledger = this.options.ledger;
+    if (!ledger) return [];
+    const index = messages.findIndex((message) => message.role === 'system' && message.content === ledger);
+    return index >= 2 ? [messages[index]] : [];
   }
 
   private async localizePlanTargets(
@@ -749,6 +972,7 @@ export class AgentService {
     messages: ChatMessage[],
     signal: AbortSignal,
     callbacks: AgentCallbacks,
+    stateNote?: string,
   ): Promise<ChatMessage[]> {
     const profile = this.options.contextProfile;
     const preserve = profile
@@ -762,20 +986,40 @@ export class AgentService {
     if (recentStart <= 2) {
       return messages;
     }
+    const pinned = this.pinnedLedger(messages);
+    const report = (compacted: ChatMessage[]): void => {
+      callbacks.onCompaction?.({
+        tokensBefore: estimateTokens(messages),
+        tokensAfter: estimateTokens(compacted),
+        messagesBefore: messages.length,
+        messagesAfter: compacted.length,
+      });
+    };
+    if (this.options.deterministicContext) {
+      const threshold = (this.options.contextLimitTokens || DEFAULT_CONTEXT_LIMIT) * 0.6;
+      const compacted = compactDeterministically(messages, recentStart, threshold, { stateNote, pinned });
+      report(compacted);
+      return compacted;
+    }
     try {
       const summary = await summarizeMessages(this.provider, this.model, messages.slice(2, recentStart), signal);
       if (summary) {
-        return buildCompactedMessages(messages, summary, recentStart);
+        const compacted = buildCompactedMessages(messages, summary, recentStart);
+        report(compacted);
+        return compacted;
       }
     } catch {
       // fall through to a model-free checkpoint below
     }
-    return buildDeterministicCheckpoint(messages, recentStart);
+    const compacted = buildDeterministicCheckpoint(messages, recentStart, 12_000, stateNote, pinned);
+    report(compacted);
+    return compacted;
   }
 
   private finishCheckSummary(
     runChangedPaths: Set<string>,
     recentToolFailures: string[],
+    verificationFailures: string[] = [],
   ): FinishCheckSummary {
     const snapshot = this.toolbox.adaptiveVerificationSnapshot?.();
     return {
@@ -784,6 +1028,7 @@ export class AgentService {
       newDiagnosticErrors: snapshot?.newDiagnosticErrors ?? 0,
       diagnosticsAvailable: snapshot?.diagnosticsAvailable ?? false,
       verificationRan: snapshot?.verificationRan ?? [],
+      verificationFailures: [...new Set(verificationFailures)],
     };
   }
 }
@@ -830,16 +1075,28 @@ function contextNudge(
   return { text, turn: assistantTurnCount };
 }
 
+const MUTATION_TOOL_NAMES = new Set([
+  'apply_change_set',
+  'fix_in_file',
+  'fix_diagnostic',
+  'add_import_and_use',
+  'rename_symbol',
+  'refactor_symbol',
+  'update_related_files',
+]);
+
 function mutationPaths(call: ToolCall, result: string): string[] {
   if (result.startsWith('Error:') || result.startsWith('Error in')) {
     return [];
   }
   const compound = parseCompoundResult(result);
+  if (MUTATION_TOOL_NAMES.has(call.name)) {
+    // Compound results carry the authoritative changed set, including files
+    // changed by language-server tools that the arguments do not mention.
+    return compound ? normalizeChangedPaths(compound.changedFiles ?? []) : [];
+  }
   if (compound) {
-    const applied = compound.status === 'verified' || (compound.status === 'needs_input' && compound.rollbackAvailable);
-    if (!applied) {
-      return [];
-    }
+    return [];
   }
   if (call.name === 'write_file' || call.name === 'edit_file') {
     const path = String(toolCallArgs(call).path ?? '');
@@ -850,39 +1107,18 @@ function mutationPaths(call: ToolCall, result: string): string[] {
     const matches = patch.match(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$/gm) ?? [];
     return matches.map((line) => line.replace(/^\*\*\* (?:Add|Update|Delete) File:\s*/, '').trim());
   }
-  if (call.name === 'apply_change_set') {
-    const changes = toolCallArgs(call).changes;
-    if (!Array.isArray(changes)) {
-      return [];
-    }
-    const paths: string[] = [];
-    for (const entry of changes) {
-      if (entry && typeof entry === 'object' && typeof (entry as { path?: unknown }).path === 'string') {
-        paths.push(String((entry as { path: string }).path));
-      }
-    }
-    return paths;
-  }
-  if (
-    call.name === 'fix_in_file' ||
-    call.name === 'fix_diagnostic' ||
-    call.name === 'add_import_and_use' ||
-    call.name === 'rename_symbol'
-  ) {
-    const path = String(toolCallArgs(call).path ?? '');
-    return path ? [path] : [];
-  }
-  if (call.name === 'refactor_symbol') {
-    const args = toolCallArgs(call);
-    const paths: string[] = [];
-    for (const key of ['path', 'targetPath'] as const) {
-      if (typeof args[key] === 'string' && args[key]) {
-        paths.push(String(args[key]));
-      }
-    }
-    return paths;
-  }
   return [];
+}
+
+function normalizeChangedPaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  for (const path of paths) {
+    const normalized = String(path).replace(/\\/g, '/').replace(/^\.\//, '').trim();
+    if (normalized) {
+      seen.add(normalized);
+    }
+  }
+  return [...seen];
 }
 
 function rewriteStaleReads(

@@ -50,7 +50,7 @@ export function planFromObject(input: unknown, version: number): Plan | undefine
     return undefined;
   }
 
-  return {
+  return applyPlanDefaults({
     version,
     status: 'draft',
     intent: intent ?? (steps?.length ? 'plan' : 'explanation'),
@@ -73,7 +73,30 @@ export function planFromObject(input: unknown, version: number): Plan | undefine
     expectedFiles,
     steps,
     trivial: trivial || planningMode === 'skip' || undefined,
-  };
+  });
+}
+
+/**
+ * Fill only harness-safe defaults. expectedFiles and (for spec/full)
+ * verification stay explicit because they drive the finish gate. Lite plans
+ * default verification to "none" because diagnostics still run during
+ * execution and the plan card shows the value.
+ */
+function applyPlanDefaults(plan: Plan): Plan {
+  if (plan.intent === 'explanation' || plan.trivial || plan.planningMode === 'skip') {
+    return plan;
+  }
+  const next = { ...plan };
+  if (!nonBlank(next.dependencies)) next.dependencies = 'none';
+  if (!nonBlank(next.assumptions)) next.assumptions = 'none';
+  if (next.planningMode === 'lite' && !next.verification?.some(nonBlank)) {
+    next.verification = ['none'];
+  }
+  return next;
+}
+
+function nonBlank(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function normalizeExpectedFiles(value: unknown, steps?: string[]): PlanExpectedFile[] | undefined {
@@ -91,6 +114,12 @@ function normalizeExpectedFiles(value: unknown, steps?: string[]): PlanExpectedF
         entries.push({ path: path.replace(/^\.\//, ''), action, reason: firstString(record.reason, record.role, record.description) ?? 'Expected change' });
       }
     }
+  }
+  // An explicit [] is an intentional "no files change" answer. Do not
+  // resurrect paths from steps in that case; a non-empty explicit list may
+  // still be supplemented by paths named in the steps.
+  if (explicitlyProvided && entries.length === 0) {
+    return [];
   }
   for (const step of steps ?? []) {
     for (const path of extractPaths(step)) {
@@ -225,7 +254,7 @@ export function planFromText(markdown: string, version: number): Plan | undefine
   let section: string | null = null;
 
   for (const line of lines) {
-    const header = /^(PLANNING MODE|PLANNINGMODE|MODE|WHAT|HOW|FLOW|WHY NOT|WHYNOT|WHY|TRADEOFF|LEAVE AS IS|LEAVEASIS|CONCEPT|CONVENTION|RISKS|CONTEXT|EXPECTED FILES|EXPECTEDFILES|PLAN):\s*(.*)$/i.exec(line.trim());
+    const header = /^(PLANNING MODE|PLANNINGMODE|MODE|WHAT|HOW|FLOW|WHY NOT|WHYNOT|WHY|TRADEOFF|LEAVE AS IS|LEAVEASIS|CONCEPT|CONVENTION|RISKS|CONTEXT|EXPECTED FILES|EXPECTEDFILES|DEPENDENCIES|DEPENDENCY|ASSUMPTIONS|ASSUMPTION|VERIFICATION|VERIFY|PLAN):\s*(.*)$/i.exec(line.trim());
     if (header) {
       section = header[1].toUpperCase().replace(/\s+/g, '');
       buffers[section] = header[2] ? [header[2]] : [];
@@ -285,6 +314,9 @@ export function planFromText(markdown: string, version: number): Plan | undefine
     convention: get('CONVENTION'),
     risks: risks.length > 0 ? risks.slice(0, 2) : undefined,
     whyNot: get('WHYNOT'),
+    dependencies: get('DEPENDENCIES') ?? get('DEPENDENCY'),
+    assumptions: get('ASSUMPTIONS') ?? get('ASSUMPTION'),
+    verification: normalizeSteps(get('VERIFICATION') ?? get('VERIFY')),
     context: context.length > 0 ? context : undefined,
     expectedFiles: expectedFiles.length > 0 ? expectedFiles : undefined,
     steps: steps.length > 0 ? steps : undefined,
@@ -312,7 +344,7 @@ export function planFromText(markdown: string, version: number): Plan | undefine
   ) {
     return undefined;
   }
-  return plan;
+  return applyPlanDefaults(plan);
 }
 
 export function planSlug(plan: Plan, fallback: string): string {
@@ -389,6 +421,16 @@ export function planToText(plan: Plan): string {
   if (plan.expectedFiles?.length) {
     lines.push('EXPECTED FILES:');
     plan.expectedFiles.forEach((entry) => lines.push(`- ${entry.action} ${entry.path} — ${entry.reason}`));
+  }
+  if (plan.dependencies) {
+    lines.push(`DEPENDENCIES: ${plan.dependencies}`);
+  }
+  if (plan.assumptions) {
+    lines.push(`ASSUMPTIONS: ${plan.assumptions}`);
+  }
+  if (plan.verification?.length) {
+    lines.push('VERIFICATION:');
+    plan.verification.forEach((check) => lines.push(`- ${check}`));
   }
   if (plan.steps?.length) {
     lines.push('PLAN:');

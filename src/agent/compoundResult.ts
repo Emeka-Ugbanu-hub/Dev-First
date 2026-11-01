@@ -41,6 +41,8 @@ export interface CompoundCoverage {
 export interface CompoundResult {
   status: CompoundStatus;
   files: string[];
+  /** Files whose content was actually changed by this tool call. */
+  changedFiles?: string[];
   diff?: string;
   diagnostics?: CompoundDiagnostic[];
   evidence?: CompoundEvidence[];
@@ -59,6 +61,8 @@ export interface CompoundResult {
 export interface CompoundResultPartial {
   status: CompoundStatus;
   files?: string[];
+  /** Files whose content was actually changed by this tool call. */
+  changedFiles?: string[];
   diff?: string;
   diagnostics?: CompoundDiagnostic[];
   evidence?: CompoundEvidence[];
@@ -78,6 +82,7 @@ export function buildCompoundResult(partial: CompoundResultPartial): CompoundRes
   return {
     status: partial.status,
     files: partial.files ?? [],
+    ...(partial.changedFiles !== undefined ? { changedFiles: partial.changedFiles } : {}),
     ...(partial.diff !== undefined ? { diff: partial.diff } : {}),
     ...(partial.diagnostics !== undefined ? { diagnostics: partial.diagnostics } : {}),
     ...(partial.evidence !== undefined ? { evidence: partial.evidence } : {}),

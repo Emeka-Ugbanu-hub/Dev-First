@@ -96,8 +96,9 @@ beforeEach(async () => {
   env.config = { preset: 'openai', model: 'gpt-4o' };
   env.secret = 'sk-test';
   vi.stubEnv('HOME', '/tmp/dev-first-explanation-test-home');
-  await rm('/tmp/dev-first-explanation-test-global', { recursive: true, force: true });
-  await rm('/tmp/dev-first-explanation-test', { recursive: true, force: true });
+  // Writes from the previous test can still be settling; retry the cleanup.
+  await rm('/tmp/dev-first-explanation-test-global', { recursive: true, force: true, maxRetries: 5, retryDelay: 40 });
+  await rm('/tmp/dev-first-explanation-test', { recursive: true, force: true, maxRetries: 5, retryDelay: 40 });
 });
 
 afterEach(() => {

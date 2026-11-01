@@ -264,3 +264,65 @@ describe('checkFinish action priority', () => {
     ).toContain('Action required: run the required test check');
   });
 });
+
+describe('checkFinish verification failures', () => {
+  it('flags a failed verification and marks the gate overridable', () => {
+    const result = checkFinish(
+      input({ verificationFailures: ['verification failed: test npm test\nerror output'] }),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.issues[0]).toContain('verification failed');
+    expect(result.compact).toContain('Verification failure');
+    expect(result.overridable).toBe(true);
+  });
+
+  it('marks diagnostics-only failures overridable', () => {
+    const result = checkFinish(input({ newDiagnosticErrors: 2, diagnosticsAvailable: true }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.overridable).toBe(true);
+  });
+
+  it('never overrides structural failures', () => {
+    const result = checkFinish(
+      input({
+        planSteps: ['First', 'Second'],
+        completedSteps: [0],
+        verificationFailures: ['verification failed: test npm test'],
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues).toContain('unfinished step: "Second"');
+      expect(result.overridable).toBe(false);
+    }
+  });
+});
+
+describe('checkFinish expected-file overrides', () => {
+  it('marks expected-file mismatches overridable', () => {
+    const result = checkFinish(
+      input({ expectedFiles: [{ path: 'src/a.ts', action: 'modify' }], changedFiles: [] }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues).toContain('expected file not changed: src/a.ts');
+      expect(result.overridable).toBe(true);
+    }
+  });
+
+  it('does not override expected-file mismatches while steps remain unfinished', () => {
+    const result = checkFinish(
+      input({
+        planSteps: ['First', 'Second'],
+        completedSteps: [0],
+        expectedFiles: [{ path: 'src/a.ts', action: 'modify' }],
+        changedFiles: [],
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.overridable).toBe(false);
+    }
+  });
+});

@@ -17,6 +17,7 @@ import {
   browserNavigateTool,
   browserScreenshotTool,
   documentSymbolsTool,
+  findAndReadTool,
   editFileTool,
   findReferencesTool,
   findSymbolTool,
@@ -25,6 +26,7 @@ import {
   hoverTool,
   incomingCallsTool,
   listFilesTool,
+  localHybridSearchTool,
   listProcessesTool,
   memoryRecallTool,
   memorySaveTool,
@@ -144,6 +146,7 @@ import type { RipgrepMatch } from '../util/fsWalk';
 import { fetchLlmsTxt, fetchUrlDetailed, webSearch } from './web';
 import { loadSkill } from '../skills/SkillManager';
 import { SemanticIndex } from '../indexing/SemanticIndex';
+import { CodebaseIndex } from '../indexing/CodebaseIndex';
 import { McpManager } from '../mcp/McpManager';
 import { BrowserSession } from '../browser/BrowserSession';
 import { SandboxMode } from './sandbox';
@@ -155,6 +158,7 @@ import {
   VerificationPolicyInput,
   VerifyChangeInfo,
   VerifyCheckKind,
+  matchesRiskPath,
   planCheckRequirementFromSteps,
   planVerification,
 } from './verificationPolicy';
@@ -212,6 +216,13 @@ const ADAPTIVE_SYMBOL_TOOLS = new Set([
   'update_related_files',
 ]);
 
+/**
+ * Project-wide checks are deferred to a single finish pass. Diagnostics and
+ * structural checks stay immediate; running a typecheck or test suite after
+ * every edit multiplies command runs and model fix turns.
+ */
+const DEFERRED_EDIT_CHECKS = new Set(['closest-test', 'package-typecheck', 'project-command']);
+
 const MAX_RELATED_DIAGNOSTIC_FILES = 10;
 const MAX_CLOSEST_TESTS = 2;
 const MAX_MUTATION_HASHES = 500;
@@ -240,6 +251,8 @@ for (const definition of [
   readFileTool,
   listFilesTool,
   searchTextTool,
+  localHybridSearchTool,
+  findAndReadTool,
   semanticSearchTool,
   findSymbolTool,
   documentSymbolsTool,
@@ -272,6 +285,12 @@ for (const definition of [
   TOOL_SCHEMAS.set(definition.name, definition);
 }
 
+const PURE_TOOL_NAMES = new Set([
+  'read_file', 'list_files', 'search_text', 'local_hybrid_search', 'find_and_read',
+  'find_symbol', 'document_symbols', 'find_references', 'go_to_definition', 'hover',
+  'go_to_implementation', 'incoming_calls', 'outgoing_calls',
+]);
+
 export interface ToolExecutionContext {
   requestTerminalApproval(command: string, cwd: string): Promise<TerminalApprovalDecision>;
   requestExternalDirectoryApproval?(directory: string): Promise<boolean>;
@@ -279,6 +298,8 @@ export interface ToolExecutionContext {
   signal?: AbortSignal;
   planning?: boolean;
   planCheckRequirement?: VerifyCheckKind;
+  /** Live prompt pressure used to keep large reads from overflowing local models. */
+  contextPressure?: () => { usedTokens: number; limitTokens: number };
 }
 
 export interface ToolBoxOptions {
@@ -294,6 +315,7 @@ export interface ToolBoxOptions {
   sandbox: SandboxMode;
   onTodos?: (todos: TodoItem[]) => void;
   semanticIndex?: SemanticIndex;
+  codebaseIndex?: CodebaseIndex;
   mcp?: McpManager;
   browser?: BrowserSession;
   memory?: MemoryStore;
@@ -305,12 +327,15 @@ export interface ToolBoxOptions {
   readCache?: FileReadCache;
   planCheckRequirement?: VerifyCheckKind;
   contextShunt?: ContextShunt;
+  /** Marker-only dedup keeps planner context small; full keeps the cached result. */
+  dedupResponse?: 'marker' | 'full';
 }
 
 export interface AdaptiveVerificationSnapshot {
   diagnosticsAvailable: boolean;
   newDiagnosticErrors: number;
   verificationRan: string[];
+  verificationFailures: string[];
 }
 
 export class ToolBox {
@@ -319,8 +344,11 @@ export class ToolBox {
   private readonly adaptiveDiagnostics = new DiagnosticsCache();
   private readonly repairStates = new Map<string, { attempts: number; hash: string; checkId: string }>();
   private readonly verificationRan: string[] = [];
+  private readonly verificationFailures: string[] = [];
   private readonly diagnosticStats = new Map<string, { baseline: number; latest: number }>();
   private readonly mutationHashes = new Map<string, string>();
+  private readonly pureResultCache = new Map<string, string>();
+  private readonly dedupResponse: 'marker' | 'full';
   private diagnosticsObserved = false;
   private packageRootsCache?: number;
   private webFetchCount = 0;
@@ -329,11 +357,13 @@ export class ToolBox {
   constructor(private readonly options: ToolBoxOptions) {
     this.externalDirectories = options.externalDirectories ?? new ExternalDirectoryConsent();
     this.readCache = options.readCache ?? makeReadCache();
+    this.dedupResponse = options.dedupResponse ?? 'full';
     initOutputStore(options.root);
   }
 
   resetReadCache(): void {
     this.readCache.clear();
+    this.pureResultCache.clear();
   }
 
   cachedFileHashes(relativePaths: string[]): Map<string, string> {
@@ -378,6 +408,7 @@ export class ToolBox {
 
   private recordMutation(absolute: string, hash: string): void {
     this.mutationHashes.set(absolute, hash);
+    this.pureResultCache.clear();
     if (this.mutationHashes.size > MAX_MUTATION_HASHES) {
       const oldest = this.mutationHashes.keys().next().value;
       if (oldest !== undefined) {
@@ -395,6 +426,7 @@ export class ToolBox {
       diagnosticsAvailable: this.options.checkDiagnostics && this.diagnosticsObserved,
       newDiagnosticErrors,
       verificationRan: [...this.verificationRan],
+      verificationFailures: [...this.verificationFailures],
     };
   }
 
@@ -403,6 +435,63 @@ export class ToolBox {
       return;
     }
     this.verificationRan.push(check);
+  }
+
+  /**
+   * Run the plan's project check once, immediately before the finish gate.
+   * Diagnostics are refreshed first so late language-server errors count.
+   */
+  async finishVerification(
+    kind: VerifyCheckKind | undefined,
+    changedPaths: string[],
+    context: ToolExecutionContext,
+  ): Promise<{ ran: string[]; failures: string[] }> {
+    const ran: string[] = [];
+    const failures: string[] = [];
+    const absolutes: string[] = [];
+    for (const relative of new Set(changedPaths)) {
+      const validation = validateWorkspacePath(this.options.root, relative);
+      if (validation.ok) {
+        absolutes.push(validation.absolute);
+      }
+    }
+    if (absolutes.length > 0 && this.options.checkDiagnostics) {
+      await this.safeDiagnostics(absolutes);
+    }
+    if (!kind) {
+      return { ran, failures };
+    }
+    const alreadyRan = this.verificationRan.some(
+      (entry) => entry === kind || entry.startsWith(`${kind}:`),
+    );
+    if (alreadyRan) {
+      return { ran, failures };
+    }
+    const candidates = [kind, 'typecheck', 'test', 'lint', 'build']
+      .filter((value, index, all) => all.indexOf(value) === index) as VerifyCheckKind[];
+    for (const candidate of candidates) {
+      const resolution = await this.commandFor(candidate);
+      if (!resolution.candidate) {
+        continue;
+      }
+      const command = resolution.candidate.command;
+      const outcome = await this.runVerificationCommand(command, context);
+      if (outcome.passed) {
+        // A later successful run invalidates earlier failed attempts.
+        this.verificationFailures.length = 0;
+        this.recordVerification(`${candidate}:${command}`);
+        ran.push(`${candidate}:${command}`);
+      } else {
+        const message = `verification failed: ${candidate} ${command}\n${capLines(outcome.text, 20)}`;
+        this.verificationFailures.push(message);
+        failures.push(message);
+      }
+      return { ran, failures };
+    }
+    const message = `verification check did not run: no ${kind} command was resolved`;
+    this.verificationFailures.push(message);
+    failures.push(message);
+    return { ran, failures };
   }
 
   private recordDiagnostics(paths: string[], items: FileDiagnostic[]): void {
@@ -445,12 +534,25 @@ export class ToolBox {
       if (problem) {
         return `Error: invalid arguments for ${name} — ${problem}. Re-emit the call with valid JSON matching the schema.`;
       }
-      const outcome = await this.dispatch(name, args, context);
-      const text = await this.adaptiveVerification(name, args, context, outcome.text);
-      if (outcome.spilled || SKIP_SPILL.has(name)) {
-        return text;
+      const cacheKey = PURE_TOOL_NAMES.has(name) ? `${name}\u0000${stableStringify(args)}` : undefined;
+      const cached = cacheKey ? this.pureResultCache.get(cacheKey) : undefined;
+      if (cached !== undefined) {
+        return this.dedupResponse === 'marker'
+          ? dedupMarker(name, args)
+          : `${cached}\n\n[DEDUP] Reused the unchanged result of an identical read-only call.`;
       }
-      return await spillOutput(text, name);
+      const outcome = await this.dispatch(name, args, context);
+      const text = withDerivedChangedFiles(await this.adaptiveVerification(name, args, context, outcome.text));
+      const returned = outcome.spilled || SKIP_SPILL.has(name)
+        ? text
+        : await spillOutput(text, name);
+      if (cacheKey && !text.startsWith('Error:')) {
+        this.pureResultCache.set(cacheKey, returned);
+        if (this.pureResultCache.size > 64) {
+          this.pureResultCache.delete(this.pureResultCache.keys().next().value as string);
+        }
+      }
+      return returned;
     } catch (error) {
       return `Error: ${errorMessage(error)}`;
     }
@@ -468,6 +570,10 @@ export class ToolBox {
         return { text: await this.listFiles(args, context) };
       case 'search_text':
         return { text: await this.searchText(args, context) };
+      case 'local_hybrid_search':
+        return { text: await this.localHybridSearch(args) };
+      case 'find_and_read':
+        return { text: await this.findAndRead(args, context) };
       case 'find_symbol':
         return { text: await workspaceSymbols(String(args.query ?? '')) };
       case 'document_symbols':
@@ -654,30 +760,47 @@ export class ToolBox {
         }
       }
     }
+    const pressure = context.contextPressure?.();
+    const pressured = Boolean(
+      pressure && pressure.limitTokens > 0 && pressure.usedTokens / pressure.limitTokens >= 0.45,
+    );
+    const headOnly = pressured && args.start_line === undefined && args.end_line === undefined && stat.size > 12 * 1024;
     const text =
       stat.size > MAX_READ_BYTES
-        ? await this.readFileStreaming(absolute, args)
-        : await this.readFileWhole(absolute, display, args);
+        ? await this.readFileStreaming(absolute, args, headOnly)
+        : await this.readFileWhole(absolute, display, args, headOnly);
     const reminder = await this.agentsMdReminder(absolute);
     return reminder ? `${text}\n\n${reminder}` : text;
   }
 
-  private async readFileWhole(absolute: string, display: string, args: Record<string, any>): Promise<string> {
+  private async readFileWhole(
+    absolute: string,
+    display: string,
+    args: Record<string, any>,
+    headOnly = false,
+  ): Promise<string> {
     const content = await fs.readFile(absolute, 'utf-8');
     if (content.includes('\u0000')) {
       return `Error: ${display} appears to be a binary file.`;
     }
     const lines = content.replace(/\r\n/g, '\n').split('\n');
     const start = clampInt(args.start_line, 1, lines.length) ?? 1;
-    const requestedEnd = clampInt(args.end_line, start, lines.length) ?? Math.min(lines.length, start + 1999);
+    const requestedEnd = headOnly
+      ? Math.min(lines.length, start + 79)
+      : clampInt(args.end_line, start, lines.length) ?? Math.min(lines.length, start + 1999);
     const end = budgetEndLine(lines, start, requestedEnd, MAX_READ_BYTES);
     const hasMore = end < lines.length;
-    return formatNumberedLines(lines.slice(start - 1, end), start, hasMore);
+    const body = formatNumberedLines(lines.slice(start - 1, end), start, hasMore);
+    return headOnly
+      ? `${body}\n\n[READ-GUARD] Context is under pressure; showing the first 80 lines. Use search_text or read_file with start_line/end_line for the relevant range.`
+      : body;
   }
 
-  private async readFileStreaming(absolute: string, args: Record<string, any>): Promise<string> {
+  private async readFileStreaming(absolute: string, args: Record<string, any>, headOnly = false): Promise<string> {
     const start = clampInt(args.start_line, 1, Number.MAX_SAFE_INTEGER) ?? 1;
-    const requestedEnd = clampInt(args.end_line, start, Number.MAX_SAFE_INTEGER) ?? start + 1999;
+    const requestedEnd = headOnly
+      ? start + 79
+      : clampInt(args.end_line, start, Number.MAX_SAFE_INTEGER) ?? start + 1999;
     const lines: string[] = [];
     let bytes = 0;
     let stopped = false;
@@ -706,7 +829,10 @@ export class ToolBox {
       reader.close();
       stream.destroy();
     }
-    return formatNumberedLines(lines, start, stopped);
+    const body = formatNumberedLines(lines, start, stopped);
+    return headOnly
+      ? `${body}\n\n[READ-GUARD] Context is under pressure; showing the first 80 lines. Use search_text or read_file with start_line/end_line for the relevant range.`
+      : body;
   }
 
   private async notFoundMessage(display: string, absolute: string): Promise<string> {
@@ -850,6 +976,69 @@ export class ToolBox {
     return matches.length >= maxResults
       ? `${fallbackBody}\n\n... [showing first ${matches.length} matches; narrow the query or path]`
       : fallbackBody;
+  }
+
+  private async localHybridSearch(args: Record<string, any>): Promise<string> {
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    if (!query) {
+      return 'Error: query is required.';
+    }
+    const index = this.options.codebaseIndex;
+    if (!index) {
+      return 'No deterministic codebase index is available yet. Use search_text or find_symbol.';
+    }
+    const limit = clampInt(args.max_results, 1, 20) ?? 8;
+    const results = await index.hybridSearch(query, limit);
+    if (results.length === 0) {
+      return `No indexed locations matched "${query}".`;
+    }
+    return [
+      `Local hybrid search: "${query}" — ${results.length} result(s)`,
+      ...results.map((result) => {
+        const symbols = result.symbols.slice(0, 8).map((symbol) => `${symbol.name} (${symbol.kind}:${symbol.line})`).join(', ');
+        const imports = result.imports.slice(0, 6).map((item) => `${item.specifier}:${item.line}`).join(', ');
+        return [
+          `- ${result.path} [${result.language}] score=${result.score}`,
+          symbols ? `  Symbols: ${symbols}` : '',
+          imports ? `  Imports: ${imports}` : '',
+          result.exports.length ? `  Exports: ${result.exports.slice(0, 8).join(', ')}` : '',
+        ].filter(Boolean).join('\n');
+      }),
+    ].join('\n');
+  }
+
+  private async findAndRead(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const query = typeof args.query === 'string' ? args.query.trim() : '';
+    if (!query) return 'Error: query is required.';
+    const maxResults = clampInt(args.max_results, 1, 6) ?? 4;
+    const matches = await this.searchText({
+      query,
+      ...(typeof args.path === 'string' && args.path.trim() ? { path: args.path.trim() } : {}),
+      max_results: maxResults * 4,
+    }, context);
+    if (matches.startsWith('No matches found.') || matches.startsWith('Error:')) return matches;
+    const ranges = new Map<string, { start: number; end: number }>();
+    for (const line of matches.split('\n')) {
+      const match = line.match(/^(.+?):(\d+):/);
+      if (!match || ranges.size >= maxResults) continue;
+      const lineNumber = Number(match[2]);
+      if (!Number.isFinite(lineNumber)) continue;
+      const relative = path.relative(this.options.root, path.resolve(this.options.root, match[1])).split(path.sep).join('/');
+      const current = ranges.get(relative);
+      if (current) {
+        current.start = Math.min(current.start, Math.max(1, lineNumber - 8));
+        current.end = Math.max(current.end, lineNumber + 8);
+      } else {
+        ranges.set(relative, { start: Math.max(1, lineNumber - 8), end: lineNumber + 8 });
+      }
+    }
+    if (ranges.size === 0) return matches;
+    const blocks: string[] = [`Find-and-read: "${query}"`];
+    for (const [relative, range] of ranges) {
+      const text = await this.readFile({ path: relative, start_line: range.start, end_line: range.end }, context);
+      blocks.push(`\n--- ${relative}:${range.start}-${range.end} ---\n${text}`);
+    }
+    return blocks.join('\n');
   }
 
   private async writeFile(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
@@ -1002,7 +1191,7 @@ export class ToolBox {
     const result = await runTerminalCommand(command, this.options.root, timeout, context.signal, sandbox, {
       background: this.options.backgroundProcesses,
     });
-    if (!planning) {
+    if (!planning && result.exitCode === 0) {
       const kind = planCheckRequirementFromSteps([command]);
       if (kind) {
         this.recordVerification(`${kind}:${command}`);
@@ -1861,6 +2050,7 @@ export class ToolBox {
     if (preflightProblems.length > 0) {
       return this.failed(`Change set preflight failed; nothing was written: ${preflightProblems.join('; ')}.`, {
         files,
+        changedFiles: [],
         ...(plannedDiff ? { diff: plannedDiff } : {}),
         evidence: [{ kind: 'checkpoint', summary: 'no files written; preflight only' }],
         rollbackAvailable: false,
@@ -1873,6 +2063,7 @@ export class ToolBox {
     if (stale.length > 0) {
       return this.needsInput(`Concurrent edit detected in ${stale.join(', ')}; the change set was aborted.`, {
         files,
+        changedFiles: [],
         ...(plannedDiff ? { diff: plannedDiff } : {}),
         evidence: [{ kind: 'checkpoint', summary: `${checkpoint}; no changes applied` }],
         rollbackAvailable: false,
@@ -1888,6 +2079,7 @@ export class ToolBox {
         const rollback = await this.rollbackApplied(applied, planned, originals);
         return this.needsInput(`Concurrent edit detected in ${changedNow.join(', ')}; the change set was aborted.`, {
           files,
+          changedFiles: rollback.failedRollback,
           ...(plannedDiff ? { diff: plannedDiff } : {}),
           evidence: [
             { kind: 'checkpoint', summary: rollback.rolledBack.length > 0 ? `rolled back ${rollback.rolledBack.join(', ')}` : `${checkpoint}; nothing applied` },
@@ -1912,6 +2104,7 @@ export class ToolBox {
               : 'nothing needed rollback';
         return this.failed(`Change set failed at ${item.relative} — ${errorMessage(error)}.`, {
           files,
+          changedFiles: applied.filter((file) => !rollback.rolledBack.includes(file)),
           ...(plannedDiff ? { diff: plannedDiff } : {}),
           evidence: [{ kind: 'checkpoint', summary: `${checkpoint}; ${rollbackNote}` }],
           rollbackAvailable: rollback.failedRollback.length > 0,
@@ -1930,6 +2123,7 @@ export class ToolBox {
         `Change set applied, but ${addedErrors.length} new error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
         {
           files,
+          changedFiles: applied,
           ...(plannedDiff ? { diff: plannedDiff } : {}),
           diagnostics: compoundDiagnostics(diagnostics),
           evidence,
@@ -1941,6 +2135,7 @@ export class ToolBox {
     return compoundResult({
       status: 'verified',
       files,
+      changedFiles: applied,
       ...(plannedDiff ? { diff: plannedDiff } : {}),
       diagnostics: compoundDiagnostics(diagnostics),
       evidence,
@@ -2165,6 +2360,7 @@ export class ToolBox {
         `Change applied to ${target.relative}, but ${addedErrors.length} new error diagnostic${addedErrors.length === 1 ? '' : 's'} appeared.`,
         {
           files: this.compoundFiles(touched),
+          changedFiles: [target.relative],
           diff,
           diagnostics: compoundDiagnostics(after),
           evidence,
@@ -2176,6 +2372,7 @@ export class ToolBox {
     return compoundResult({
       status: 'verified',
       files: this.compoundFiles(touched),
+      changedFiles: [target.relative],
       diff,
       diagnostics: compoundDiagnostics(after),
       evidence,
@@ -3136,25 +3333,25 @@ export class ToolBox {
         reasons: plan.reasons,
       });
     }
-    if (plan.needsInput && pending.size === 0) {
-      const note = `Adaptive verification needs a confident ${plan.commandKind} command; none was resolved and no command ran. Set devFirst.${plan.commandKind}Command or add a manifest script.`;
-      return compoundResult({
-        ...result,
-        status: 'needs_input',
-        message: result.message ? `${result.message}\n${note}` : note,
-        verification: { level: 'partial', checks: this.mergeChecks(result.verification?.checks ?? [], plan.checks) },
-        policyLevel: plan.level,
-        reasons: plan.reasons,
-        repairAllowed: false,
-      });
-    }
-    const listedChecks = pending.size > 0 ? [...pending] : plan.checks;
+    // High-risk edits keep their targeted checks (closest tests, package
+    // typecheck) so auth/database/migration/route changes fail early. Only the
+    // full project command is deferred. Other edits defer all project checks.
+    const risky = changes.some((change) => matchesRiskPath(change.path));
+    const deferred = plan.checks.filter((check) =>
+      risky ? check === 'project-command' : DEFERRED_EDIT_CHECKS.has(check),
+    );
+    const editChecks = plan.checks.filter((check) => !deferred.includes(check));
+    const listedChecks = pending.size > 0 ? [...pending] : editChecks;
     const outcome = await this.runVerificationChecks(name, args, context, changes, result, listedChecks, touched, plan.commandKind);
     const checks = this.mergeChecks(result.verification?.checks ?? [], listedChecks);
+    const skipped = [
+      ...outcome.skipped,
+      ...deferred.map((check) => ({ check, reason: 'deferred to finish' })),
+    ];
     const evidence = [
       ...(result.evidence ?? []),
       ...outcome.evidence,
-      ...outcome.skipped.map((skip) => ({ kind: 'skip', summary: `${skip.check} skipped: ${skip.reason}` })),
+      ...skipped.map((skip) => ({ kind: 'skip', summary: `${skip.check} skipped: ${skip.reason}` })),
     ];
     if (outcome.failure) {
       const key = `${outcome.failure.path}\u0000${outcome.failure.check}`;
@@ -3176,7 +3373,7 @@ export class ToolBox {
     }
     this.clearRepairStates(changes);
     const level =
-      result.verification?.level === 'full' && outcome.skipped.length === 0 ? 'full' : 'partial';
+      result.verification?.level === 'full' && skipped.length === 0 ? 'full' : 'partial';
     return compoundResult({
       ...result,
       verification: { level, checks },
@@ -3887,6 +4084,56 @@ export function globToRegExp(glob: string): RegExp {
     }
   }
   return new RegExp(`^${pattern}$`);
+}
+
+function stableStringify(value: unknown): string {
+  if (value === undefined) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function dedupMarker(name: string, args: Record<string, any>): string {
+  const target = shortToolTarget(args);
+  return `[DEDUP] Reused unchanged result of ${name}${target ? `(${target})` : ''}. Re-read a specific range if needed.`;
+}
+
+function shortToolTarget(args: Record<string, any>): string {
+  for (const key of ['path', 'query', 'symbol', 'command', 'pattern', 'glob', 'name']) {
+    const value = args[key];
+    if (typeof value === 'string' && value.trim()) {
+      const text = value.trim().replace(/\s+/g, ' ');
+      return text.length > 80 ? `${text.slice(0, 77)}...` : text;
+    }
+  }
+  return '';
+}
+
+function withDerivedChangedFiles(text: string): string {
+  const compound = parseCompoundResult(text);
+  if (!compound || compound.changedFiles !== undefined || !compound.diff) {
+    return text;
+  }
+  const paths = new Set<string>();
+  for (const line of compound.diff.split('\n')) {
+    const match = /^\+\+\+ (?:b\/)?(.+)$/.exec(line.trim());
+    if (!match) continue;
+    const value = match[1].replace(/\\/g, '/').replace(/^\.\//, '').trim();
+    if (value && value !== '/dev/null') {
+      paths.add(value);
+    }
+  }
+  if (paths.size === 0) {
+    return text;
+  }
+  return JSON.stringify({ ...compound, changedFiles: [...paths] });
 }
 
 export { toolCallArgs };

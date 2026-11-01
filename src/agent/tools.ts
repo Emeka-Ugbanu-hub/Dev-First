@@ -77,6 +77,36 @@ export const semanticSearchTool: ToolDef = {
   },
 };
 
+/** A zero-model local search over the deterministic codebase index. */
+export const localHybridSearchTool: ToolDef = {
+  name: 'local_hybrid_search',
+  description:
+    'Fast local hybrid search over indexed paths, symbols, imports, and exports. Use before broad reads; it never calls an embedding model or the network.',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Symbol, file, import, or concept to locate.' },
+      max_results: { type: 'number', description: 'Maximum locations to return (optional, default 8).' },
+    },
+    required: ['query'],
+  },
+};
+
+export const findAndReadTool: ToolDef = {
+  name: 'find_and_read',
+  description:
+    'Search for a symbol or text and read compact numbered ranges around the best matches in one call. Read-only and bounded.',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Text or symbol to find.' },
+      path: { type: 'string', description: 'Optional workspace-relative directory.' },
+      max_results: { type: 'number', description: 'Maximum files/ranges to read (optional, default 4).' },
+    },
+    required: ['query'],
+  },
+};
+
 export const findSymbolTool: ToolDef = {
   name: 'find_symbol',
   description:
@@ -726,6 +756,7 @@ const PLANNER_TOOL_DESCRIPTIONS: Record<string, string> = {
   list_files: 'List workspace files, optionally scoped by path and glob.',
   search_text: 'Search file contents for text or a regular expression and return file:line matches.',
   semantic_search: 'Search the codebase by meaning and return relevant files and line ranges.',
+  local_hybrid_search: 'Fast local search over indexed paths, symbols, imports, and exports; no model call.',
   find_symbol: 'Find symbols by name and return their file, line, kind, and container.',
   document_symbols: 'List a file\'s symbol tree with line numbers.',
   find_references: 'Find references to a symbol in the workspace.',
@@ -791,6 +822,8 @@ export function readOnlyTools(options: ToolRegistryOptions = {}): ToolDef[] {
     readFileTool,
     listFilesTool,
     searchTextTool,
+    localHybridSearchTool,
+    findAndReadTool,
     findSymbolTool,
     documentSymbolsTool,
     findReferencesTool,

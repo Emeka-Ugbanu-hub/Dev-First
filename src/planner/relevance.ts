@@ -315,6 +315,8 @@ export interface PlannerRequestInput {
   completedRunBoundary?: boolean;
   /** Deterministic, request-scoped scanner evidence. */
   evidence?: string;
+  /** Cached, deterministic project identity summary. */
+  bootstrap?: string;
 }
 
 export interface PlannerRequestResult {
@@ -342,6 +344,9 @@ export function composePlannerRequest(input: PlannerRequestInput): PlannerReques
   }
   if (input.evidence) {
     messages.push({ role: 'system', content: input.evidence });
+  }
+  if (input.bootstrap) {
+    messages.push({ role: 'system', content: input.bootstrap });
   }
   if (selection.summary) {
     messages.push({ role: 'system', content: selection.summary });

@@ -1021,7 +1021,12 @@ function applyHostMessage(previous: UiState, message: HostMessage): UiState {
         },
       };
     case 'addMessage':
-      return { ...previous, messages: [...previous.messages, message.message] };
+      return {
+        ...previous,
+        messages: previous.messages.some((item) => item.id === message.message.id)
+          ? previous.messages.map((item) => (item.id === message.message.id ? message.message : item))
+          : [...previous.messages, message.message],
+      };
     case 'assistantDelta':
       return {
         ...previous,

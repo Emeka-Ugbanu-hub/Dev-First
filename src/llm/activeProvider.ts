@@ -17,7 +17,7 @@ export interface ActiveProvider {
   reasoningDefault?: string;
 }
 
-export type ModelRole = 'main' | 'planner' | 'editor' | 'scanner' | 'architecture';
+export type ModelRole = 'main' | 'planner' | 'editor' | 'scanner';
 
 interface ResolvedConnection {
   preset: ProviderPreset;
@@ -90,16 +90,12 @@ export async function roleProvider(
     ? config.plannerPreset
     : role === 'editor'
       ? config.editorPreset
-      : role === 'scanner'
-        ? config.scanPreset
-        : config.architecturePreset;
+      : config.scanPreset;
   const modelSetting = role === 'planner'
     ? config.plannerModel.trim()
     : role === 'editor'
       ? config.editorModel.trim()
-      : role === 'scanner'
-        ? (config.scanModel.trim() || config.scanAiModel.trim())
-        : config.architectureModel.trim();
+      : (config.scanModel.trim() || config.scanAiModel.trim());
   if (!presetId && !modelSetting) {
     return activeProvider(context);
   }

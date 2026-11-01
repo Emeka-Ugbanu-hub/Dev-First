@@ -76,6 +76,9 @@ beforeEach(() => {
   env.root = `/tmp/dev-first-paste-file-${Math.random().toString(36).slice(2)}`;
   env.config = { preset: 'openai', model: 'gpt-4o', pasteFileLines: 120 };
   env.secret = 'sk-test';
+  // Keep the route probe from reaching the network; an auth failure falls
+  // back to the local route and the planner.
+  vi.stubGlobal('fetch', async () => ({ ok: false, status: 401, json: async () => ({}), text: async () => '' }));
 });
 
 afterEach(async () => {

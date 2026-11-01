@@ -2,7 +2,7 @@
   "name": "dev-first",
   "displayName": "Dev-First",
   "description": "Plan-first AI coding agent — every request becomes a plan you approve before a single line changes.",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "publisher": "dev-first",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "media/icon.png",
@@ -410,7 +410,7 @@
         "devFirst.adaptiveVerify": {
           "type": "boolean",
           "default": true,
-          "description": "Escalate verification automatically after edits: diagnostics, related files, closest tests, then the project typecheck or test command when risk or scope warrants it."
+          "description": "Verify as edits land: diagnostics and related-file checks stay immediate, while project typecheck/test/lint runs once at finish. A failed finish asks before completing."
         },
         "devFirst.typecheckCommand": {
           "type": "string",
@@ -667,22 +667,7 @@
           "default": "",
           "markdownDescription": "Optional model ID for approved execution/editing. Empty uses the editor preset's selected model."
         },
-        "devFirst.architecturePreset": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Provider preset for architecture mapping. Empty inherits the main connection."
-        },
-        "devFirst.architectureModel": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Model ID for architecture mapping. Empty uses the selected architecture connection model."
-        },
-        "devFirst.architectureReasoningEffort": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Reasoning effort for architecture mapping. Empty uses the strongest supported level for broad, accurate maps and does not inherit the main composer."
-        },
-        "devFirst.architecture": {
+                                "devFirst.architecture": {
           "type": "boolean",
           "default": true,
           "description": "Show the Architecture button that maps the codebase into domains, subsystems, and components."

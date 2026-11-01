@@ -154,7 +154,7 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     group: 'Verification',
     label: 'Adaptive verification after edits',
     description:
-      'Escalate verification automatically after edits: diagnostics, related files, closest tests, then the project typecheck or test command when risk or scope warrants it.',
+      'Verify as edits land: diagnostics and related-file checks stay immediate, while project typecheck/test/lint runs once at finish. A failed finish asks before completing.',
     type: 'boolean',
   },
   {
@@ -250,6 +250,15 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     type: 'number',
     min: 0,
     max: 2_000_000,
+  },
+  {
+    key: 'plannerThinking',
+    tab: 'behavior',
+    group: 'Context',
+    label: 'Planner thinking',
+    description: 'Whether the planner deliberates before answering. Auto skips planner thinking on local models and uses bounded evidence-based effort routing elsewhere; off disables it everywhere; on honors the selected effort. Explicit run overrides always win.',
+    type: 'enum',
+    options: ['auto', 'off', 'on'],
   },
   {
     key: 'contextProfile',
@@ -420,20 +429,9 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     description: 'Effort for the selected scanner model. Empty uses a speed-first default and does not inherit the main composer.', type: 'enum',
     options: ['', 'off', 'low', 'medium', 'high', 'max'],
   },
-  {
-    key: 'architecturePreset', tab: 'provider', group: 'Task models', label: 'Architecture provider',
-    description: 'Provider used for architecture mapping. Empty inherits the main connection.', type: 'enum',
-    options: ['', 'openai', 'anthropic', 'gemini', 'openrouter', 'groq', 'deepseek', 'ollama', 'lmstudio', 'custom'],
-  },
-  {
-    key: 'architectureModel', tab: 'provider', group: 'Task models', label: 'Architecture model',
-    description: 'Model ID for architecture mapping. Empty uses the selected architecture connection model.', type: 'string',
-  },
-  {
-    key: 'architectureReasoningEffort', tab: 'provider', group: 'Task models', label: 'Architecture reasoning effort',
-    description: 'Effort for the selected architecture model. Empty uses the strongest supported level for broad, accurate maps; it does not inherit the main composer.', type: 'enum',
-    options: ['', 'off', 'low', 'medium', 'high', 'max'],
-  },
+
+
+
   {
     key: 'architecture',
     tab: 'display',

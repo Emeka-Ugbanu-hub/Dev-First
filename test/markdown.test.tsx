@@ -38,6 +38,15 @@ describe('Markdown', () => {
     expect(html).toContain('<code>npm test</code>');
   });
 
+  it('renders Mermaid diagrams with a zoom and pan viewer', () => {
+    const html = render('```mermaid\nflowchart TD\n  A[Start] --> B[Finish]\n```');
+    expect(html).toContain('mermaid-viewport');
+    expect(html).toContain('aria-label="Zoom in"');
+    expect(html).toContain('aria-label="Zoom out"');
+    expect(html).toContain('aria-label="Reset diagram view"');
+    expect(html).toContain('Drag to move');
+  });
+
   it('keeps single line breaks inside a paragraph', () => {
     const html = render('**WHAT**\nIt seeds the setting on first launch.');
     expect(html).toMatch(/<br\s*\/?>/);

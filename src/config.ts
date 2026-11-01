@@ -63,9 +63,6 @@ export interface DevFirstConfig {
   plannerModel: string;
   editorPreset: string;
   editorModel: string;
-  architecturePreset: string;
-  architectureModel: string;
-  architectureReasoningEffort: ReasoningEffortSetting | '';
   architecture: boolean;
   pasteFileLines: number;
   warmOnFocus: boolean;
@@ -140,9 +137,6 @@ export function getConfig(): DevFirstConfig {
     plannerModel: config.get<string>('plannerModel', ''),
     editorPreset: config.get<string>('editorPreset', ''),
     editorModel: config.get<string>('editorModel', ''),
-    architecturePreset: config.get<string>('architecturePreset', ''),
-    architectureModel: config.get<string>('architectureModel', ''),
-    architectureReasoningEffort: config.get<ReasoningEffortSetting | ''>('architectureReasoningEffort', ''),
     architecture: config.get<boolean>('architecture', true),
     pasteFileLines: Math.max(20, config.get<number>('pasteFileLines', 120)),
     warmOnFocus: config.get<boolean>('warmOnFocus', true),

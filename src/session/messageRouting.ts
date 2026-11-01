@@ -1,7 +1,7 @@
 import type { ChatMessage, LLMProvider, ToolCall, ToolDef } from '../llm/types';
 import { chatWithRetry } from '../llm/retry';
 import { parseJsonLoose } from '../util/json';
-import type { DurableTaskState, Plan, TaskRouteEvent } from '../shared/protocol';
+import type { DurableTaskState, Plan, PlanningMode, TaskRouteEvent } from '../shared/protocol';
 
 export type IncomingRoute = TaskRouteEvent['route'];
 
@@ -24,7 +24,7 @@ const ROUTES = new Set<ModelMessageRoute>([
   'smalltalk', 'acknowledgement', 'question', 'answer', 'refine-plan', 'cancel-plan', 'continue-task', 'needs-clarification', 'new-task',
 ]);
 
-const ROUTER_PROMPT = `Classify the latest developer message for the current Dev-First task. Call classify_route exactly once. Do not answer the developer and do not emit prose. Use the message meaning and current task state, not single keyword matches. Routes: smalltalk (greeting/casual conversation), acknowledgement (brief confirmation/thanks), question (codebase or general explanation), answer (explanation while an existing task is active), refine-plan (changes the current draft plan), cancel-plan (discards the current draft), continue-task (steers the current task), needs-clarification (the request is genuinely ambiguous and needs one decision), new-task (unrelated change request). An explicit request to create a plan, turn an explanation into a plan, implement, fix, edit, build, change, improve, refactor, add, or remove something is a task request even if it contains a question; route it to refine-plan when it clearly refers to the current draft, otherwise new-task. A pure request for explanation or information remains question/answer and must not create a plan.`;
+const ROUTER_PROMPT = `Classify the latest developer message for the current Dev-First task. Call classify_route exactly once. Do not answer the developer and do not emit prose. Use the message meaning and current task state, not single keyword matches. Routes: smalltalk (greeting/casual conversation), acknowledgement (brief confirmation/thanks), question (codebase or general explanation), answer (explanation while an existing task is active), refine-plan (changes the current draft plan), cancel-plan (discards the current draft), continue-task (steers the current task), needs-clarification (the request is genuinely ambiguous and needs one decision), new-task (unrelated change request). For change requests (refine-plan or new-task), also set mode to the smallest safe planningMode: skip for one explicit low-risk operation, lite for a small known change, spec for a normal change, full for architecture or high-risk work. Omit mode for questions, answers, smalltalk, and acknowledgements. An explicit request to create a plan, turn an explanation into a plan, implement, fix, edit, build, change, improve, refactor, add, or remove something is a task request even if it contains a question; route it to refine-plan when it clearly refers to the current draft, otherwise new-task. A pure request for explanation or information remains question/answer and must not create a plan.`;
 
 const ROUTE_TOOL: ToolDef = {
   name: 'classify_route',
@@ -37,6 +37,11 @@ const ROUTE_TOOL: ToolDef = {
         type: 'string',
         enum: ['smalltalk', 'acknowledgement', 'question', 'answer', 'refine-plan', 'cancel-plan', 'continue-task', 'needs-clarification', 'new-task'],
       },
+      mode: {
+        type: 'string',
+        enum: ['skip', 'lite', 'spec', 'full'],
+        description: 'Smallest safe planning mode for a change request; omit for questions, answers, smalltalk, or acknowledgements.',
+      },
       response: { type: 'string', description: 'Short reply only for smalltalk or acknowledgement; otherwise empty.' },
     },
     required: ['route'],
@@ -45,6 +50,7 @@ const ROUTE_TOOL: ToolDef = {
 
 export interface ModelRouteDecision {
   route: ModelMessageRoute;
+  mode?: PlanningMode;
   response?: string;
 }
 
@@ -97,9 +103,13 @@ export async function classifyMessageRoute(
       continue;
     }
     if (!decision) {
-      const parsed = parseJsonLoose(raw) as { route?: unknown; response?: unknown } | undefined;
+      const parsed = parseJsonLoose(raw) as { route?: unknown; mode?: unknown; response?: unknown } | undefined;
       if (typeof parsed?.route === 'string' && ROUTES.has(parsed.route as ModelMessageRoute)) {
-        decision = { route: parsed.route as ModelMessageRoute, response: typeof parsed.response === 'string' ? parsed.response.trim() : undefined };
+        decision = {
+          route: parsed.route as ModelMessageRoute,
+          ...(isPlanningMode(parsed.mode) ? { mode: parsed.mode } : {}),
+          response: typeof parsed.response === 'string' ? parsed.response.trim() : undefined,
+        };
       }
     }
     if (decision) return decision;
@@ -107,10 +117,18 @@ export async function classifyMessageRoute(
   return undefined;
 }
 
+function isPlanningMode(value: unknown): value is PlanningMode {
+  return value === 'skip' || value === 'lite' || value === 'spec' || value === 'full';
+}
+
 function parseRouteArguments(call: ToolCall): ModelRouteDecision | undefined {
-  const parsed = parseJsonLoose(call.arguments) as { route?: unknown; response?: unknown } | undefined;
+  const parsed = parseJsonLoose(call.arguments) as { route?: unknown; mode?: unknown; response?: unknown } | undefined;
   return typeof parsed?.route === 'string' && ROUTES.has(parsed.route as ModelMessageRoute)
-    ? { route: parsed.route as ModelMessageRoute, response: typeof parsed.response === 'string' ? parsed.response.trim() : undefined }
+    ? {
+      route: parsed.route as ModelMessageRoute,
+      ...(isPlanningMode(parsed.mode) ? { mode: parsed.mode } : {}),
+      response: typeof parsed.response === 'string' ? parsed.response.trim() : undefined,
+    }
     : undefined;
 }
 

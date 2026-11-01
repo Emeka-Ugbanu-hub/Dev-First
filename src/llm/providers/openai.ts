@@ -10,6 +10,7 @@ import { normalizeModelId } from '../modelRegistry';
 import { hasInterleavedReasoning } from '../catalog';
 import { HttpError, isReasoningRejection, isStreamOptionsRejection } from '../errors';
 import { FetchTimeouts, fetchWithTimeouts, resolveTimeouts } from '../timeout';
+import { consolidateSystemMessages } from '../messageNormalizer';
 
 export interface OpenAIProviderConfig {
   apiKey: string;
@@ -143,9 +144,10 @@ export class OpenAIProvider implements LLMProvider {
     reasoning: ChatOptions['reasoning'],
     streamUsage: boolean,
   ): Record<string, unknown> {
+    const normalizedMessages = consolidateSystemMessages(messages);
     const body: Record<string, unknown> = {
       model: options.model,
-      messages: toOpenAIMessages(messages, this.replaysReasoning(options.model)),
+      messages: toOpenAIMessages(normalizedMessages, this.replaysReasoning(options.model)),
       stream: true,
     };
     if (streamUsage) {
@@ -178,7 +180,7 @@ export class OpenAIProvider implements LLMProvider {
       body.reasoning_effort = reasoning.effort ?? (isReasoningModel(options.model) ? 'medium' : undefined);
     }
     if (options.cache !== false) {
-      const cacheKey = promptCacheKey(messages, options);
+      const cacheKey = promptCacheKey(normalizedMessages, options);
       if (cacheKey) {
         body.prompt_cache_key = cacheKey;
       }
@@ -335,15 +337,8 @@ function ollamaImageData(dataUrl: string): string {
 }
 
 function toOllamaMessages(messages: ChatMessage[]): unknown[] {
-  const system = messages
-    .filter((message) => message.role === 'system')
-    .map((message) => sanitizeSurrogates(message.content))
-    .filter(Boolean)
-    .join('\n\n');
-  const ordered = messages.filter((message) => message.role !== 'system');
-  const normalized: ChatMessage[] = system
-    ? [{ role: 'system', content: system }, ...ordered]
-    : ordered;
+  const normalized = consolidateSystemMessages(messages);
+  const system = normalized.find((message) => message.role === 'system')?.content ?? '';
   if (!normalized.some((message) => message.role === 'user')) {
     // Some context projections can contain only system/tool/assistant history.
     // Ollama templates require a user query, so recover the pinned active

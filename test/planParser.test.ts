@@ -20,6 +20,39 @@ describe('planFromObject', () => {
     ]);
   });
 
+  it('keeps an explicit empty expectedFiles list even when steps name paths', () => {
+    const plan = planFromObject({
+      steps: ['Update src/api/client.ts'],
+      expectedFiles: [],
+    }, 1);
+    expect(plan?.expectedFiles).toEqual([]);
+  });
+
+  it('defaults dependencies and assumptions to none for change plans', () => {
+    const plan = planFromObject({ what: 'W', steps: ['Update src/a.ts'], expectedFiles: [] }, 1);
+    expect(plan?.dependencies).toBe('none');
+    expect(plan?.assumptions).toBe('none');
+  });
+
+  it('defaults verification to none only for lite plans', () => {
+    const lite = planFromObject(
+      { planningMode: 'lite', what: 'W', steps: ['Update src/a.ts'], expectedFiles: [] },
+      1,
+    );
+    expect(lite?.verification).toEqual(['none']);
+    const spec = planFromObject(
+      { planningMode: 'spec', what: 'W', steps: ['Update src/a.ts'], expectedFiles: [] },
+      1,
+    );
+    expect(spec?.verification).toBeUndefined();
+  });
+
+  it('does not add execution defaults to explanations', () => {
+    const plan = planFromObject({ intent: 'explanation', what: 'W' }, 1);
+    expect(plan?.dependencies).toBeUndefined();
+    expect(plan?.assumptions).toBeUndefined();
+  });
+
   it('parses a full plan', () => {
     const plan = planFromObject(
       {
@@ -344,6 +377,26 @@ describe('planToText', () => {
       4,
     );
     expect(parsed?.convention).toBe('follows the handler-layer auth convention');
+  });
+
+  it('round-trips dependencies, assumptions, and verification', () => {
+    const parsed = planFromText(
+      planToText({
+        version: 1,
+        status: 'draft',
+        planningMode: 'spec',
+        what: 'W',
+        steps: ['s1'],
+        expectedFiles: [],
+        dependencies: 'none',
+        assumptions: 'Auth middleware already exists.',
+        verification: ['Run the auth tests'],
+      }),
+      1,
+    );
+    expect(parsed?.dependencies).toBe('none');
+    expect(parsed?.assumptions).toBe('Auth middleware already exists.');
+    expect(parsed?.verification).toEqual(['Run the auth tests']);
   });
 });
 

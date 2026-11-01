@@ -5,6 +5,7 @@ import {
   RISK_PATH_SEGMENTS,
   diagnosticsCacheKey,
   matchesRiskPath,
+  planCheckRequirementFromPlan,
   planCheckRequirementFromSteps,
   planVerification,
 } from '../src/agent/verificationPolicy';
@@ -177,10 +178,18 @@ describe('plan check requirement from steps', () => {
     expect(planCheckRequirementFromSteps(['npm run build'])).toBe('build');
   });
 
-  it('ignores generic verification language', () => {
+  it('detects natural-language checks but ignores generic verification language', () => {
     expect(planCheckRequirementFromSteps(['verify the implementation'])).toBeUndefined();
-    expect(planCheckRequirementFromSteps(['run the tests'])).toBeUndefined();
+    expect(planCheckRequirementFromSteps(['run the tests'])).toBe('test');
+    expect(planCheckRequirementFromSteps(['run typecheck'])).toBe('typecheck');
     expect(planCheckRequirementFromSteps(['check the change', 'make sure it works'])).toBeUndefined();
+  });
+
+  it('resolves the plan requirement from steps or explicit verification prose', () => {
+    expect(planCheckRequirementFromPlan(['Do the thing'], ['Run the auth tests'])).toBe('test');
+    expect(planCheckRequirementFromPlan(['Run lint'], ['none'])).toBe('lint');
+    expect(planCheckRequirementFromPlan(['Do the thing'], ['none'])).toBeUndefined();
+    expect(planCheckRequirementFromPlan(['Do the thing'], ['Manually check the toggle'])).toBe('typecheck');
   });
 
   it('returns undefined for missing or empty steps', () => {

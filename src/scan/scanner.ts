@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import { createHash } from 'node:crypto';
 import type { Tree } from '@vscode/tree-sitter-wasm/wasm/web-tree-sitter';
 import { getConfig } from '../config';
 import type { DevFirstConfig } from '../config';
@@ -33,6 +34,15 @@ import { reasoningLevelsFor } from '../llm/catalog';
 
 export { matchGlob };
 
+function workspaceStorageFile(storageRoot: string | undefined, root: string | undefined): string | undefined {
+  if (!storageRoot) {
+    return undefined;
+  }
+  const identity = path.resolve(root ?? process.cwd());
+  const key = createHash('sha1').update(identity).digest('hex').slice(0, 16);
+  return path.join(storageRoot, 'duplication-index', `${key}.json`);
+}
+
 const AI_RULE_IDS = new Set([
   'ai-bug',
   'ai-vulnerability',
@@ -58,12 +68,12 @@ export class ScanRunner implements vscode.Disposable {
   private readonly diagnosticCache = new Map<string, Map<ScanFinding, vscode.Diagnostic>>();
   private readonly trees = new Map<string, { version: number; tree: Tree }>();
   private readonly treeSitter: TreeSitterService;
-  private readonly duplication: DuplicationIndex;
+  private duplication: DuplicationIndex;
   private readonly aiScanner: AiScanner;
   private readonly crossFileAi: CrossFileAi;
-  private readonly memory: MemoryStore;
+  private memory: MemoryStore;
   private readonly conventionPhraser: ConventionPhraser;
-  private readonly projectModel: ProjectModel;
+  private projectModel: ProjectModel;
   private readonly aiStatus: vscode.StatusBarItem;
   private readonly output: vscode.OutputChannel;
   private readonly pairFindings = new Map<string, ScanFinding[]>();
@@ -115,35 +125,14 @@ export class ScanRunner implements vscode.Disposable {
         set: (key, verdict) => this.duplication.setPairVerdict(key, verdict),
       },
     });
-    this.duplication = new DuplicationIndex({
-      parse: (text, languageId) => this.treeSitter.parse(text, languageId),
-      root: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
-      storageFile: context.globalStorageUri
-        ? path.join(context.globalStorageUri.fsPath, 'duplication-index.json')
-        : undefined,
-      getScanIgnore: () => getConfig().scanIgnore,
-      getMaxFileKb: () => 1024,
-      getMaxFiles: () => getConfig().scanMaxFiles,
-    });
-    this.memory = new MemoryStore(
-      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
-      context.globalStorageUri.fsPath,
-    );
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    this.duplication = this.createDuplicationIndex(root);
+    this.memory = new MemoryStore(root ?? process.cwd(), context.globalStorageUri.fsPath);
     this.conventionPhraser = new ConventionPhraser({
       getModel: () => getConfig().scanModel.trim() || getConfig().scanAiModel.trim() || getConfig().model,
       buildProvider: () => this.buildScanProvider(),
     });
-    this.projectModel = new ProjectModel({
-      memory: this.memory,
-      loadState: () => this.context.workspaceState.get<ProjectModelState>('devFirst.projectModel'),
-      saveState: async (state) => {
-        await this.context.workspaceState.update('devFirst.projectModel', state);
-      },
-      getFacts: () => this.duplication.getFacts(),
-      getHashes: () => this.duplication.getFileHashes(),
-      buildProvider: () => this.buildScanProvider(),
-      getModel: () => getConfig().scanModel.trim() || getConfig().scanAiModel.trim() || getConfig().model,
-    });
+    this.projectModel = this.createProjectModel();
     this.diagnostics = vscode.languages.createDiagnosticCollection('dev-first-scan');
     this.aiStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 89);
     this.output = vscode.window.createOutputChannel('Dev-First Scanner');
@@ -156,6 +145,57 @@ export class ScanRunner implements vscode.Disposable {
       vscode.workspace.onDidCloseTextDocument((document) => this.clear(document)),
       this,
     );
+  }
+
+  /**
+   * Workspace folders can change without reloading the extension. Rebuild the
+   * scanner boundary so facts, cached indexes, and project memory never leak
+   * from the previous workspace into architecture or scan results.
+   */
+  resetWorkspace(root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath): void {
+    if (this.disposed) {
+      return;
+    }
+    const previous = this.duplication;
+    this.duplication = this.createDuplicationIndex(root);
+    this.memory = new MemoryStore(root ?? process.cwd(), this.context.globalStorageUri.fsPath);
+    this.projectModel = this.createProjectModel();
+    for (const entry of this.trees.values()) {
+      entry.tree.delete();
+    }
+    this.trees.clear();
+    this.findings.clear();
+    this.aiFindings.clear();
+    this.pairFindings.clear();
+    this.diagnosticCache.clear();
+    previous.dispose();
+    void this.duplication.ensureBuilt(this.duplicationToken);
+    this.factsUpdated.fire();
+  }
+
+  private createDuplicationIndex(root: string | undefined): DuplicationIndex {
+    return new DuplicationIndex({
+      parse: (text, languageId) => this.treeSitter.parse(text, languageId),
+      root,
+      storageFile: workspaceStorageFile(this.context.globalStorageUri?.fsPath, root),
+      getScanIgnore: () => getConfig().scanIgnore,
+      getMaxFileKb: () => 1024,
+      getMaxFiles: () => getConfig().scanMaxFiles,
+    });
+  }
+
+  private createProjectModel(): ProjectModel {
+    return new ProjectModel({
+      memory: this.memory,
+      loadState: () => this.context.workspaceState.get<ProjectModelState>('devFirst.projectModel'),
+      saveState: async (state) => {
+        await this.context.workspaceState.update('devFirst.projectModel', state);
+      },
+      getFacts: () => this.duplication.getFacts(),
+      getHashes: () => this.duplication.getFileHashes(),
+      buildProvider: () => this.buildScanProvider(),
+      getModel: () => getConfig().scanModel.trim() || getConfig().scanAiModel.trim() || getConfig().model,
+    });
   }
 
   dispose(): void {

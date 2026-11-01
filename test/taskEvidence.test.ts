@@ -4,7 +4,7 @@ import { buildTaskEvidencePack } from '../src/planner/taskEvidence';
 describe('task evidence pack', () => {
   it('selects request-relevant nodes and verified relationships', () => {
     const stored = {
-      version: 3,
+      version: 5,
       workspaceRoot: '/workspace',
       filesHash: 'hash',
       mermaid: 'flowchart TD',
@@ -38,7 +38,7 @@ describe('task evidence pack', () => {
 
   it('rejects a cached map from another workspace', () => {
     const state = { get: <T>(_key: string): T | undefined => ({
-      version: 3,
+      version: 5,
       workspaceRoot: '/other',
       filesHash: 'hash',
       mermaid: 'flowchart TD',

@@ -107,7 +107,36 @@ export function buildStructuralMap(facts: FileFacts[], root: string, projectName
     nodes.push({ id, label: labelFor(entry.file), group: groupFor(entry.file, entry.fact), path: entry.file });
   }
 
-  const edges: StructuredEdge[] = [];
+  const routeEdges: StructuredEdge[] = [];
+  for (const entry of files) {
+    const target = nodeByFile.get(entry.file);
+    if (!target) continue;
+    for (const handler of entry.fact.handlers) {
+      const routeId = nodeId(`route/${entry.file}/${handler.method}/${handler.pathShape}/${handler.line}`);
+      const label = [handler.method, handler.pathShape].filter(Boolean).join(' ') || handler.name;
+      nodes.push({ id: routeId, label: label.slice(0, 40), group: 'Flows' });
+      routeEdges.push({
+        from: routeId,
+        to: target,
+        label: 'handles',
+        evidence: [{ path: entry.file, line: handler.line }],
+      });
+    }
+  }
+
+  // Add explicit side-effect boundaries from scanner evidence. These nodes
+  // make every discoverable flow visible without asking the model to invent a
+  // database, external service, event bus, or storage layer.
+  const hasDatabase = files.some(({ fact }) => fact.sql.length > 0);
+  const hasExternal = files.some(({ fact }) => fact.httpClients.length > 0 || fact.httpCalls.length > 0);
+  const hasEvents = files.some(({ fact }) => fact.listeners.length > 0);
+  const hasStorage = files.some(({ fact }) => fact.storageKeys.length > 0);
+  if (hasDatabase) nodes.push({ id: 'system_database', label: 'Database', group: 'Infrastructure' });
+  if (hasExternal) nodes.push({ id: 'system_external', label: 'External Services', group: 'Infrastructure' });
+  if (hasEvents) nodes.push({ id: 'system_events', label: 'Events / Queues', group: 'Infrastructure' });
+  if (hasStorage) nodes.push({ id: 'system_storage', label: 'Storage', group: 'Infrastructure' });
+
+  const edges: StructuredEdge[] = [...routeEdges];
   const edgeKeys = new Set<string>();
   for (const entry of files) {
     const from = nodeByFile.get(entry.file);
@@ -125,6 +154,40 @@ export function buildStructuralMap(facts: FileFacts[], root: string, projectName
         to,
         label: 'imports',
         evidence: [{ path: entry.file, line: imported.line }],
+      });
+    }
+    if (entry.fact.sql.length > 0) {
+      edges.push({
+        from,
+        to: 'system_database',
+        label: 'queries',
+        evidence: [{ path: entry.file, line: entry.fact.sql[0].line }],
+      });
+    }
+    if (entry.fact.httpClients.length > 0 || entry.fact.httpCalls.length > 0) {
+      const line = entry.fact.httpCalls[0]?.line ?? entry.fact.httpClients[0]?.line ?? 1;
+      edges.push({
+        from,
+        to: 'system_external',
+        label: 'calls',
+        evidence: [{ path: entry.file, line }],
+      });
+    }
+    if (entry.fact.listeners.length > 0) {
+      edges.push({
+        from,
+        to: 'system_events',
+        label: 'listens',
+        evidence: [{ path: entry.file, line: entry.fact.listeners[0].line }],
+      });
+    }
+    if (entry.fact.storageKeys.length > 0) {
+      const access = entry.fact.storageKeys[0].access;
+      edges.push({
+        from,
+        to: 'system_storage',
+        label: access === 'write' ? 'writes' : 'reads',
+        evidence: [{ path: entry.file, line: entry.fact.storageKeys[0].line }],
       });
     }
   }

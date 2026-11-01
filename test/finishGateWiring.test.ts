@@ -130,7 +130,9 @@ describe('AgentService finish gate', () => {
       onNotice: (text) => notices.push(text),
     });
 
-    expect(result).toEqual({ summary: 'Done.', files: undefined, reachedLimit: false });
+    expect(result).toMatchObject({ summary: 'Done.', files: undefined, reachedLimit: false });
+    expect(result.stats).toMatchObject({ turns: 1, toolCalls: 1, stopReason: 'finish' });
+    expect(result.stats?.promptTokens).toBeGreaterThan(0);
     expect(provider.calls).toHaveLength(1);
     expect(finishCheck).toHaveBeenCalledTimes(1);
     expect(notices).toEqual([]);
@@ -243,7 +245,288 @@ describe('AgentService finish gate', () => {
     const { provider, agent } = buildAgent([[toolCallEvent('finish', { summary: 'Done.' })]]);
     const result = await agent.run(planArgs(), 'do it', new AbortController().signal, callbacks());
     expect(provider.calls).toHaveLength(1);
-    expect(result).toEqual({ summary: 'Done.', files: undefined, reachedLimit: false });
+    expect(result).toMatchObject({ summary: 'Done.', files: undefined, reachedLimit: false });
+    expect(result.stats).toMatchObject({ turns: 1, toolCalls: 1, stopReason: 'finish' });
+    expect(result.stats?.promptTokens).toBeGreaterThan(0);
+  });
+});
+
+describe('AgentService finish verification', () => {
+  it('runs the plan check at finish and offers Finish anyway when it fails', async () => {
+    const failures = ['verification failed: typecheck npm run typecheck\nerror TS1005'];
+    const finishVerification = vi.fn(async () => ({ ran: [], failures }));
+    let received: FinishCheckSummary | undefined;
+    const finishCheck = vi.fn((summary: FinishCheckSummary) => {
+      received = summary;
+      return {
+        ok: false as const,
+        issues: ['verification failed: typecheck npm run typecheck'],
+        compact: 'Finish check:\nAction required: resolve the failing verification check',
+        overridable: true,
+      };
+    });
+    const provider = new ScriptedProvider([[toolCallEvent('finish', { summary: 'Done.' })]]);
+    const toolbox = {
+      execute: vi.fn(async () => 'ok'),
+      finishVerification,
+      adaptiveVerificationSnapshot: () => ({
+        diagnosticsAvailable: false,
+        newDiagnosticErrors: 0,
+        verificationRan: [],
+        verificationFailures: failures,
+      }),
+    } as unknown as ToolBox;
+    const agent = new AgentService(provider, 'gpt-test', toolbox, {
+      maxSteps: 6,
+      tools: executionTools(),
+      autoCompact: false,
+      contextLimitTokens: 128000,
+      finishCheck,
+    });
+    const notices: string[] = [];
+
+    const result = await agent.run(planArgs(), 'do it', new AbortController().signal, {
+      ...callbacks(),
+      planCheckRequirement: 'typecheck',
+      askUser: async () => 'Finish anyway',
+      onNotice: (text) => notices.push(text),
+    });
+
+    expect(finishVerification).toHaveBeenCalledTimes(1);
+    expect(received?.verificationFailures).toEqual(failures);
+    expect(result.incomplete).toBeUndefined();
+    expect(result.verificationWaived).toBe(true);
+    expect(result.summary).toContain('without passing verification');
+    expect(provider.calls).toHaveLength(1);
+    expect(notices).toContain("Finished without passing verification at the developer's request.");
+  });
+
+  it('continues once when the developer chooses Keep working', async () => {
+    const failure = {
+      ok: false as const,
+      issues: ['verification failed: test npm test'],
+      compact: COMPACT,
+      overridable: true,
+    };
+    const finishCheck = vi.fn().mockReturnValueOnce(failure).mockReturnValueOnce({ ok: true as const });
+    const finishVerification = vi.fn(async () => ({
+      ran: [],
+      failures: ['verification failed: test npm test'],
+    }));
+    const provider = new ScriptedProvider([
+      [toolCallEvent('finish', { summary: 'First.' })],
+      [toolCallEvent('finish', { summary: 'Second.' })],
+    ]);
+    const toolbox = { execute: vi.fn(async () => 'ok'), finishVerification } as unknown as ToolBox;
+    const agent = new AgentService(provider, 'gpt-test', toolbox, {
+      maxSteps: 6,
+      tools: executionTools(),
+      autoCompact: false,
+      contextLimitTokens: 128000,
+      finishCheck,
+    });
+
+    const result = await agent.run(planArgs(), 'do it', new AbortController().signal, {
+      ...callbacks(),
+      planCheckRequirement: 'test',
+      askUser: async () => 'Keep working',
+    });
+
+    expect(finishCheck).toHaveBeenCalledTimes(2);
+    expect(provider.calls).toHaveLength(2);
+    expect(toolMessage(provider, 1, COMPACT)).toBeDefined();
+    expect(result.summary).toBe('Second.');
+    expect(result.incomplete).toBeUndefined();
+  });
+});
+
+describe('AgentService changed-file accounting', () => {
+  it('passes compound changedFiles to the finish gate', async () => {
+    let received: FinishCheckSummary | undefined;
+    const finishCheck = vi.fn((summary: FinishCheckSummary) => {
+      received = summary;
+      return { ok: true as const };
+    });
+    const provider = new ScriptedProvider([
+      [toolCallEvent('update_related_files', { symbol_or_pattern: 'X', patchTemplate: '@@\n-a\n+b' })],
+      [toolCallEvent('finish', { summary: 'Done.' })],
+    ]);
+    const toolbox = {
+      execute: vi.fn(async () => JSON.stringify({
+        status: 'verified',
+        files: ['src/a.ts', 'src/b.ts'],
+        changedFiles: ['src/a.ts', 'src/b.ts'],
+        verification: { level: 'full', checks: [] },
+        rollbackAvailable: true,
+      })),
+    } as unknown as ToolBox;
+    const agent = new AgentService(provider, 'gpt-test', toolbox, {
+      maxSteps: 6,
+      tools: executionTools(),
+      autoCompact: false,
+      contextLimitTokens: 128000,
+      finishCheck,
+    });
+
+    await agent.run(planArgs(), 'do it', new AbortController().signal, callbacks());
+
+    expect(received?.changedFiles.map((file) => file.path).sort()).toEqual(['src/a.ts', 'src/b.ts']);
+  });
+
+  it('marks an earlier read stale when a compound result reports the file changed', async () => {
+    const provider = new ScriptedProvider([
+      [toolCallEvent('read_file', { path: 'src/a.ts' })],
+      [toolCallEvent('update_related_files', { symbol_or_pattern: 'X', patchTemplate: '@@\n-a\n+b' })],
+      [toolCallEvent('finish', { summary: 'Done.' })],
+    ]);
+    const toolbox = {
+      execute: vi.fn(async (name: string) => (name === 'read_file'
+        ? '1 | old contents'
+        : JSON.stringify({
+          status: 'verified',
+          files: ['src/a.ts'],
+          changedFiles: ['src/a.ts'],
+          verification: { level: 'full', checks: [] },
+          rollbackAvailable: true,
+        }))),
+    } as unknown as ToolBox;
+    const agent = new AgentService(provider, 'gpt-test', toolbox, {
+      maxSteps: 6,
+      tools: executionTools(),
+      autoCompact: false,
+      contextLimitTokens: 128000,
+    });
+
+    await agent.run(planArgs(), 'do it', new AbortController().signal, callbacks());
+
+    const lastCall = provider.calls[provider.calls.length - 1];
+    expect(lastCall.messages.some(
+      (message) => message.role === 'tool' && String(message.content).includes('outdated'),
+    )).toBe(true);
+  });
+
+  it('labels an expected-file waiver as verification incomplete', async () => {
+    const finishCheck = vi.fn(() => ({
+      ok: false as const,
+      issues: ['expected file not changed: src/a.ts'],
+      compact: 'Finish check:\nAction required: complete expected file: src/a.ts',
+      overridable: true,
+    }));
+    const provider = new ScriptedProvider([[toolCallEvent('finish', { summary: 'Done.' })]]);
+    const toolbox = { execute: vi.fn(async () => 'ok') } as unknown as ToolBox;
+    const agent = new AgentService(provider, 'gpt-test', toolbox, {
+      maxSteps: 6,
+      tools: executionTools(),
+      autoCompact: false,
+      contextLimitTokens: 128000,
+      finishCheck,
+    });
+    const notices: string[] = [];
+
+    const result = await agent.run(planArgs(), 'do it', new AbortController().signal, {
+      ...callbacks(),
+      askUser: async () => 'Finish anyway',
+      onNotice: (text) => notices.push(text),
+    });
+
+    expect(result.planWaived).toBe(true);
+    expect(result.verificationWaived).toBeUndefined();
+    expect(result.summary).toContain('Finished with verification incomplete');
+    expect(notices).toContain('Finished with verification incomplete — expected files were not changed.');
+    expect(provider.calls).toHaveLength(1);
+  });
+});
+
+describe('AgentService tool ordering and budgets', () => {
+  it('executes mixed calls in model order and batches only adjacent reads', async () => {
+    const events: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const toolbox = {
+      execute: vi.fn(async (name: string, argsJson: string) => {
+        const path = JSON.parse(argsJson).path ?? '';
+        events.push(`${name}:${path}`);
+        if (name === 'read_file') {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          inFlight -= 1;
+        }
+        return 'ok';
+      }),
+    } as unknown as ToolBox;
+    const provider = new ScriptedProvider([
+      [
+        toolCallEvent('read_file', { path: 'a.ts' }),
+        toolCallEvent('edit_file', { path: 'b.ts', oldText: 'x', newText: 'y' }),
+        toolCallEvent('read_file', { path: 'c.ts' }),
+      ],
+      [toolCallEvent('finish', { summary: 'Done.' })],
+    ]);
+    const agent = new AgentService(provider, 'gpt-test', toolbox, {
+      maxSteps: 4,
+      tools: executionTools(),
+      autoCompact: false,
+      contextLimitTokens: 128000,
+      parallelTools: true,
+    });
+
+    await agent.run(planArgs(), 'do it', new AbortController().signal, callbacks());
+
+    expect(events).toEqual(['read_file:a.ts', 'edit_file:b.ts', 'read_file:c.ts']);
+    expect(maxInFlight).toBe(1);
+  });
+
+  it('runs adjacent reads concurrently', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const toolbox = {
+      execute: vi.fn(async (name: string) => {
+        if (name === 'read_file') {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          inFlight -= 1;
+        }
+        return 'ok';
+      }),
+    } as unknown as ToolBox;
+    const provider = new ScriptedProvider([
+      [
+        toolCallEvent('read_file', { path: 'a.ts' }),
+        toolCallEvent('read_file', { path: 'b.ts' }),
+      ],
+      [toolCallEvent('finish', { summary: 'Done.' })],
+    ]);
+    const agent = new AgentService(provider, 'gpt-test', toolbox, {
+      maxSteps: 4,
+      tools: executionTools(),
+      autoCompact: false,
+      contextLimitTokens: 128000,
+      parallelTools: true,
+    });
+
+    await agent.run(planArgs(), 'do it', new AbortController().signal, callbacks());
+
+    expect(maxInFlight).toBe(2);
+  });
+
+  it('returns an incomplete result and stats at the step limit', async () => {
+    const provider = new ScriptedProvider([[toolCallEvent('read_file', { path: 'a.ts' })]]);
+    const toolbox = { execute: vi.fn(async () => 'ok') } as unknown as ToolBox;
+    const agent = new AgentService(provider, 'gpt-test', toolbox, {
+      maxSteps: 1,
+      tools: executionTools(),
+      autoCompact: false,
+      contextLimitTokens: 128000,
+    });
+
+    const result = await agent.run(planArgs(), 'do it', new AbortController().signal, callbacks());
+
+    expect(result.reachedLimit).toBe(true);
+    expect(result.incomplete?.issues[0]).toContain('step limit');
+    expect(result.stats).toMatchObject({ turns: 1, toolCalls: 1, stopReason: 'step-limit' });
+    expect(result.stats?.promptTokens).toBeGreaterThan(0);
   });
 });
 
@@ -300,6 +583,7 @@ describe('SessionController incomplete finish', () => {
       .find((message) => message.kind === 'completion');
     expect(completion?.text).toContain('Done.');
     expect(completion?.text).toContain('Run ended incomplete — unfinished step: "Do the thing"');
+    expect(posts(posted, 'plan').some((message) => message.plan?.status === 'completed')).toBe(false);
     controller.dispose();
   });
 });

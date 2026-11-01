@@ -137,7 +137,7 @@ describe('run completion plan lifecycle', () => {
     setPlan(controller, draftPlan());
     setTodos(controller, [
       { text: 'Add a retry helper', status: 'done' },
-      { text: 'Wire it into the client', status: 'in_progress' },
+      { text: 'Wire it into the client', status: 'done' },
     ]);
 
     await controller.handleMessage({ type: 'approvePlan' });

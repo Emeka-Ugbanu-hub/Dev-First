@@ -145,7 +145,7 @@ let root: string;
 let applyChange: ReturnType<typeof vi.fn>;
 let applyDeletion: ReturnType<typeof vi.fn>;
 
-function toolbox(): ToolBox {
+function toolbox(dedupResponse?: 'marker' | 'full'): ToolBox {
   return new ToolBox({
     root,
     diffManager: { applyChange, applyDeletion } as any,
@@ -157,6 +157,7 @@ function toolbox(): ToolBox {
     autoApproveMcp: true,
     checkDiagnostics: false,
     sandbox: 'off',
+    ...(dedupResponse ? { dedupResponse } : {}),
   });
 }
 
@@ -493,9 +494,24 @@ describe('fix_in_file', () => {
     const parsed = JSON.parse(result);
     expect(parsed.status).toBe('verified');
     expect(parsed.files).toEqual(['broken.ts']);
+    expect(parsed.changedFiles).toEqual(['broken.ts']);
     expect(parsed.diff).toContain('+const fixed = 1;');
     expect(parsed.verification.level).toBe('full');
     expect(await fs.readFile(target, 'utf-8')).toBe('const fixed = 1;\n');
+  });
+
+  it('records only the edited target when verification paths are supplied', async () => {
+    await fs.writeFile(path.join(root, 'target.ts'), 'const value = 1;\n', 'utf-8');
+    await fs.writeFile(path.join(root, 'verify.ts'), 'export const other = 2;\n', 'utf-8');
+    const result = await toolbox().execute(
+      'fix_in_file',
+      JSON.stringify({ path: 'target.ts', content: 'const value = 2;\n', verify: ['verify.ts'] }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.status).toBe('verified');
+    expect(parsed.files).toEqual(expect.arrayContaining(['target.ts', 'verify.ts']));
+    expect(parsed.changedFiles).toEqual(['target.ts']);
   });
 
   it('fails cleanly when the patch does not match', async () => {
@@ -726,10 +742,14 @@ describe('update_related_files', () => {
       context,
     );
     const parsed = JSON.parse(result);
-    expect(parsed.status).toBe('needs_input');
+    expect(parsed.status).toBe('verified');
     expect(parsed.message).toContain('Updated 12/12 files');
+    expect(parsed.changedFiles).toHaveLength(12);
+    expect(parsed.changedFiles).toEqual(expect.arrayContaining(['file-0.ts', 'file-5.ts', 'file-11.ts']));
     expect(parsed.policyLevel).toBe(3);
-    expect(parsed.message).toContain('none was resolved and no command ran');
+    expect(parsed.evidence).toEqual(
+      expect.arrayContaining([{ kind: 'skip', summary: 'project-command skipped: deferred to finish' }]),
+    );
     expect(await fs.readFile(path.join(root, 'file-5.ts'), 'utf-8')).toBe('let marker = 1;\n');
   });
 });
@@ -984,13 +1004,40 @@ describe('adaptive verification', () => {
     const parsed = JSON.parse(result);
     expect(parsed.status).toBe('verified');
     expect(parsed.policyLevel).toBe(2);
-    expect(parsed.verification.checks).toEqual(
-      expect.arrayContaining(['related-diagnostics', 'references', 'closest-test', 'package-typecheck']),
+    expect(parsed.changedFiles).toEqual(expect.arrayContaining(['greet.ts', 'greet.test.ts']));
+    expect(parsed.verification.checks).toEqual(expect.arrayContaining(['related-diagnostics', 'references']));
+    expect(parsed.verification.checks).not.toContain('closest-test');
+    expect(parsed.verification.checks).not.toContain('package-typecheck');
+    expect(parsed.evidence).toEqual(
+      expect.arrayContaining([{ kind: 'skip', summary: 'closest-test skipped: deferred to finish' }]),
     );
     expect(terminal.calls).toEqual([]);
   });
 
-  it('escalates a five-file change set to level 3 and runs the project test command', async () => {
+  it('keeps targeted checks during edits on risk paths', async () => {
+    await fs.mkdir(path.join(root, 'auth'), { recursive: true });
+    await fs.writeFile(
+      path.join(root, 'package.json'),
+      JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' } }),
+      'utf-8',
+    );
+    await fs.writeFile(path.join(root, 'auth', 'solo.ts'), 'const a = 1;\n', 'utf-8');
+    const result = await toolbox().execute(
+      'fix_in_file',
+      JSON.stringify({ path: 'auth/solo.ts', content: 'const a = 2;\n' }),
+      context,
+    );
+    const parsed = JSON.parse(result);
+    expect(parsed.policyLevel).toBe(3);
+    expect(parsed.verification.checks).toContain('package-typecheck');
+    expect(parsed.verification.checks).not.toContain('project-command');
+    expect(parsed.evidence).toEqual(
+      expect.arrayContaining([{ kind: 'skip', summary: 'project-command skipped: deferred to finish' }]),
+    );
+    expect(terminal.calls).toEqual(['npm run typecheck']);
+  });
+
+  it('escalates a five-file change set to level 3 and defers the project test command', async () => {
     await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run' } }), 'utf-8');
     const changes = [];
     for (let index = 0; index < 5; index++) {
@@ -1002,8 +1049,11 @@ describe('adaptive verification', () => {
     expect(parsed.status).toBe('verified');
     expect(parsed.policyLevel).toBe(3);
     expect(parsed.reasons).toContain('5 files changed');
-    expect(parsed.verification.checks).toContain('project-command');
-    expect(terminal.calls).toEqual(['npm run test']);
+    expect(parsed.verification.checks).not.toContain('project-command');
+    expect(parsed.evidence).toEqual(
+      expect.arrayContaining([{ kind: 'skip', summary: 'project-command skipped: deferred to finish' }]),
+    );
+    expect(terminal.calls).toEqual([]);
   });
 
   it('honors a context plan check requirement over the toolbox options', async () => {
@@ -1018,11 +1068,14 @@ describe('adaptive verification', () => {
     expect(parsed.status).toBe('verified');
     expect(parsed.policyLevel).toBe(3);
     expect(parsed.reasons).toContain('plan requires test check');
-    expect(parsed.verification.checks).toContain('project-command');
-    expect(terminal.calls).toEqual(['npm run test']);
+    expect(parsed.verification.checks).not.toContain('project-command');
+    expect(parsed.evidence).toEqual(
+      expect.arrayContaining([{ kind: 'skip', summary: 'project-command skipped: deferred to finish' }]),
+    );
+    expect(terminal.calls).toEqual([]);
   });
 
-  it('allows one repair and reruns only the failed check', async () => {
+  it('runs the required project check once at finish and dedupes repeat finishes', async () => {
     await fs.writeFile(
       path.join(root, 'package.json'),
       JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' } }),
@@ -1030,34 +1083,19 @@ describe('adaptive verification', () => {
     );
     await fs.writeFile(path.join(root, 'check.ts'), 'const a = 1;\n', 'utf-8');
     const box = toolbox();
-    terminal.exitCode = 2;
-    terminal.output = 'error TS1005';
-    const first = await box.execute(
-      'fix_in_file',
-      JSON.stringify({ path: 'check.ts', content: 'const a = 2;\n' }),
-      context,
-    );
-    const firstParsed = JSON.parse(first);
-    expect(firstParsed.status).toBe('failed');
-    expect(firstParsed.repairAllowed).toBe(true);
-    expect(firstParsed.message).toContain('error TS1005');
+
+    const first = await box.finishVerification('typecheck', ['check.ts'], context);
+    expect(first.ran).toEqual(['typecheck:npm run typecheck']);
+    expect(first.failures).toEqual([]);
     expect(terminal.calls).toEqual(['npm run typecheck']);
 
-    terminal.exitCode = 0;
-    const second = await box.execute(
-      'fix_in_file',
-      JSON.stringify({ path: 'check.ts', content: 'const a = 3;\n' }),
-      context,
-    );
-    const secondParsed = JSON.parse(second);
-    expect(secondParsed.status).toBe('verified');
-    expect(secondParsed.repairAllowed).toBe(false);
-    expect(secondParsed.policyLevel).toBe(3);
-    expect(secondParsed.verification.level).toBe('full');
-    expect(terminal.calls).toEqual(['npm run typecheck', 'npm run typecheck']);
+    const second = await box.finishVerification('typecheck', ['check.ts'], context);
+    expect(second.ran).toEqual([]);
+    expect(second.failures).toEqual([]);
+    expect(terminal.calls).toEqual(['npm run typecheck']);
   });
 
-  it('stops after the second failure of the same check', async () => {
+  it('captures a failed finish check and reruns it after a fix', async () => {
     await fs.writeFile(
       path.join(root, 'package.json'),
       JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' } }),
@@ -1067,17 +1105,20 @@ describe('adaptive verification', () => {
     const box = toolbox();
     terminal.exitCode = 2;
     terminal.output = 'error TS1005';
-    await box.execute('fix_in_file', JSON.stringify({ path: 'check.ts', content: 'const a = 2;\n' }), context);
-    terminal.output = 'error TS2322';
-    const second = await box.execute(
-      'fix_in_file',
-      JSON.stringify({ path: 'check.ts', content: 'const a = 3;\n' }),
-      context,
+
+    const first = await box.finishVerification('typecheck', ['check.ts'], context);
+    expect(first.ran).toEqual([]);
+    expect(first.failures[0]).toContain('error TS1005');
+    expect(box.adaptiveVerificationSnapshot().verificationFailures).toEqual(
+      expect.arrayContaining([expect.stringContaining('verification failed')]),
     );
-    const parsed = JSON.parse(second);
-    expect(parsed.status).toBe('failed');
-    expect(parsed.repairAllowed).toBe(false);
-    expect(parsed.message).toBe('Repair attempt already used; stopping.');
+
+    terminal.exitCode = 0;
+    terminal.output = 'ok';
+    const second = await box.finishVerification('typecheck', ['check.ts'], context);
+    expect(second.ran).toEqual(['typecheck:npm run typecheck']);
+    expect(second.failures).toEqual([]);
+    expect(box.adaptiveVerificationSnapshot().verificationFailures).toEqual([]);
     expect(terminal.calls).toEqual(['npm run typecheck', 'npm run typecheck']);
   });
 
@@ -1104,5 +1145,58 @@ describe('adaptive verification', () => {
     expect(parsed.repairAllowed).toBeUndefined();
     expect(parsed.verification.checks).toEqual(['content', 'stale-guard', 'diagnostics']);
     expect(terminal.calls).toEqual([]);
+  });
+});
+
+describe('pure-result dedup responses', () => {
+  it('returns only a short marker on a marker-mode cache hit', async () => {
+    await fs.writeFile(path.join(root, 'auth.ts'), 'const token = "secret";\n', 'utf-8');
+    const box = toolbox('marker');
+    const first = await box.execute('read_file', JSON.stringify({ path: 'auth.ts' }), context);
+    expect(first).toContain('const token');
+
+    const second = await box.execute('read_file', JSON.stringify({ path: 'auth.ts' }), context);
+    expect(second.startsWith('[DEDUP]')).toBe(true);
+    expect(second).toContain('read_file(auth.ts)');
+    expect(second).not.toContain('const token');
+  });
+
+  it('keeps the full result for the default executor mode', async () => {
+    await fs.writeFile(path.join(root, 'auth.ts'), 'const token = "secret";\n', 'utf-8');
+    const box = toolbox('full');
+    await box.execute('read_file', JSON.stringify({ path: 'auth.ts' }), context);
+    const second = await box.execute('read_file', JSON.stringify({ path: 'auth.ts' }), context);
+    expect(second).toContain('const token');
+    expect(second).toContain('[DEDUP]');
+  });
+
+  it('dedups reordered arguments through a canonical cache key', async () => {
+    await fs.writeFile(path.join(root, 'auth.ts'), 'const token = "secret";\n', 'utf-8');
+    const box = toolbox('marker');
+    const first = await box.execute(
+      'read_file',
+      JSON.stringify({ start_line: 1, path: 'auth.ts' }),
+      context,
+    );
+    expect(first).toContain('const token');
+    const second = await box.execute(
+      'read_file',
+      JSON.stringify({ path: 'auth.ts', start_line: 1 }),
+      context,
+    );
+    expect(second.startsWith('[DEDUP]')).toBe(true);
+  });
+
+  it('clears the pure cache when the read cache is reset', async () => {
+    await fs.writeFile(path.join(root, 'auth.ts'), 'const token = "secret";\n', 'utf-8');
+    const box = toolbox('marker');
+    await box.execute('read_file', JSON.stringify({ path: 'auth.ts' }), context);
+    const cached = await box.execute('read_file', JSON.stringify({ path: 'auth.ts' }), context);
+    expect(cached.startsWith('[DEDUP]')).toBe(true);
+
+    box.resetReadCache();
+    const fresh = await box.execute('read_file', JSON.stringify({ path: 'auth.ts' }), context);
+    expect(fresh).toContain('const token');
+    expect(fresh.startsWith('[DEDUP]')).toBe(false);
   });
 });

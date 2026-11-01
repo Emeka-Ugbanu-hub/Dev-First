@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ChatMessage, ChatOptions, LLMProvider, ReasoningOptions, StreamEvent, ToolDef } from '../src/llm/types';
 import type { Plan } from '../src/shared/protocol';
 import { PlannerService, PlannerCallbacks } from '../src/planner/PlannerService';
@@ -238,6 +238,84 @@ describe('PlannerService single-turn intent handling', () => {
     expect(toolMessages[8].content).not.toContain('trimmed');
   });
 
+  it('reports planner prompt, turn, TTFT, and readiness stats', async () => {
+    const provider = new ScriptedProvider([[{ type: 'text', text: 'Hello.' }]]);
+    const result = await planner(provider).plan(request, null, 1, callbacks(), new AbortController().signal);
+
+    expect(result.stats?.turns).toBe(1);
+    expect(result.stats?.promptTokens).toBeGreaterThan(0);
+    expect(result.stats?.readinessRejections).toBe(0);
+    expect(result.stats?.timeToFirstTokenMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('uses the requested planning-mode fragment in the system prompt', async () => {
+    const provider = new ScriptedProvider([[{ type: 'text', text: 'Hello.' }]]);
+    const service = new PlannerService(provider, 'test-model', {
+      maxSteps: 1,
+      tools: [],
+      planningMode: 'full',
+    });
+    await service.plan(request, null, 1, callbacks(), new AbortController().signal);
+
+    expect(String(provider.calls[0].messages[0].content)).toContain('## Mode: full');
+    expect(String(provider.calls[0].messages[0].content)).toContain('risks');
+  });
+
+  it('folds the planner transcript when compress_context is called', async () => {
+    const replies: StreamEvent[][] = Array.from({ length: 12 }, (_, index) => [
+      callWithId(`read-${index}`, 'read_file', { path: `file-${index}.ts` }),
+    ]);
+    const provider = new ScriptedProvider([
+      ...replies,
+      [call('compress_context', { focus: 'auth' })],
+      [{ type: 'text', text: 'Done.' }],
+    ]);
+    const cb = callbacks();
+    cb.executeTool = async () => 'x'.repeat(3_000);
+    const service = new PlannerService(provider, 'test-model', {
+      maxSteps: 20,
+      tools: [
+        { name: 'read_file', description: 'Read files', parameters: { type: 'object', properties: {} } },
+        { name: 'ask_user', description: 'Ask a question', parameters: { type: 'object', properties: {} } },
+      ],
+      contextLimitTokens: 4_000,
+    });
+
+    await service.plan(request, null, 1, cb, new AbortController().signal);
+
+    const finalCall = provider.calls[provider.calls.length - 1];
+    expect(finalCall.messages.some(
+      (message) => message.role === 'tool' && String(message.content).includes('Planner context folded from'),
+    )).toBe(true);
+    expect(finalCall.messages.some(
+      (message) => String(message.content).includes('[Deterministic checkpoint of earlier work]'),
+    )).toBe(true);
+  });
+
+  it('notifies when older tool results are trimmed so planner caches can reset', async () => {
+    const reads = Array.from({ length: 9 }, (_, index) =>
+      callWithId(`t${index}`, 'read_file', { path: `f${index}.ts` }));
+    const provider = new ScriptedProvider([
+      reads,
+      [call('submit_plan', { what: 'Fix X', steps: ['Fix X'], ...readiness })],
+    ]);
+    const onTrimmed = vi.fn();
+    const cb = callbacks();
+    cb.executeTool = async (tool) => `${tool.id}:`.padEnd(600, 'x');
+    const service = new PlannerService(provider, 'test-model', {
+      maxSteps: 4,
+      tools: [
+        { name: 'read_file', description: 'Read files', parameters: { type: 'object', properties: {} } },
+        { name: 'ask_user', description: 'Ask a question', parameters: { type: 'object', properties: {} } },
+      ],
+      onToolResultsTrimmed: onTrimmed,
+    });
+
+    await service.plan(request, null, 1, cb, new AbortController().signal);
+
+    expect(onTrimmed).toHaveBeenCalled();
+  });
+
   it('nudges once when a turn ends with thinking but no answer', async () => {
     const provider = new ScriptedProvider([
       [{ type: 'reasoning', text: 'Let me think about this.' }],
@@ -252,6 +330,49 @@ describe('PlannerService single-turn intent handling', () => {
     expect(String(nudge?.content)).toContain('stopped after thinking');
   });
 
+  it('includes a correction example when a plan misses required fields', async () => {
+    const provider = new ScriptedProvider([
+      [call('submit_plan', { what: 'Fix X', steps: ['Fix X in src/a.ts'], expectedFiles: [] })],
+      [call('submit_plan', { what: 'Fix X', steps: ['Fix X in src/a.ts'], expectedFiles: [], ...readiness })],
+    ]);
+    const result = await planner(provider).plan(request, null, 1, callbacks(), new AbortController().signal);
+
+    expect(result.plan).toBeDefined();
+    const rejection = provider.calls[1].messages.find(
+      (message) => message.role === 'tool' && String(message.content).includes('plan is not ready'),
+    );
+    expect(String(rejection?.content)).toContain('Correction example');
+    expect(String(rejection?.content)).toContain('"verification"');
+    expect(String(rejection?.content)).not.toContain('dependencies');
+  });
+
+  it('applies readiness to plans emitted as text', async () => {
+    const incomplete = JSON.stringify({
+      intent: 'plan',
+      what: 'Fix X',
+      steps: ['Fix X in src/a.ts'],
+      expectedFiles: [],
+    });
+    const complete = JSON.stringify({
+      intent: 'plan',
+      what: 'Fix X',
+      steps: ['Fix X in src/a.ts'],
+      expectedFiles: [],
+      verification: ['Run the relevant tests'],
+    });
+    const provider = new ScriptedProvider([
+      [{ type: 'text', text: incomplete }],
+      [{ type: 'text', text: complete }],
+    ]);
+    const result = await planner(provider).plan(request, null, 1, callbacks(), new AbortController().signal);
+
+    expect(result.plan).toBeDefined();
+    expect(provider.calls).toHaveLength(2);
+    const rejection = provider.calls[1].messages.at(-1);
+    expect(rejection?.role).toBe('user');
+    expect(String(rejection?.content)).toContain('Correction example');
+  });
+
   it('nudges once after repeated readiness rejections, then stops', async () => {
     const minimal = call('submit_plan', { what: 'Fix X', steps: ['Fix X'] });
     const provider = new ScriptedProvider([[minimal], [minimal], [minimal]]);
@@ -261,6 +382,7 @@ describe('PlannerService single-turn intent handling', () => {
     expect(result.exhausted).toBe(false);
     expect(result.stopped).toBe('same-plan');
     expect(provider.calls).toHaveLength(3);
+    expect(result.stats?.readinessRejections).toBeGreaterThanOrEqual(2);
     expect(provider.calls[2].messages.some(
       (message) => message.role === 'user' && String(message.content).startsWith('LOOP RECOVERY:'),
     )).toBe(true);

@@ -5,6 +5,20 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import * as path from 'path';
 
+async function removeDir(target: string): Promise<void> {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      await rm(target, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOTEMPTY' || attempt === 5) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
+    }
+  }
+}
+
 const env = vi.hoisted(() => ({
   config: {} as Record<string, unknown>,
   secret: undefined as string | undefined,
@@ -215,7 +229,7 @@ describe('buildRunOperation', () => {
       expect(operation?.target).toBe('a.ts');
       expect(operation?.afterHash).toBeUndefined();
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await removeDir(root);
     }
   });
 
@@ -240,7 +254,7 @@ describe('buildRunOperation', () => {
         { path: 'new.ts', status: 'added', before: null, after: null, captured: false },
       ]);
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await removeDir(root);
     }
   });
 });
@@ -373,8 +387,8 @@ describe('SessionController recovered runs', () => {
       expect(controller.getState().recovery).toBeUndefined();
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -401,8 +415,8 @@ describe('SessionController recovered runs', () => {
       expect(notices.some((text) => text.includes('no longer valid'))).toBe(true);
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -423,8 +437,8 @@ describe('SessionController recovered runs', () => {
       expect(notices.some((text) => text.includes('Cannot resume safely'))).toBe(false);
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -451,8 +465,8 @@ describe('SessionController recovered runs', () => {
       expect((await runs.load('r1'))?.changedFiles).toBeUndefined();
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -468,8 +482,8 @@ describe('SessionController recovered runs', () => {
       expect((await runs.load('r1'))?.changedFiles).toEqual([]);
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -502,8 +516,8 @@ describe('SessionController recovered runs', () => {
       expect((await runs.load('r1'))?.changedFiles).toEqual([]);
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -542,8 +556,8 @@ describe('SessionController recovered runs', () => {
       expect((await runs.load('r1'))?.changedFiles).toEqual([]);
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -562,8 +576,8 @@ describe('SessionController recovered runs', () => {
       expect((await runs.load('r1'))?.changedFiles).toEqual([]);
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -621,8 +635,8 @@ describe('SessionController recovered runs', () => {
       expect(notices.some((text) => text.includes(conflicted))).toBe(true);
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -640,8 +654,8 @@ describe('SessionController recovered runs', () => {
       expect((await store.load('s1'))?.queued).toEqual([]);
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -654,8 +668,8 @@ describe('SessionController recovered runs', () => {
       expect(controller.getState().recovery?.processesAlive).toEqual([process.pid]);
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 
@@ -671,8 +685,8 @@ describe('SessionController recovered runs', () => {
       expect((await runs.load('r1'))?.browser).toBeUndefined();
       controller.dispose();
     } finally {
-      await rm(storage, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
+      await removeDir(storage);
+      await removeDir(workspace);
     }
   });
 });

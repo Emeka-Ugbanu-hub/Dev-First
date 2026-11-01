@@ -1,25 +1,23 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
-import { existsSync, readFileSync, statSync } from 'fs';
+import { existsSync, statSync } from 'fs';
 import * as path from 'path';
 import type { FileFacts } from '../scan/duplication';
 import type { ArchitectureScanCoverage } from '../scan/duplication';
-import type { ChatOptions, LLMProvider, ToolCall, ToolDef } from '../llm/types';
-import { buildMapDigest } from './mapDigest';
-import { buildMermaidMap, mapPathsOf, parseStructuredMap } from './mapValidate';
+import { buildMermaidMap, mapPathsOf } from './mapValidate';
 import { buildLevelView } from './mapLevels';
 import {
   ARCHITECTURE_MAP_KEY,
+  ARCHITECTURE_MAP_VERSION,
   StoredArchitectureMap,
-  architectureFilesHash,
+  architectureFactsHash,
   isStale,
   readStoredMap,
   writeStoredMap,
   ArchitectureMapCoverage,
 } from './mapStore';
-import { generateArchitectureMap } from './mapGenerate';
-import { buildStructuralMap, selectArchitectureFacts } from './structuralMap';
-import { summarizeFiles, summarizeModules } from './fileSummaries';
+import { selectArchitectureFacts } from './structuralMap';
+import { buildDeterministicMap } from './deterministicMap';
 
 export interface ArchitecturePanelDeps {
   extensionUri: vscode.Uri;
@@ -27,10 +25,6 @@ export interface ArchitecturePanelDeps {
   state: vscode.Memento;
   getFacts: () => Promise<FileFacts[]>;
   getCoverage: () => Promise<ArchitectureScanCoverage>;
-  getActive: () => Promise<{ provider: LLMProvider; model: string } | undefined>;
-  getReasoning?: () => ChatOptions['reasoning'] | Promise<ChatOptions['reasoning']>;
-  getTools: () => Promise<ToolDef[]>;
-  executeTool: (call: ToolCall) => Promise<string>;
 }
 
 interface ArchitectureMessage {
@@ -39,108 +33,20 @@ interface ArchitectureMessage {
   path?: string;
   svg?: string;
   crumbs?: string[];
+  targetPath?: string[];
 }
 
-function relativeFile(root: string, value: string): string {
-  let candidate = value.trim();
-  if (/^file:/i.test(candidate)) {
-    try {
-      candidate = decodeURIComponent(new URL(candidate).pathname);
-    } catch {
-      candidate = candidate.replace(/^file:\/\//i, '');
-    }
-  }
-  const absolute = path.resolve(candidate);
-  const relative = path.relative(path.resolve(root), absolute);
-  return relative && !relative.startsWith('..') && !path.isAbsolute(relative)
-    ? relative.replace(/\\/g, '/')
-    : value.replace(/\\/g, '/').replace(/^\.\//, '');
-}
-
-function architectureDomain(file: string, fact?: FileFacts): string {
-  const parts = file.replace(/\\/g, '/').split('/').filter(Boolean);
-  const ignored = new Set(['src', 'app', 'lib', 'packages']);
-  const lowerFile = file.toLowerCase();
-  if (fact?.sql.length || /(^|\/)(db|database|prisma|migrations?|repositories?)(\/|$)/.test(lowerFile)) return 'Database';
-  if (fact?.handlers.length || fact?.httpClients.length || /(^|\/)(api|server|routes?|controllers?|services?|middleware)(\/|$)/.test(lowerFile)) return 'Backend';
-  if (/(^|\/)(functions?|lambda|workers?|jobs?|queues?)(\/|$)/.test(lowerFile)) return 'Functions';
-  if (/(^|\/)(cloud|infra|infrastructure|deploy|terraform|\.github)(\/|$)/.test(lowerFile)) return 'Cloud';
-  if (/\.(jsx?|tsx?|vue|svelte|astro|css|scss)$/.test(lowerFile) && /\.(tsx?|jsx?)$/.test(lowerFile)) return 'Frontend';
-  const segment = parts.slice(0, -1).find((part) => !ignored.has(part.toLowerCase())) ?? 'Core';
-  const value = segment.toLowerCase();
-  if (/^(front|client|component|page|screen|view|ui)/.test(value)) return 'Frontend';
-  if (/^(back|server|api|route|controller|service|middleware)/.test(value)) return 'Backend';
-  if (/^(db|database|data|prisma|sql|migration|repository|repo)/.test(value)) return 'Database';
-  if (/^(cloud|infra|infrastructure|deploy|terraform|aws|azure|gcp)/.test(value)) return 'Cloud';
-  if (/^(function|functions|lambda|worker|jobs|queue)/.test(value)) return 'Functions';
-  return segment;
-}
-
-function mergeArchitectureMaps(
-  base: StoredArchitectureMap,
-  detail: import('./mapValidate').StructuredMap,
-  domain: string,
-  root: string,
-  model: string,
-): StoredArchitectureMap {
-  const prefix = domain.toLowerCase().replace(/[^a-z0-9]+/g, '_');
-  const existing = new Set(base.structured.nodes.map((node) => node.id));
-  const idMap = new Map<string, string>();
-  const nodes = detail.nodes.map((node) => {
-    if (node.id === 'project' || node.id === 'root') {
-      return undefined;
-    }
-    let id = `${prefix}_${node.id}`;
-    while (existing.has(id)) id = `${id}_`;
-    existing.add(id);
-    idMap.set(node.id, id);
-    return {
-      ...node,
-      id,
-      group: node.group ? `${domain}/${node.group}` : domain,
-    };
-  }).filter((node): node is NonNullable<typeof node> => Boolean(node));
-  const edges = detail.edges.flatMap((edge) => {
-    const from = idMap.get(edge.from);
-    const to = idMap.get(edge.to);
-    if (!from || !to || from === to) return [];
-    return [{ ...edge, from, to }];
-  });
-  const structured = {
-    nodes: [...base.structured.nodes, ...nodes],
-    edges: [...base.structured.edges, ...edges],
-  };
-  const filesHash = base.filesHash;
-  return {
-    ...base,
-    model,
-    generatedAt: Date.now(),
-    filesHash,
-    mermaid: buildMermaidMap(structured),
-    paths: mapPathsOf(structured, (relative) => existsSync(path.join(root, relative))),
-    structured,
-  };
-}
-
-export const EMPTY_NO_MODEL = 'no-model';
 export const EMPTY_NO_FACTS = 'no-facts';
-export const EMPTY_NOT_DRAWN = 'not-drawn';
 
 export class ArchitecturePanel {
   static current: ArchitecturePanel | undefined;
 
   private stored: StoredArchitectureMap | undefined;
-  private controller: AbortController | undefined;
   private generating = false;
-  private lastRaw = '';
   private levelPath: string[] = [];
   private groupIndex = new Map<string, string[]>();
   private currentStale = false;
   private disposed = false;
-  private latestFacts: FileFacts[] = [];
-  private latestActive: { provider: LLMProvider; model: string } | undefined;
-  private latestTools: ToolDef[] = [];
-  private readonly generatedScopes = new Set<string>();
   private readonly projectName: string;
 
   private constructor(
@@ -194,7 +100,6 @@ export class ArchitecturePanel {
       return;
     }
     this.disposed = true;
-    this.controller?.abort();
     if (ArchitecturePanel.current === this) {
       ArchitecturePanel.current = undefined;
     }
@@ -220,18 +125,20 @@ export class ArchitecturePanel {
       await this.exportDiagram(message.svg);
       return;
     }
-    if (message.type === 'showRaw') {
-      this.post({ type: 'raw', text: this.lastRaw });
-      return;
-    }
     if (message.type === 'drillDown' && typeof message.id === 'string') {
       const target = this.groupIndex.get(message.id);
       if (target && this.stored) {
         this.levelPath = target;
         this.postMap(this.stored, this.currentStale);
-        if (target.length > 1 && !this.generatedScopes.has(target.join('/'))) {
-          void this.generateLazyScope(target);
-        }
+      }
+      return;
+    }
+    if (message.type === 'navigate' && Array.isArray(message.targetPath)) {
+      if (this.stored) {
+        this.levelPath = message.targetPath.filter(
+          (segment): segment is string => typeof segment === 'string',
+        );
+        this.postMap(this.stored, this.currentStale);
       }
       return;
     }
@@ -249,12 +156,32 @@ export class ArchitecturePanel {
     const stored = this.stored ?? this.readProjectMap();
     this.stored = stored;
     if (stored) {
+      // Do not present a map from an earlier checkout as the current project.
+      try {
+        const facts = await this.deps.getFacts();
+        if (isStale(stored, architectureFactsHash(facts))) {
+          this.stored = undefined;
+          this.levelPath = [];
+          this.groupIndex.clear();
+          this.post({
+            type: 'generating',
+            progress: 'Code changed — rebuilding the architecture map…',
+            hasMap: false,
+            project: this.projectName,
+          });
+          void this.runGenerate();
+          return;
+        }
+      } catch {
+        // If the index is temporarily unavailable, keep the verified stored
+        // map rather than blocking the panel. A later reload will re-check it.
+      }
       this.postMap(stored, false);
-      void this.refreshStaleFlag(stored);
       return;
     }
-    const reason = (await this.hasProvider()) ? EMPTY_NOT_DRAWN : EMPTY_NO_MODEL;
-    this.post({ type: 'empty', reason, project: this.projectName });
+    // No stored map: build the deterministic map immediately. No model is
+    // needed; this is the same scanner-fact path used by Refresh.
+    void this.runGenerate();
   }
 
   private readProjectMap(): StoredArchitectureMap | undefined {
@@ -267,37 +194,15 @@ export class ArchitecturePanel {
     return undefined;
   }
 
-  private async refreshStaleFlag(stored: StoredArchitectureMap): Promise<void> {
-    let stale = false;
-    try {
-      const facts = await this.deps.getFacts();
-      stale = isStale(stored, architectureFilesHash(facts.map((fact) => fact.file)));
-    } catch {
-      stale = false;
-    }
-    if (this.disposed || this.stored !== stored) {
-      return;
-    }
-    this.postMap(stored, stale);
-  }
-
   private async runGenerate(): Promise<void> {
     if (this.disposed || this.generating) {
       return;
     }
-    const active = await this.getActive();
-    if (!active) {
-      this.post({ type: 'empty', reason: EMPTY_NO_MODEL, project: this.projectName });
-      return;
-    }
     this.generating = true;
-    const controller = new AbortController();
-    this.controller = controller;
     const hasMap = Boolean(this.stored);
-    this.latestActive = active;
     this.post({
       type: 'generating',
-      progress: 'Reading files…',
+      progress: 'Reading indexed files…',
       hasMap,
       project: this.projectName,
     });
@@ -317,7 +222,7 @@ export class ArchitecturePanel {
       try {
         scanCoverage = await this.deps.getCoverage();
       } catch {}
-      if (this.disposed || controller.signal.aborted) {
+      if (this.disposed) {
         return;
       }
       if (facts.length === 0) {
@@ -326,323 +231,50 @@ export class ArchitecturePanel {
       }
       const selectedFacts = selectArchitectureFacts(facts, this.deps.root);
       const architectureFacts = selectedFacts.length > 0 ? selectedFacts : facts;
-      const digest = buildMapDigest(architectureFacts, this.deps.root);
-      let tools: ToolDef[] = [];
-      try {
-        tools = await this.deps.getTools();
-      } catch {
-        tools = [];
-      }
-      if (this.disposed || controller.signal.aborted) {
-        return;
-      }
       this.post({
         type: 'generating',
-        progress: 'Building the map…',
+        progress: 'Building the verified map…',
         hasMap,
         project: this.projectName,
       });
-      // Publish a verified scanner-based map before model enrichment. This
-      // keeps architecture useful when a local model is slow, unavailable, or
-      // returns malformed JSON.
-      const structural = buildStructuralMap(architectureFacts, this.deps.root, this.projectName);
-      this.latestFacts = architectureFacts;
-      this.latestTools = tools;
-      const baselineCoverage: ArchitectureMapCoverage = {
-        ...scanCoverage,
-        indexedFiles: facts.length,
-        representedFiles: structural.representedFiles,
-        unresolvedRelationships: structural.unresolvedRelationships,
-      };
-      const baseline: StoredArchitectureMap = {
-        version: 3,
-        workspaceRoot: path.resolve(this.deps.root),
-        filesHash: architectureFilesHash(facts.map((fact) => fact.file)),
-        mermaid: buildMermaidMap(structural.map),
-        paths: mapPathsOf(structural.map, (relative) => existsSync(path.join(this.deps.root, relative))),
-        structured: structural.map,
-        model: active.model,
-        generatedAt: Date.now(),
-        coverage: baselineCoverage,
-      };
-      this.stored = baseline;
-      this.currentStale = false;
-      this.levelPath = [];
-      try {
-        await writeStoredMap(this.deps.state, baseline);
-      } catch {}
-      this.post({
-        type: 'generating',
-        progress: 'Generating the AI overview…',
-        hasMap: true,
-        project: this.projectName,
-      });
-      this.postMap(baseline, false);
-      const raw = await generateArchitectureMap(digest, {
-        provider: active.provider,
-        model: active.model,
-        reasoning: await this.deps.getReasoning?.(),
-        tools,
-        executeTool: this.deps.executeTool,
-        signal: controller.signal,
-        onProgress: (text, done) => {
-          if (!done && !this.disposed && !controller.signal.aborted) {
-            this.post({
-              type: 'generating',
-              progress: text,
-              hasMap: Boolean(this.stored),
-              project: this.projectName,
-            });
-          }
-        },
-      });
-      if (this.disposed || controller.signal.aborted) {
-        return;
-      }
-      if (!raw) {
-        this.post({
-          type: 'generating',
-          progress: 'Model enrichment unavailable; keeping the verified map.',
-          hasMap: true,
-          project: this.projectName,
-        });
-        this.postMap(baseline, false);
-        return;
-      }
-      this.lastRaw = raw;
-      const parsed = parseStructuredMap(raw);
-      if (!parsed || parsed.nodes.length < 2) {
-        this.post({
-          type: 'generating',
-          progress: 'Model returned an unusable structure; keeping the verified map.',
-          hasMap: true,
-          project: this.projectName,
-        });
-        this.postMap(baseline, false);
-        return;
-      }
-      const indexedFiles = new Set(architectureFacts.map((fact) => relativeFile(this.deps.root, fact.file)));
-      const validated = {
-        ...parsed,
-        nodes: parsed.nodes.map((node) => {
-          if (!node.path) {
-            return node;
-          }
-          const candidate = node.path.replace(/\\/g, '/').replace(/^\.\//, '');
-          return existsSync(path.join(this.deps.root, candidate))
-            ? { ...node, path: candidate }
-            : { ...node, path: undefined };
-        }),
-        edges: parsed.edges.filter((edge) => {
-          edge.evidence = edge.evidence?.filter((item) => {
-            const relative = relativeFile(this.deps.root, item.path);
-            if (!indexedFiles.has(relative) || item.line <= 0) {
-              return false;
-            }
-            try {
-              const source = readFileSync(path.join(this.deps.root, relative), 'utf8');
-              return item.line <= source.split(/\r?\n/).length;
-            } catch {
-              return false;
-            }
-          });
-          return Boolean(edge.evidence?.length);
-        }),
-      };
-      // An architecture overview should not display orphaned guesses. Keep
-      // the project root and nodes participating in at least one evidenced
-      // relationship; isolated files remain available through the scanner
-      // coverage and deeper drill-down views.
-      const connected = new Set<string>(['project', 'root']);
-      for (const edge of validated.edges) {
-        connected.add(edge.from);
-        connected.add(edge.to);
-      }
-      validated.nodes = validated.nodes.filter((node) => connected.has(node.id));
-      const validNodeIds = new Set(validated.nodes.map((node) => node.id));
-      validated.edges = validated.edges.filter((edge) => validNodeIds.has(edge.from) && validNodeIds.has(edge.to));
-      const representedFiles = architectureFacts.filter((fact) => {
-        const file = relativeFile(this.deps.root, fact.file);
-        return validated.nodes.some((node) => {
-          const nodePath = node.path && node.path.replace(/\\/g, '/').replace(/^\.\//, '');
-          return nodePath && (nodePath === file || file.startsWith(`${nodePath}/`));
-        });
-      }).length;
-      // A model response that mentions only a handful of folders is not an
-      // architecture map for the project. Keep the scanner truth instead of
-      // replacing it with a sparse or invented diagram.
-      const evidenceEdges = validated.edges.filter((edge) => edge.evidence?.length).length;
-      if (representedFiles < Math.max(2, Math.ceil(architectureFacts.length * 0.35)) || evidenceEdges === 0) {
-        this.post({
-          type: 'generating',
-          progress: 'AI overview did not cover enough verified files; keeping the complete scanner map.',
-          hasMap: true,
-          project: this.projectName,
-        });
-        this.postMap(baseline, false);
+      const result = await buildDeterministicMap(architectureFacts, this.deps.root, this.projectName);
+      if (this.disposed) {
         return;
       }
       const coverage: ArchitectureMapCoverage = {
         ...scanCoverage,
         indexedFiles: facts.length,
-        representedFiles,
-        unresolvedRelationships: 0,
+        representedFiles: result.representedFiles,
+        unresolvedRelationships: result.unresolvedRelationships,
+        isolatedFiles: result.isolatedFiles,
+        unclassifiedFiles: result.unclassifiedFiles,
+        excludedFiles: Math.max(0, facts.length - architectureFacts.length),
+        fingerprint: result.fingerprint,
       };
       const map: StoredArchitectureMap = {
-        version: 3,
+        version: ARCHITECTURE_MAP_VERSION,
         workspaceRoot: path.resolve(this.deps.root),
-        filesHash: architectureFilesHash(facts.map((fact) => fact.file)),
-        mermaid: buildMermaidMap(validated),
-        paths: mapPathsOf(validated, (relative) => existsSync(path.join(this.deps.root, relative))),
-        structured: validated,
-        model: active.model,
+        filesHash: architectureFactsHash(facts),
+        mermaid: buildMermaidMap(result.map),
+        paths: mapPathsOf(result.map, (relative) => existsSync(path.join(this.deps.root, relative))),
+        structured: result.map,
+        model: 'scanner facts',
         generatedAt: Date.now(),
         coverage,
       };
       this.stored = map;
+      this.currentStale = false;
+      this.levelPath = [];
+      this.groupIndex.clear();
       try {
         await writeStoredMap(this.deps.state, map);
       } catch {}
-      if (this.disposed) {
-        return;
+      if (!this.disposed) {
+        this.postMap(map, false);
       }
-      this.levelPath = [];
-      this.postMap(map, false);
-      await this.generateArchitectureDomains(map, architectureFacts, active, tools, controller);
     } finally {
       this.generating = false;
-      if (this.controller === controller) {
-        this.controller = undefined;
-      }
     }
-  }
-
-  private async generateArchitectureDomains(
-    overview: StoredArchitectureMap,
-    facts: FileFacts[],
-    active: { provider: LLMProvider; model: string },
-    tools: ToolDef[],
-    controller: AbortController,
-  ): Promise<void> {
-    const domains = [...new Set(facts
-      .map((fact) => architectureDomain(relativeFile(this.deps.root, fact.file), fact))
-      .filter((domain) => domain !== 'root'))];
-    for (let index = 0; index < domains.length; index++) {
-      if (this.disposed || controller.signal.aborted) return;
-      const domain = domains[index];
-      const domainFacts = facts.filter((fact) => architectureDomain(relativeFile(this.deps.root, fact.file), fact) === domain);
-      if (domainFacts.length === 0) continue;
-      this.post({
-        type: 'generating',
-        progress: `Generating ${domain} (${index + 1}/${domains.length})…`,
-        hasMap: true,
-        project: this.projectName,
-      });
-      const summaries = await summarizeFiles(
-        active.provider,
-        active.model,
-        this.deps.state,
-        domainFacts.map((fact) => ({ path: relativeFile(this.deps.root, fact.file), fact })),
-        controller.signal,
-        (file) => this.post({ type: 'generating', progress: `${domain}: summarizing ${file}`, hasMap: true, project: this.projectName }),
-        path.resolve(this.deps.root),
-      );
-      const moduleGroups = new Map<string, Array<{ path: string; summary: string }>>();
-      for (const fact of domainFacts) {
-        const file = relativeFile(this.deps.root, fact.file);
-        const parts = file.split('/').filter(Boolean);
-        const module = parts.length > 1 ? parts.slice(0, -1).join('/') : domain;
-        const list = moduleGroups.get(module) ?? [];
-        list.push({ path: file, summary: summaries[file] ?? 'No cached summary available.' });
-        moduleGroups.set(module, list);
-      }
-      const moduleSummaries = await summarizeModules(
-        active.provider,
-        active.model,
-        this.deps.state,
-        [...moduleGroups.entries()].map(([key, files]) => ({ key, files })),
-        controller.signal,
-        (module) => this.post({ type: 'generating', progress: `${domain}: reducing ${module}`, hasMap: true, project: this.projectName }),
-        path.resolve(this.deps.root),
-      );
-      const domainRaw = await generateArchitectureMap(buildMapDigest(domainFacts, this.deps.root, summaries, moduleSummaries), {
-        provider: active.provider,
-        model: active.model,
-        reasoning: await this.deps.getReasoning?.(),
-        tools,
-        executeTool: this.deps.executeTool,
-        signal: controller.signal,
-        maxSteps: 12,
-        onProgress: (text, done) => {
-          if (!done && !this.disposed && !controller.signal.aborted) {
-            this.post({ type: 'generating', progress: `${domain}: ${text}`, hasMap: true, project: this.projectName });
-          }
-        },
-      });
-      if (!domainRaw || this.disposed || controller.signal.aborted) continue;
-      const parsed = parseStructuredMap(domainRaw);
-      if (!parsed || parsed.nodes.length < 2) continue;
-      const merged = mergeArchitectureMaps(this.stored ?? overview, parsed, domain, this.deps.root, active.model);
-      this.stored = merged;
-      try {
-        await writeStoredMap(this.deps.state, merged);
-      } catch {}
-      this.postMap(merged, false);
-      this.post({ type: 'generating', progress: `${domain} ready`, hasMap: true, project: this.projectName });
-    }
-  }
-
-  private async generateLazyScope(scope: string[]): Promise<void> {
-    const active = this.latestActive;
-    const facts = this.latestFacts;
-    if (!active || facts.length === 0 || this.disposed || !this.stored) return;
-    const key = scope.join('/');
-    this.generatedScopes.add(key);
-    const domain = scope[0];
-    const scopedFacts = facts.filter((fact) => {
-      const file = relativeFile(this.deps.root, fact.file);
-      const parts = file.split('/').filter(Boolean);
-      return architectureDomain(file, fact) === domain && parts.includes(scope[scope.length - 1]);
-    });
-    if (scopedFacts.length === 0) return;
-    const controller = new AbortController();
-    this.post({ type: 'generating', progress: `Loading ${key}…`, hasMap: true, project: this.projectName });
-    const raw = await generateArchitectureMap(buildMapDigest(scopedFacts, this.deps.root), {
-      provider: active.provider,
-      model: active.model,
-      reasoning: await this.deps.getReasoning?.(),
-      tools: this.latestTools,
-      executeTool: this.deps.executeTool,
-      signal: controller.signal,
-      maxSteps: 12,
-      onProgress: (text, done) => {
-        if (!done && !this.disposed) {
-          this.post({ type: 'generating', progress: `${key}: ${text}`, hasMap: true, project: this.projectName });
-        }
-      },
-    });
-    if (!raw || this.disposed || !this.stored) return;
-    const parsed = parseStructuredMap(raw);
-    if (!parsed || parsed.nodes.length < 2) return;
-    const merged = mergeArchitectureMaps(this.stored, parsed, domain, this.deps.root, active.model);
-    this.stored = merged;
-    try {
-      await writeStoredMap(this.deps.state, merged);
-    } catch {}
-    this.postMap(merged, false);
-    this.post({ type: 'generating', progress: `${key} ready`, hasMap: true, project: this.projectName });
-  }
-
-  private async getActive(): Promise<{ provider: LLMProvider; model: string } | undefined> {
-    try {
-      return await this.deps.getActive();
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async hasProvider(): Promise<boolean> {
-    return Boolean(await this.getActive());
   }
 
   private postMap(map: StoredArchitectureMap, stale: boolean): void {
@@ -655,6 +287,12 @@ export class ArchitecturePanel {
       paths: view.paths,
       groups: view.groups,
       breadcrumbs: view.breadcrumbs,
+      kind: view.kind,
+      items: view.items,
+      related: view.related,
+      systemTargets: view.systemTargets,
+      hiddenEdges: view.hiddenEdges,
+      totalEdges: view.totalEdges,
       stale,
       generatedAt: map.generatedAt,
       model: map.model,
@@ -780,7 +418,7 @@ export class ArchitecturePanel {
       border-bottom: 1px solid var(--vscode-panel-border);
       background: var(--vscode-editorWidget-background);
     }
-    #df-refresh, #df-export, #df-zoom-in, #df-zoom-out, #df-zoom-fit {
+    #df-back, #df-refresh, #df-export, #df-zoom-in, #df-zoom-out, #df-zoom-fit {
       display: inline-flex;
       align-items: center;
       gap: 4px;
@@ -792,8 +430,8 @@ export class ArchitecturePanel {
       cursor: pointer;
       font-size: 12px;
     }
-    #df-refresh:disabled, #df-export:disabled { opacity: 0.4; cursor: default; }
-    #df-refresh:hover:not(:disabled), #df-export:hover:not(:disabled), #df-zoom-in:hover, #df-zoom-out:hover, #df-zoom-fit:hover { background: var(--df-hover); }
+    #df-refresh:disabled, #df-export:disabled, #df-back:disabled, #df-zoom-in:disabled, #df-zoom-out:disabled, #df-zoom-fit:disabled { opacity: 0.4; cursor: default; }
+    #df-refresh:hover:not(:disabled), #df-export:hover:not(:disabled), #df-back:hover:not(:disabled), #df-zoom-in:hover:not(:disabled), #df-zoom-out:hover:not(:disabled), #df-zoom-fit:hover:not(:disabled) { background: var(--df-hover); }
     #df-refresh .codicon, #df-export .codicon { font-size: 12px; }
     #df-map-crumbs { display: flex; align-items: center; gap: 2px; font-size: 12px; color: var(--vscode-descriptionForeground); }
     #df-map-crumbs button { background: none; border: none; color: var(--vscode-textLink-foreground); cursor: pointer; padding: 0 2px; font-size: 12px; }
@@ -825,6 +463,82 @@ export class ArchitecturePanel {
     #df-diagram-wrap { flex: 1; min-width: 0; overflow: hidden; padding: 24px; }
     #df-diagram { min-width: 100%; min-height: 100%; display: block; overflow: hidden; cursor: grab; }
     #df-diagram svg { display: block; max-width: none; height: auto; transform-origin: 0 0; }
+    #df-diagram[hidden], #df-cards[hidden], #df-files[hidden], #df-side[hidden] { display: none; }
+    #df-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+      gap: 10px;
+      align-content: start;
+      height: 100%;
+      overflow: auto;
+    }
+    .df-card {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 6px;
+      padding: 12px;
+      border: 1px solid var(--df-border);
+      border-radius: var(--df-radius-lg);
+      background: var(--df-surface);
+      color: var(--vscode-foreground);
+      text-align: left;
+      cursor: pointer;
+      font: inherit;
+    }
+    .df-card:hover { background: var(--df-hover); border-color: var(--vscode-focusBorder); }
+    .df-card-title { font-size: 13px; font-weight: 600; }
+    .df-card-meta { color: var(--df-muted); font-size: 11px; }
+    #df-files { display: flex; flex-direction: column; gap: 2px; height: 100%; overflow: auto; }
+    .df-file-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border: 1px solid transparent;
+      border-radius: var(--df-radius-md);
+      cursor: pointer;
+      color: var(--vscode-foreground);
+    }
+    .df-file-row:hover { background: var(--df-hover); }
+    .df-file-row.df-selected { background: var(--vscode-list-activeSelectionBackground); border-color: var(--vscode-focusBorder); }
+    .df-file-name { display: block; font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .df-file-path { display: block; color: var(--df-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .df-file-counts { color: var(--df-muted); font-size: 11px; white-space: nowrap; }
+    .df-file-open {
+      border: 1px solid var(--df-border);
+      border-radius: var(--df-radius-sm);
+      background: var(--vscode-button-secondaryBackground, transparent);
+      color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+      cursor: pointer;
+      font-size: 11px;
+      padding: 3px 8px;
+    }
+    .df-badge { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); font-size: 10px; font-weight: 500; }
+    #df-side { width: 300px; flex: 0 0 300px; border-left: 1px solid var(--df-border); padding: 16px; overflow: auto; display: flex; flex-direction: column; gap: 18px; }
+    .df-side-head { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+    .df-side-head strong { font-size: 14px; }
+    .df-side-path { color: var(--df-muted); font-size: 11px; word-break: break-all; }
+    .df-side-section { display: flex; flex-direction: column; gap: 6px; }
+    .df-side-section h3 { margin: 0; color: var(--df-muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .df-related-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; width: 100%; padding: 7px 8px; border: 1px solid transparent; border-radius: var(--df-radius-sm); background: transparent; color: var(--vscode-foreground); text-align: left; cursor: pointer; font: inherit; }
+    .df-related-row:hover { background: var(--df-hover); border-color: var(--df-border); }
+    .df-related-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .df-related-parent { grid-column: 1 / 2; color: var(--df-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .df-related-count { grid-column: 2 / 3; grid-row: 1 / 3; align-self: center; color: var(--df-muted); font-size: 11px; }
+    .df-link-row { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; padding: 6px 8px; border: 1px solid transparent; border-radius: var(--df-radius-sm); background: transparent; color: var(--vscode-textLink-foreground); text-align: left; cursor: pointer; font: inherit; font-size: 12px; }
+    .df-link-row:hover { background: var(--df-hover); border-color: var(--df-border); }
+    .df-link-meta { color: var(--df-muted); font-size: 10px; }
+    .df-system-link { cursor: default; color: var(--vscode-foreground); }
+    .df-system-link:hover { background: transparent; border-color: transparent; }
+    .df-system-target { display: flex; flex-direction: column; gap: 3px; padding-bottom: 8px; border-bottom: 1px solid var(--df-border); }
+    .df-system-target:last-child { padding-bottom: 0; border-bottom: none; }
+    .df-system-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 8px; }
+    .df-system-name { font-size: 12px; font-weight: 600; }
+    .df-system-count { color: var(--df-muted); font-size: 10px; white-space: nowrap; }
+    .df-side-empty { color: var(--df-muted); font-size: 12px; line-height: 1.5; }
+    .df-side-open { margin-top: 4px; }
     .df-state {
       margin: 48px auto;
       max-width: 480px;
@@ -876,12 +590,19 @@ export class ArchitecturePanel {
       border-radius: var(--df-radius-md);
       white-space: pre-wrap;
     }
-    @media (max-width: 620px) { #df-diagram-wrap { padding: 14px; } #df-hint { display: none; } }
+    @media (max-width: 760px) { #df-side { width: 240px; flex-basis: 240px; } }
+    @media (max-width: 620px) {
+      #df-diagram-wrap { padding: 14px; }
+      #df-hint { display: none; }
+      #df-main { flex-direction: column; }
+      #df-side { width: auto; flex: 0 0 auto; max-height: 45vh; border-left: none; border-top: 1px solid var(--df-border); }
+    }
     @media (prefers-reduced-motion: reduce) { .codicon-modifier-spin { animation: none; } }
   </style>
 </head>
 <body>
   <header>
+    <button id="df-back" type="button" title="Back" disabled>&#8592; Back</button>
     <nav id="df-map-crumbs" aria-label="Architecture levels"></nav>
     <span id="df-hint" role="status"></span>
     <span id="df-status"></span>
@@ -897,7 +618,12 @@ export class ArchitecturePanel {
   </header>
   <div id="df-banner" hidden></div>
   <main id="df-main">
-    <section id="df-diagram-wrap"><div id="df-diagram"></div></section>
+    <section id="df-diagram-wrap">
+      <div id="df-diagram"></div>
+      <div id="df-cards" hidden></div>
+      <div id="df-files" hidden></div>
+    </section>
+    <aside id="df-side" hidden></aside>
   </main>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>

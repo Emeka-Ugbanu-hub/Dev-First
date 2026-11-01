@@ -1,7 +1,7 @@
 import { ChatMessage, LLMProvider, ReasoningOptions, ReasoningRouteContext, ToolCall, ToolDef, UsageTotals } from '../llm/types';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Plan } from '../shared/protocol';
+import { Plan, PlannerStats, PlanningMode } from '../shared/protocol';
 import {
   ActivityMeta,
   activityMeta,
@@ -12,18 +12,25 @@ import {
   toolIcon,
 } from '../agent/tools';
 import { PARALLEL_SAFE } from '../agent/parallelTools';
-import { estimateTokens } from '../agent/compaction';
+import { PRESERVE_RECENT_TOKENS, estimateTokens, foldMessagesForCompression } from '../agent/compaction';
 import { planFromToolCall, parsePlanFromText } from './planParser';
 import { PromptFamily, buildPlannerContext, buildPlannerSystemPrompt } from './prompts';
 import { normalizeToolArguments } from '../util/toolArgs';
 import { errorMessage } from '../util/errors';
 import { chatWithRetry } from '../llm/retry';
 import { mergeUsage } from '../llm/usage';
-import { checkPlanReadiness } from './planReadiness';
+import {
+  PlanReadiness,
+  checkPlanReadiness,
+  readinessCorrection,
+  readinessFieldLabel,
+} from './planReadiness';
 
 const SPECIAL_TOOLS = new Set(['submit_plan', 'dismiss_plan', 'set_reasoning', 'compress_context', 'ask_user']);
 const KEEP_FULL_TOOL_RESULTS = 8;
 const STALE_TOOL_RESULT_CHARS = 400;
+const READINESS_LOOP_RECOVERY =
+  'LOOP RECOVERY: submit_plan was rejected twice. Do not gather more context. Call submit_plan now with the missing fields filled in.';
 
 export interface PlannerCallbacks {
   onTextDelta(text: string): void;
@@ -51,6 +58,7 @@ export interface PlannerResult {
   text: string;
   exhausted: boolean;
   stopped?: 'same-plan';
+  stats?: PlannerStats;
 }
 
 export interface PlannerOptions {
@@ -65,9 +73,14 @@ export interface PlannerOptions {
   workspaceRoot?: string;
   /** Keep question/answer turns in read-and-respond mode. */
   questionMode?: boolean;
+  planningMode?: PlanningMode;
+  /** Clear cached read-only results when older tool results are trimmed. */
+  onToolResultsTrimmed?: () => void;
 }
 
 export class PlannerService {
+  private stats = { turns: 0, promptTokens: 0, ttftTotal: 0, readinessRejections: 0 };
+
   constructor(
     private readonly provider: LLMProvider,
     private readonly model: string,
@@ -81,16 +94,36 @@ export class PlannerService {
     callbacks: PlannerCallbacks,
     signal: AbortSignal,
   ): Promise<PlannerResult> {
+    this.stats = { turns: 0, promptTokens: 0, ttftTotal: 0, readinessRejections: 0 };
+    const result = await this.runPlan(conversation, currentPlan, version, callbacks, signal);
+    return {
+      ...result,
+      stats: {
+        turns: this.stats.turns,
+        promptTokens: this.stats.promptTokens,
+        timeToFirstTokenMs: this.stats.turns > 0 ? Math.round(this.stats.ttftTotal / this.stats.turns) : 0,
+        readinessRejections: this.stats.readinessRejections,
+      },
+    };
+  }
+
+  private async runPlan(
+    conversation: ChatMessage[],
+    currentPlan: Plan | null,
+    version: number,
+    callbacks: PlannerCallbacks,
+    signal: AbortSignal,
+  ): Promise<PlannerResult> {
     const context = buildPlannerContext(currentPlan);
     const turnTools = plannerToolSet(this.options.tools, { reasoningSwitch: this.options.reasoningSwitch })
       .filter((tool) => !this.options.questionMode || (tool.name !== 'submit_plan' && tool.name !== 'dismiss_plan'));
     const questionGuard = this.options.questionMode
       ? 'QUESTION MODE: answer the latest question in chat. You may use read-only tools to gather evidence, but never call submit_plan or dismiss_plan, never propose an execution plan, and never change files.'
       : undefined;
-    const systemPrompt = [buildPlannerSystemPrompt(this.options.rules, this.options.family), context, questionGuard]
+    const systemPrompt = [buildPlannerSystemPrompt(this.options.rules, this.options.family, this.options.planningMode), context, questionGuard]
       .filter(Boolean)
       .join('\n\n');
-    const messages: ChatMessage[] = [
+    let messages: ChatMessage[] = [
       { role: 'system', content: systemPrompt },
       ...conversation,
     ];
@@ -100,7 +133,6 @@ export class PlannerService {
     let dismissed = false;
     let clarificationAsked = false;
     let emptyRecoverySent = false;
-    let readinessRejections = 0;
     let readinessNudged = false;
     let previousToolNames: string[] = [];
     let previousToolFailed = false;
@@ -113,22 +145,40 @@ export class PlannerService {
         abort.name = 'AbortError';
         throw abort;
       }
-      trimStaleToolResults(messages);
+      if (trimStaleToolResults(messages)) {
+        this.options.onToolResultsTrimmed?.();
+      }
       callbacks.onStage?.(step === 0
         ? 'PLANNING — waiting for first response…'
         : 'PLANNING — processing tool results…');
-      const { text, toolCalls, reasoning } = await this.runTurn(messages, callbacks, signal, turnTools, true, {
+      this.stats.turns += 1;
+      this.stats.promptTokens += estimateTokens(messages);
+      const { text, toolCalls, reasoning, ttftMs } = await this.runTurn(messages, callbacks, signal, turnTools, true, {
         phase: 'planning',
         turn: step,
         previousToolNames,
         previousToolFailed,
       });
+      this.stats.ttftTotal += ttftMs;
       lastText = text;
 
       if (toolCalls.length === 0) {
         const parsed = parsePlanFromText(text, version);
         if (parsed) {
-          return { plan: parsed, text, exhausted: false };
+          const candidate = this.validateExpectedFiles(parsed);
+          const readiness = checkPlanReadiness(candidate);
+          if (readiness.ready) {
+            return { plan: candidate, text, exhausted: false };
+          }
+          this.stats.readinessRejections += 1;
+          messages.push({ role: 'user', content: this.textPlanRejection(readiness) });
+          if (this.stats.readinessRejections >= 2 && !readinessNudged) {
+            readinessNudged = true;
+            messages.push({ role: 'user', content: READINESS_LOOP_RECOVERY });
+          } else if (readinessNudged) {
+            return { text: lastText, exhausted: false, stopped: 'same-plan' };
+          }
+          continue;
         }
         if (text.trim()) {
           return { text, exhausted: false };
@@ -244,8 +294,8 @@ export class PlannerService {
           }
           const rawPlan = planFromToolCall(call.arguments, version);
           const plan = rawPlan ? this.validateExpectedFiles(rawPlan) : undefined;
-          const readiness = plan ? checkPlanReadiness(plan) : { ready: false, missing: ['valid plan payload'] };
-          if (plan && readiness.ready) {
+          const readiness = plan ? checkPlanReadiness(plan) : undefined;
+          if (plan && readiness?.ready) {
             submitted = plan;
             messages.push({
               role: 'tool',
@@ -255,19 +305,20 @@ export class PlannerService {
             });
             break;
           }
-          readinessRejections += 1;
+          this.stats.readinessRejections += 1;
           messages.push({
             role: 'tool',
             toolCallId: call.id,
             toolName: call.name,
-            content: `Error: plan is not ready. Provide only the missing fields: ${readiness.missing.join(', ')}.`,
+            content: readiness
+              ? this.readinessError(readiness)
+              : 'Error: the plan payload could not be parsed. Call submit_plan with valid JSON and the required fields.',
           });
-          if (readinessRejections >= 2 && !readinessNudged) {
+          if (this.stats.readinessRejections >= 2 && !readinessNudged) {
             readinessNudged = true;
             messages.push({
               role: 'user',
-              content:
-                'LOOP RECOVERY: submit_plan was rejected twice. Do not gather more context. Call submit_plan now with the missing fields filled in.',
+              content: READINESS_LOOP_RECOVERY,
             });
           } else if (readinessNudged) {
             return { text: lastText, exhausted: false, stopped: 'same-plan' };
@@ -305,15 +356,45 @@ export class PlannerService {
           callbacks.onToolActivity(call.id, describeToolCall(call), 'running', toolIcon(call.name));
           const args = toolCallArgs(call);
           const focus = typeof args.focus === 'string' ? args.focus : undefined;
-          let result: string;
+          let controllerResult = '';
           if (callbacks.compressContext) {
             try {
-              result = await callbacks.compressContext(focus);
+              controllerResult = await callbacks.compressContext(focus);
             } catch (error) {
-              result = `Error: ${errorMessage(error)}`;
+              controllerResult = `Error: ${errorMessage(error)}`;
             }
+          }
+          let assistantIndex = messages.length;
+          for (let index = messages.length - 1; index >= 0; index--) {
+            const message = messages[index];
+            if (message.role === 'assistant' && message.toolCalls?.some((entry) => entry.id === call.id)) {
+              assistantIndex = index;
+              break;
+            }
+          }
+          const limit = this.options.contextLimitTokens ?? 128_000;
+          const preserve = Math.max(4_000, Math.min(PRESERVE_RECENT_TOKENS, limit * 0.25));
+          const fold = foldMessagesForCompression(messages, preserve, {
+            minRecentStart: assistantIndex,
+            stateNote: focus ? `Compression focus: ${focus}` : undefined,
+          });
+          if (fold.folded) {
+            messages = fold.messages;
+          }
+          const controllerOk = controllerResult.length > 0 && !controllerResult.startsWith('Error:');
+          const percent = fold.folded
+            ? Math.round((1 - fold.afterTokens / Math.max(1, fold.beforeTokens)) * 100)
+            : 0;
+          const foldNote = fold.folded
+            ? `Planner context folded from ~${fold.beforeTokens} to ~${fold.afterTokens} estimated tokens (${percent}% smaller).`
+            : 'No older planner context could be folded; transcript unchanged.';
+          let result: string;
+          if (fold.folded) {
+            result = [controllerOk ? controllerResult : '', foldNote].filter(Boolean).join('\n');
+          } else if (controllerOk) {
+            result = `${controllerResult}\n${foldNote}`;
           } else {
-            result = 'Error: context compression is not available while planning.';
+            result = controllerResult || foldNote;
           }
           callbacks.onToolActivity(
             call.id,
@@ -407,7 +488,8 @@ export class PlannerService {
       }
 
       if (turnProgress) {
-        readinessRejections = 0;
+        this.stats.readinessRejections = 0;
+        readinessNudged = false;
       }
       if (submitted) {
         return { plan: submitted, text, exhausted: false };
@@ -418,6 +500,16 @@ export class PlannerService {
     }
 
     return { text: lastText, exhausted: true };
+  }
+
+  private readinessError(readiness: PlanReadiness): string {
+    const labels = readiness.missing.map(readinessFieldLabel).join(', ');
+    return `Error: plan is not ready. Provide only the missing fields: ${labels}.\nCorrection example: ${readinessCorrection(readiness.missing)}`;
+  }
+
+  private textPlanRejection(readiness: PlanReadiness): string {
+    const labels = readiness.missing.map(readinessFieldLabel).join(', ');
+    return `The plan in your text is not ready. Do not repeat it; call submit_plan with the missing fields: ${labels}.\nCorrection example: ${readinessCorrection(readiness.missing)}`;
   }
 
   private validateExpectedFiles(plan: Plan): Plan {
@@ -441,12 +533,14 @@ export class PlannerService {
     tools: ToolDef[],
     streamOutput = true,
     routeContext?: ReasoningRouteContext,
-  ): Promise<{ text: string; toolCalls: ToolCall[]; reasoning: string }> {
+  ): Promise<{ text: string; toolCalls: ToolCall[]; reasoning: string; ttftMs: number }> {
     let text = '';
     let reasoning = '';
     let usage: UsageTotals | undefined;
     const toolCalls: ToolCall[] = [];
     let retried = false;
+    const startedAt = Date.now();
+    let ttftMs = 0;
     callbacks.onUsage?.(estimateTokens(messages));
     try {
       for await (const event of chatWithRetry(
@@ -469,6 +563,9 @@ export class PlannerService {
           },
         },
       )) {
+        if (ttftMs === 0 && (event.type === 'text' || event.type === 'reasoning' || event.type === 'toolCall')) {
+          ttftMs = Date.now() - startedAt;
+        }
         if (event.type === 'text') {
           text += event.text;
           if (streamOutput) callbacks.onTextDelta(event.text);
@@ -489,13 +586,13 @@ export class PlannerService {
         callbacks.onStatus?.('retry', '', undefined, true);
       }
     }
-    return { text, toolCalls, reasoning };
+    return { text, toolCalls, reasoning, ttftMs };
   }
 
 }
 
 /** Keep the newest tool results intact; older ones only inflate prompt eval. */
-function trimStaleToolResults(messages: ChatMessage[]): void {
+function trimStaleToolResults(messages: ChatMessage[]): boolean {
   const toolIndexes: number[] = [];
   for (let index = 0; index < messages.length; index++) {
     if (messages[index].role === 'tool') {
@@ -503,8 +600,9 @@ function trimStaleToolResults(messages: ChatMessage[]): void {
     }
   }
   if (toolIndexes.length <= KEEP_FULL_TOOL_RESULTS) {
-    return;
+    return false;
   }
+  let trimmed = false;
   for (const index of toolIndexes.slice(0, toolIndexes.length - KEEP_FULL_TOOL_RESULTS)) {
     const message = messages[index];
     if (message.content.length > STALE_TOOL_RESULT_CHARS) {
@@ -512,6 +610,8 @@ function trimStaleToolResults(messages: ChatMessage[]): void {
         ...message,
         content: `${message.content.slice(0, STALE_TOOL_RESULT_CHARS)}\n… [earlier result trimmed to keep planning fast]`,
       };
+      trimmed = true;
     }
   }
+  return trimmed;
 }

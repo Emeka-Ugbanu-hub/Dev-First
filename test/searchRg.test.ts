@@ -3,7 +3,12 @@ import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-vi.mock('vscode', () => ({}));
+vi.mock('vscode', () => ({
+  workspace: {
+    getConfiguration: () => ({ get: (_key: string, fallback: unknown) => fallback }),
+    workspaceFolders: [],
+  },
+}));
 
 import { ToolBox } from '../src/agent/ToolBox';
 import {

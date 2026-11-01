@@ -41,6 +41,7 @@ import {
   ADAPTIVE_RECENT_FLOOR,
   PRESERVE_RECENT_TOKENS,
   chooseRecentStart,
+  estimateTokens,
   type CompressionBlock,
 } from '../src/agent/compaction';
 import { compressContextTool, executionTools, plannerToolSet, toolIcon } from '../src/agent/tools';
@@ -259,15 +260,33 @@ describe('SessionController compressContext', () => {
 describe('compress_context nudges', () => {
   function runAgent(
     replies: StreamEvent[][],
-    options: { contextLimitTokens?: number } = {},
+    options: {
+      contextLimitTokens?: number;
+      toolResult?: (name: string) => string;
+      autoCompact?: boolean;
+      deterministicContext?: boolean;
+      ledger?: string;
+      contextProfile?: {
+        tier: 'compact' | 'standard' | 'large';
+        triggerRatio: number;
+        pruneRatio: number;
+        preserveTokens: number;
+        reserveRatio: number;
+      };
+    } = {},
   ): { provider: ScriptedProvider; agent: AgentService } {
     const provider = new ScriptedProvider(replies);
-    const toolbox = { execute: vi.fn(async () => 'ok') } as unknown as ToolBox;
+    const toolbox = {
+      execute: vi.fn(async (name: string) => options.toolResult?.(name) ?? 'ok'),
+    } as unknown as ToolBox;
     const agent = new AgentService(provider, 'gpt-test', toolbox, {
       maxSteps: replies.length,
       tools: executionTools(),
-      autoCompact: false,
+      autoCompact: options.autoCompact ?? false,
       contextLimitTokens: options.contextLimitTokens ?? 1_000_000,
+      ...(options.deterministicContext ? { deterministicContext: true } : {}),
+      ...(options.ledger ? { ledger: options.ledger } : {}),
+      ...(options.contextProfile ? { contextProfile: options.contextProfile } : {}),
     });
     return { provider, agent };
   }
@@ -341,7 +360,7 @@ describe('compress_context nudges', () => {
     expect(nudges).toEqual([0, 1, 1, 1, 1, 1, 2]);
   });
 
-  it('suppresses the nudge right after a compression block is created', async () => {
+  it('keeps the nudge when only the controller conversation is compressed', async () => {
     const compress = vi.fn(async () => 'Compressed 3 earlier messages into a summary.');
     const { provider, agent } = runAgent(
       [
@@ -355,12 +374,116 @@ describe('compress_context nudges', () => {
     await agent.run(planArgs(), 'do it', new AbortController().signal, callbacks(compress));
 
     expect(compress).toHaveBeenCalledWith('auth');
-    expect(nudgeTexts(provider, 1)).toEqual([]);
-    expect(nudgeTexts(provider, 2)).toEqual([]);
+    expect(nudgeTexts(provider, 1)).toHaveLength(1);
     expect(
       provider.calls[1].messages.some(
-        (message) => message.role === 'tool' && message.content === 'Compressed 3 earlier messages into a summary.',
+        (message) => message.role === 'tool' && message.content.includes('Compressed 3 earlier messages'),
       ),
     ).toBe(true);
+    expect(
+      provider.calls[1].messages.some(
+        (message) => message.role === 'tool' && message.content.includes('No older executor context could be folded'),
+      ),
+    ).toBe(true);
+  });
+
+  it('uses a deterministic checkpoint for local execution without a summary call', async () => {
+    const replies: StreamEvent[][] = Array.from({ length: 6 }, (_, index) => [
+      { type: 'text', text: `${index}: ${'turn '.repeat(800)}` },
+      toolCallEvent('read_file', { path: `src/f${index}.ts` }),
+      ...(index === 0 ? [toolCallEvent('write_file', { path: 'src/a.ts', content: 'x' })] : []),
+    ]);
+    replies.push([toolCallEvent('finish', { summary: 'Done.' })]);
+    const { provider, agent } = runAgent(replies, {
+      autoCompact: true,
+      deterministicContext: true,
+      ledger: '[Event ledger]\nIMPORTANT_LEDGER_FACT',
+      contextLimitTokens: 10_000,
+      contextProfile: {
+        tier: 'compact',
+        triggerRatio: 0.45,
+        pruneRatio: 0.35,
+        preserveTokens: 8_000,
+        reserveRatio: 0.2,
+      },
+      toolResult: (name) => (name === 'read_file' ? 'x'.repeat(5_000) : 'ok'),
+    });
+    const compaction = vi.fn();
+
+    await agent.run(planArgs(), 'do it', new AbortController().signal, {
+      ...callbacks(),
+      onCompaction: compaction,
+    });
+
+    const summaryCalls = provider.calls.filter((call) =>
+      call.messages.some((message) => String(message.content).includes('You are compacting the conversation')),
+    );
+    expect(summaryCalls).toHaveLength(0);
+    expect(compaction).toHaveBeenCalled();
+    const finalCall = provider.calls[provider.calls.length - 1];
+    const checkpoint = finalCall.messages.find((message) =>
+      String(message.content).includes('[Deterministic checkpoint of earlier work]'));
+    expect(checkpoint).toBeDefined();
+    expect(String(checkpoint?.content)).toContain('Current step: Add a retry helper');
+    expect(String(checkpoint?.content)).toContain('Changed files: src/a.ts');
+    expect(finalCall.messages.some(
+      (message) => String(message.content).includes('IMPORTANT_LEDGER_FACT'),
+    )).toBe(true);
+  });
+
+  it('folds the executor transcript and suppresses the nudge after a real reduction', async () => {
+    const reads: StreamEvent[][] = Array.from({ length: 10 }, (_, index) => [
+      { type: 'usage', inputTokens: 600_000 },
+      toolCallEvent('read_file', { path: `file-${index}.ts` }),
+    ]);
+    const { provider, agent } = runAgent(
+      [
+        ...reads,
+        [toolCallEvent('compress_context', { focus: 'auth' })],
+        [toolCallEvent('finish', { summary: 'Done.' })],
+      ],
+      { toolResult: () => 'x'.repeat(50_000) },
+    );
+
+    await agent.run(planArgs(), 'do it', new AbortController().signal, callbacks());
+
+    const finalCall = provider.calls[provider.calls.length - 1];
+    expect(finalCall.messages.some(
+      (message) => message.role === 'tool' && String(message.content).includes('Executor context folded from'),
+    )).toBe(true);
+    expect(finalCall.messages.some(
+      (message) => String(message.content).includes('[Deterministic checkpoint of earlier work]'),
+    )).toBe(true);
+    expect(nudgeTexts(provider, provider.calls.length - 1)).toEqual([]);
+  });
+});
+
+describe('planner local compaction', () => {
+  it('uses a deterministic checkpoint without a summary call', async () => {
+    const controller = createController();
+    const provider = new ScriptedProvider([]);
+    env.config = { preset: 'ollama', model: 'local-test', contextLimitTokens: 10_000 };
+    const messages: ChatMessage[] = [
+      { role: 'system', content: 'system' },
+      { role: 'user', content: 'request' },
+      ...Array.from({ length: 10 }, (_, index) => ({
+        role: index % 2 === 0 ? 'user' as const : 'assistant' as const,
+        content: `${index}: ${'x'.repeat(6_000)}`,
+      })),
+    ];
+    const compact = (controller as unknown as {
+      maybeCompactPlanner: (
+        messages: ChatMessage[],
+        provider: LLMProvider,
+        model: string,
+        local: boolean,
+      ) => Promise<ChatMessage[]>;
+    }).maybeCompactPlanner.bind(controller);
+
+    const result = await compact(messages, provider, 'local-test', true);
+
+    expect(provider.calls).toHaveLength(0);
+    expect(estimateTokens(result)).toBeLessThan(estimateTokens(messages));
+    controller.dispose();
   });
 });

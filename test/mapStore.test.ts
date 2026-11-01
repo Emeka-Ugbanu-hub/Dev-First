@@ -21,7 +21,7 @@ class FakeMemento {
 }
 
 const stored: StoredArchitectureMap = {
-  version: 3,
+  version: 5,
   filesHash: architectureFilesHash(['src/a.ts', 'src/b.ts']),
   mermaid: 'flowchart TD\n  n1["App"]',
   paths: { n1: 'src/a.ts' },

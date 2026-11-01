@@ -210,6 +210,8 @@ const PLAN_CHECK_PATTERNS: Array<{ kind: VerifyCheckKind; patterns: RegExp[] }> 
       /\bpytest\b/i,
       /\bvitest\s+run\b/i,
       /\bjest\b/i,
+      /\b(?:run|rerun|execute)\b[^.\n]{0,40}\btests?\b/i,
+      /\btests?\s+(?:must\s+)?pass(?:es)?\b/i,
     ],
   },
   {
@@ -221,6 +223,7 @@ const PLAN_CHECK_PATTERNS: Array<{ kind: VerifyCheckKind; patterns: RegExp[] }> 
       /\bgo\s+vet\b/i,
       /\bpyright\b/i,
       /\bmypy\b/i,
+      /\btype-?check\b/i,
     ],
   },
   {
@@ -230,6 +233,7 @@ const PLAN_CHECK_PATTERNS: Array<{ kind: VerifyCheckKind; patterns: RegExp[] }> 
       /\beslint\b/i,
       /\bruff\s+check\b/i,
       /\bcargo\s+clippy\b/i,
+      /\blint\b/i,
     ],
   },
   {
@@ -238,6 +242,7 @@ const PLAN_CHECK_PATTERNS: Array<{ kind: VerifyCheckKind; patterns: RegExp[] }> 
       /\b(?:npm|pnpm|yarn|bun)\s+run\s+build\b/i,
       /\bcargo\s+build\b/i,
       /\bgo\s+build\b/i,
+      /\b(?:run|pass(?:es)?|succeeds?)\b[^.\n]{0,30}\bbuild\b/i,
     ],
   },
 ];
@@ -253,4 +258,25 @@ export function planCheckRequirementFromSteps(steps: string[] | undefined): Veri
     }
   }
   return undefined;
+}
+
+/**
+ * Resolve the plan's verification requirement from both steps and the explicit
+ * verification list. When the plan asks for a real check in prose ("run the
+ * auth tests"), prefer typecheck as a safe default; the runner falls back to
+ * the next resolvable project command if typecheck is unavailable.
+ */
+export function planCheckRequirementFromPlan(
+  steps: string[] | undefined,
+  verification: string[] | undefined,
+): VerifyCheckKind | undefined {
+  const explicit = planCheckRequirementFromSteps([...(steps ?? []), ...(verification ?? [])]);
+  if (explicit) {
+    return explicit;
+  }
+  const meaningful = (verification ?? []).some((entry) => {
+    const text = entry.trim();
+    return text.length > 0 && !/^(?:none|n\/a|not needed|no check)$/i.test(text);
+  });
+  return meaningful ? 'typecheck' : undefined;
 }

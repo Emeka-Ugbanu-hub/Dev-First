@@ -254,20 +254,82 @@ export function buildDeterministicCheckpoint(
   messages: ChatMessage[],
   recentStart: number,
   maxChars = 12_000,
+  note?: string,
+  pinned: ChatMessage[] = [],
 ): ChatMessage[] {
   const head = messages.slice(0, Math.min(2, messages.length));
-  const older = messages.slice(2, recentStart);
+  const tail = messages.slice(recentStart);
+  const pinnedSet = new Set(pinned);
+  const retainedPinned = pinned.filter((message) => !tail.includes(message));
+  const older = messages.slice(2, recentStart).filter((message) => !pinnedSet.has(message));
   const checkpoint = serializeForSummary(older);
   const bounded = checkpoint.length > maxChars
     ? `${checkpoint.slice(0, Math.max(1, maxChars - 80))}\n… [older context clipped]`
     : checkpoint;
+  const prefix = note?.trim() ? `${note.trim()}\n\n` : '';
   return [
     ...head,
-    ...(bounded.trim()
-      ? [{ role: 'user' as const, content: `[Deterministic checkpoint of earlier work]\n\n${bounded}` }]
+    ...retainedPinned,
+    ...(bounded.trim() || prefix
+      ? [{ role: 'user' as const, content: `[Deterministic checkpoint of earlier work]\n\n${prefix}${bounded}` }]
       : []),
-    ...messages.slice(recentStart),
+    ...tail,
   ];
+}
+
+/**
+ * Trim the stale middle when possible; otherwise write a deterministic
+ * checkpoint. No model call. Keeps pinned messages (e.g. the event ledger).
+ */
+export function compactDeterministically(
+  messages: ChatMessage[],
+  recentStart: number,
+  thresholdTokens: number,
+  options: { stateNote?: string; pinned?: ChatMessage[] } = {},
+): ChatMessage[] {
+  const pinned = options.pinned ?? [];
+  const tail = messages.slice(recentStart);
+  const retainedPinned = pinned.filter((message) => !tail.includes(message));
+  const head = messages.slice(0, Math.min(2, messages.length));
+  const state = options.stateNote?.trim()
+    ? [{ role: 'user' as const, content: `[Context checkpoint state]\n${options.stateNote.trim()}` }]
+    : [];
+  const trimmed = [...head, ...retainedPinned, ...state, ...tail];
+  if (estimateTokens(trimmed) <= thresholdTokens) {
+    return trimmed;
+  }
+  return buildDeterministicCheckpoint(messages, recentStart, 12_000, options.stateNote, pinned);
+}
+
+export interface CompressedFold {
+  messages: ChatMessage[];
+  beforeTokens: number;
+  afterTokens: number;
+  beforeMessages: number;
+  folded: boolean;
+}
+
+/**
+ * Fold a live transcript deterministically when the model asks to compress.
+ * Keeps the head, recent tail, and optionally a structured state note.
+ */
+export function foldMessagesForCompression(
+  messages: ChatMessage[],
+  preserveTokens: number,
+  options: { minRecentStart?: number; stateNote?: string; pinned?: ChatMessage[] } = {},
+): CompressedFold {
+  const beforeTokens = estimateTokens(messages);
+  const desiredStart = chooseRecentStart(messages, preserveTokens, ADAPTIVE_RECENT_FLOOR);
+  const recentStart = Math.min(desiredStart, options.minRecentStart ?? messages.length);
+  if (recentStart <= 2) {
+    return { messages, beforeTokens, afterTokens: beforeTokens, beforeMessages: messages.length, folded: false };
+  }
+  const folded = buildDeterministicCheckpoint(messages, recentStart, 12_000, options.stateNote, options.pinned);
+  const afterTokens = estimateTokens(folded);
+  if (afterTokens >= beforeTokens) {
+    return { messages, beforeTokens, afterTokens: beforeTokens, beforeMessages: messages.length, folded: false };
+  }
+  return { messages: folded, beforeTokens, afterTokens, beforeMessages: messages.length, folded: true };
 }
 
 export function projectCompressedMessages(

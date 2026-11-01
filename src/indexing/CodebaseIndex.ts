@@ -45,6 +45,8 @@ export interface CodebaseEvidence {
   exports: string[];
 }
 
+export type HybridSearchResult = CodebaseEvidence;
+
 export interface CodebaseIndexOptions {
   root: string;
   storageFile: string;
@@ -114,6 +116,16 @@ export class CodebaseIndex {
     return lines.join('\n');
   }
 
+  /**
+   * Fast, model-free search over the metadata index. Exact path/symbol matches
+   * receive the strongest weight, followed by exports and imports. This is a
+   * deliberately cheap first pass before semantic search or file reads.
+   */
+  async hybridSearch(query: string, limit = 8): Promise<HybridSearchResult[]> {
+    await this.refresh();
+    return this.search(query, limit);
+  }
+
   stats(): { files: number; symbols: number; imports: number; ready: boolean } {
     let symbols = 0;
     let imports = 0;
@@ -139,6 +151,16 @@ export class CodebaseIndex {
         if (exportText.includes(term)) score += 6;
         if (importText.includes(term)) score += 3;
       }
+      // Give exact whole-token matches a deterministic boost. This behaves
+      // like a small BM25-style lexical ranker without loading an embedding
+      // model or sending source code anywhere.
+      const exactTokens = new Set([
+        ...tokenize(file),
+        ...tokenize(symbolText),
+        ...tokenize(exportText),
+        ...tokenize(importText),
+      ]);
+      score += terms.reduce((total, term) => total + (exactTokens.has(term) ? 2 : 0), 0);
       // Keep a small set of likely entry points available for broad questions.
       if (score === 0 && terms.length === 0 && /(^|\/)(index|main|app|server|entry)\./i.test(file)) score = 1;
       if (score <= 0) continue;

@@ -15,7 +15,7 @@ import {
 } from './editor/prompts';
 import { ChatViewProvider } from './webview/ChatViewProvider';
 import { getConfig, promptForApiKey, workspaceRoot } from './config';
-import { activeProvider, roleProvider } from './llm/activeProvider';
+import { activeProvider } from './llm/activeProvider';
 import { PRESETS, findPreset } from './llm/presets';
 import { cleanupStaleTemps } from './util/atomicWrite';
 import { WorktreeManager } from './worktree/WorktreeManager';
@@ -73,23 +73,18 @@ export function activate(context: vscode.ExtensionContext): void {
   provider = new ChatViewProvider(context.extensionUri, session);
   const attention = new AttentionService(context);
 
-  let architectureAvailable: boolean | undefined;
-  const syncArchitectureAvailability = (connected: boolean): void => {
-    if (connected === architectureAvailable) {
-      return;
-    }
-    architectureAvailable = connected;
-    void vscode.commands.executeCommand(
-      'setContext',
-      'devFirst.architectureAvailable',
-      connected,
-    );
-  };
-  session.setConnectionListener(syncArchitectureAvailability);
-  syncArchitectureAvailability(false);
-  void activeProvider(context)
-    .then((active) => syncArchitectureAvailability(Boolean(active)))
-    .catch(() => syncArchitectureAvailability(false));
+  // VS Code can switch workspace folders without deactivating the extension.
+  // Recreate the scanner and close any architecture panel from the old root so
+  // its indexed facts and cached diagram cannot appear in the new project.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      scanRunner.resetWorkspace();
+      ArchitecturePanel.current?.dispose();
+    }),
+  );
+
+  // Architecture is built from scanner facts and needs no model connection.
+  void vscode.commands.executeCommand('setContext', 'devFirst.architectureAvailable', true);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, provider, {
@@ -596,42 +591,12 @@ export function activate(context: vscode.ExtensionContext): void {
       void scanRunner.scanFile(document);
     }),
     vscode.commands.registerCommand('devFirst.openArchitecture', async () => {
-      const executeTool = session.readOnlyToolExecutor();
       await ArchitecturePanel.show({
         extensionUri: context.extensionUri,
         root: workspaceRoot() ?? '',
         state: context.globalState,
         getFacts: () => scanRunner.getArchitectureFacts(),
         getCoverage: () => scanRunner.getArchitectureCoverage(),
-        getActive: () => roleProvider(context, 'architecture'),
-        getReasoning: async () => {
-          const config = getConfig();
-          const role = await roleProvider(context, 'architecture');
-          const levels = role?.reasoningLevels ?? [];
-          // Architecture is deliberately independent from the main composer:
-          // use its explicit setting, or the strongest supported level by
-          // default because map generation spans many files and boundaries.
-          const configured = config.architectureReasoningEffort.trim();
-          const effort = configured || [...levels].reverse().find((level) => level !== 'off' && level !== 'none') || '';
-          if (!effort || effort === 'off' || effort === 'none') return undefined;
-          if (levels.length > 0 && !levels.includes(effort)) {
-            return undefined;
-          }
-          return { enabled: true, effort: effort as 'low' | 'medium' | 'high' };
-        },
-        getTools: async () => {
-          const allowed = new Set([
-            'read_file',
-            'list_files',
-            'search_text',
-            'find_symbol',
-            'document_symbols',
-            'go_to_definition',
-          ]);
-          return (await session.plannerToolDefs()).filter((tool) => allowed.has(tool.name));
-        },
-        executeTool:
-          executeTool ?? (() => Promise.resolve('Error: read-only tools are unavailable.')),
       });
     }),
     vscode.commands.registerCommand('devFirst.refreshArchitecture', () => {

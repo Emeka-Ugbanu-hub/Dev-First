@@ -147,6 +147,10 @@ export interface QueuedPromptRecord {
   text: string;
   status: 'queued' | 'running' | 'paused' | 'completed' | 'cancelled';
   newTask?: boolean;
+  selection?: SelectionContext;
+  quote?: string;
+  images?: string[];
+  pastes?: PastedContent[];
   createdAt: number;
 }
 
@@ -180,6 +184,21 @@ export interface TaskRouteEvent {
   createdAt: number;
 }
 
+export interface PlannerStats {
+  turns: number;
+  promptTokens: number;
+  timeToFirstTokenMs: number;
+  readinessRejections: number;
+}
+
+export interface RunStats {
+  turns: number;
+  toolCalls: number;
+  promptTokens: number;
+  verificationRuns: number;
+  stopReason: 'finish' | 'step-limit' | 'incomplete' | 'loop' | 'mistakes' | 'aborted';
+}
+
 export interface RunRecord {
   id: string;
   sessionId: string;
@@ -201,6 +220,8 @@ export interface RunRecord {
   browser?: { port: number; url?: string };
   pending?: PendingDecisionRecord;
   reliability?: RunReliabilityState;
+  stats?: RunStats;
+  plannerStats?: PlannerStats;
   createdAt: number;
   updatedAt: number;
 }
