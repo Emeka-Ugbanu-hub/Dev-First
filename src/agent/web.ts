@@ -22,6 +22,25 @@ export interface FetchResult {
   cached: boolean;
 }
 
+/** Block obvious local/private targets without performing DNS resolution. */
+export function isPrivateHost(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return true;
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+    return true;
+  }
+  if (host === 'metadata.google.internal') return true;
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (ipv4) {
+    const [a, b] = ipv4.slice(1).map(Number);
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
+      (a === 100 && b >= 64 && b <= 127);
+  }
+  return host === '::1' || host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80:') ||
+    host.startsWith('::ffff:127.');
+}
+
 /** Normalize common documentation URLs without adding another network request. */
 export function normalizeDocumentationUrl(raw: string): string {
   try {
@@ -50,6 +69,7 @@ export interface RegistryMetadata {
 export async function fetchLlmsTxt(rawUrl: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
     const source = new URL(normalizeDocumentationUrl(rawUrl));
+    if (isPrivateHost(source.hostname)) return undefined;
     const candidate = `${source.protocol}//${source.host}/llms.txt`;
     const response = await fetchWithTimeout(candidate, { headers: { 'user-agent': HONEST_USER_AGENT, accept: 'text/plain' } }, 10, signal);
     if (!response.ok) return undefined;
@@ -146,6 +166,15 @@ export async function fetchUrlDetailed(
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     return { content: 'Error: only http(s) URLs are supported.', finalUrl: url, contentType: '', retrievedAt: new Date().toISOString(), cached: false };
   }
+  if (isPrivateHost(parsed.hostname)) {
+    return {
+      content: `Error: refusing to fetch local/private URL "${parsed.hostname}".`,
+      finalUrl: url,
+      contentType: '',
+      retrievedAt: new Date().toISOString(),
+      cached: false,
+    };
+  }
   const cacheKey = `${parsed.toString()}|${Math.max(1000, Math.min(maxChars || 30_000, 200_000))}`;
   const cached = fetchCache.get(cacheKey);
   if (useCache && cached && cached.expires > Date.now()) return { ...cached.value, cached: true };
@@ -175,6 +204,19 @@ export async function fetchUrlDetailed(
     } catch (error) {
       return { content: `Error: request failed: ${error instanceof Error ? error.message : String(error)}`, finalUrl: url, contentType: '', retrievedAt: new Date().toISOString(), cached: false };
     }
+  }
+  if (response.url) {
+    try {
+      if (isPrivateHost(new URL(response.url).hostname)) {
+        return {
+          content: 'Error: the URL redirected to a local/private address and was blocked.',
+          finalUrl: response.url,
+          contentType: '',
+          retrievedAt: new Date().toISOString(),
+          cached: false,
+        };
+      }
+    } catch {}
   }
   if (!response.ok) {
     return { content: `Error: HTTP ${response.status} ${response.statusText}`, finalUrl: response.url || url, contentType: response.headers.get('content-type') ?? '', retrievedAt: new Date().toISOString(), cached: false };

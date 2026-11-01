@@ -32,6 +32,8 @@ export interface DevFirstConfig {
   contextProfile: ContextProfileSetting;
   plannerThinking: PlannerThinkingSetting;
   semanticIndex: boolean;
+  semanticIndexMaxFiles: number;
+  codebaseIndexMaxFiles: number;
   embeddingsProvider: EmbeddingsProvider;
   embeddingsModel: string;
   sandbox: SandboxMode;
@@ -102,6 +104,8 @@ export function getConfig(): DevFirstConfig {
     contextProfile: config.get<ContextProfileSetting>('contextProfile', 'auto'),
     plannerThinking: normalizePlannerThinking(config.get<string>('plannerThinking', 'auto')),
     semanticIndex: config.get<boolean>('semanticIndex', true),
+    semanticIndexMaxFiles: Math.max(100, config.get<number>('semanticIndexMaxFiles', 2000)),
+    codebaseIndexMaxFiles: Math.max(100, config.get<number>('codebaseIndexMaxFiles', 20000)),
     embeddingsProvider: config.get<EmbeddingsProvider>('embeddingsProvider', 'local'),
     embeddingsModel: config.get<string>('embeddingsModel', 'text-embedding-3-small'),
     sandbox: config.get<SandboxMode>('sandbox', 'workspace-write'),
@@ -113,7 +117,7 @@ export function getConfig(): DevFirstConfig {
     autocomplete: config.get<boolean>('autocomplete', false),
     autocompleteModel: config.get<string>('autocompleteModel', ''),
     autocompleteFallback: config.get<boolean>('autocompleteFallback', true),
-    autoApproveMcp: config.get<boolean>('autoApproveMcp', true),
+    autoApproveMcp: config.get<boolean>('autoApproveMcp', false),
     resources: config.get<boolean>('resources', true),
     mcpDisplay: config.get<'plain' | 'markdown'>('mcpDisplay', 'markdown'),
     notifyOnFinish: config.get<boolean>('notifyOnFinish', false),

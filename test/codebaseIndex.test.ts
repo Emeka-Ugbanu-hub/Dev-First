@@ -46,6 +46,29 @@ describe('CodebaseIndex', () => {
     expect(evidence).not.toContain('createSession');
   });
 
+  it('serves the persisted snapshot before a background refresh finishes', async () => {
+    const { root, index } = await makeIndex();
+    await index.refresh();
+    const second = new CodebaseIndex({ root, storageFile: path.join(root, '.index.json') });
+    const evidence = await second.evidenceFast('create session', 4);
+    expect(evidence).toContain('snapshot');
+    expect(evidence).toContain('src/auth.ts');
+    expect(second.stats().ready).toBe(false);
+    expect(second.stats().files).toBeGreaterThan(0);
+  });
+
+  it('reports truncated coverage in evidence', async () => {
+    const { root } = await makeIndex();
+    const index = new CodebaseIndex({
+      root,
+      storageFile: path.join(root, '.index.json'),
+      maxFiles: 1,
+    });
+    const evidence = await index.evidence('create session', 4);
+    expect(evidence).toContain('Index coverage');
+    expect(index.stats()).toMatchObject({ truncated: true, maxFiles: 1 });
+  });
+
   it('provides a model-free hybrid lookup for symbols and imports', async () => {
     const { index } = await makeIndex();
     const results = await index.hybridSearch('UserStore session', 4);

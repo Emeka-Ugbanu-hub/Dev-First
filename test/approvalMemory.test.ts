@@ -28,21 +28,21 @@ function toolbox(options: { root: string; approvalMemory?: ApprovalMemory; exter
 const deny = { requestTerminalApproval: async () => 'deny' as const };
 
 describe('command approval prefixes', () => {
-  it('uses the first two tokens plus a star', () => {
-    expect(commandApprovalPrefix('npm run dev')).toBe('npm run *');
-    expect(commandApprovalPrefix('  npm   install  express ')).toBe('npm install *');
+  it('uses the first three tokens plus a star', () => {
+    expect(commandApprovalPrefix('npm run dev')).toBe('npm run dev *');
+    expect(commandApprovalPrefix('  npm   install  express ')).toBe('npm install express *');
     expect(commandApprovalPrefix('')).toBe('');
   });
 
-  it('matches same-prefix commands and does not over-match', () => {
+  it('matches the same command family and does not over-match other scripts', () => {
     const memory = new ApprovalMemory();
     memory.remember('npm run dev');
-    expect(memory.allows('npm run build')).toBe(true);
-    expect(memory.allows('npm run dev')).toBe(true);
+    expect(memory.allows('npm run dev --host')).toBe(true);
+    expect(memory.allows('npm run build')).toBe(false);
     expect(memory.allows('npm install')).toBe(false);
     expect(memory.size).toBe(1);
     memory.clear();
-    expect(memory.allows('npm run build')).toBe(false);
+    expect(memory.allows('npm run dev')).toBe(false);
   });
 
   it('skips the approval card for a remembered command', async () => {
@@ -55,10 +55,10 @@ describe('command approval prefixes', () => {
     expect(first).toContain('first');
     expect(approval).toHaveBeenCalledTimes(1);
 
-    const second = await box.execute('run_terminal_command', JSON.stringify({ command: 'echo -n second' }), {
+    const second = await box.execute('run_terminal_command', JSON.stringify({ command: 'echo -n first' }), {
       requestTerminalApproval: approval,
     });
-    expect(second).toContain('second');
+    expect(second).toContain('first');
     expect(approval).toHaveBeenCalledTimes(1);
   });
 

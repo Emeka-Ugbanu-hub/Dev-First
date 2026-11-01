@@ -2,7 +2,7 @@
   "name": "dev-first",
   "displayName": "Dev-First",
   "description": "Plan-first AI coding agent — every request becomes a plan you approve before a single line changes.",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "publisher": "dev-first",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "media/icon.png",
@@ -470,6 +470,18 @@
           "default": true,
           "description": "Enable semantic_search. Uses a bundled local embedding model by default — no API key needed, nothing leaves your machine."
         },
+        "devFirst.semanticIndexMaxFiles": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 100,
+          "description": "Maximum first-party files included in the semantic index. Lower this on very large repositories to keep local indexing fast."
+        },
+        "devFirst.codebaseIndexMaxFiles": {
+          "type": "number",
+          "default": 20000,
+          "minimum": 100,
+          "description": "Maximum files included in the model-free codebase locator. Metadata indexing is cheap; raise this for very large repositories."
+        },
         "devFirst.embeddingsProvider": {
           "type": "string",
           "enum": [
@@ -548,7 +560,7 @@
         },
         "devFirst.autoApproveMcp": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "Run MCP tool calls without asking for approval."
         },
         "devFirst.resources": {

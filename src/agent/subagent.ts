@@ -4,6 +4,7 @@ import { AgentService } from './AgentService';
 import { ToolBox } from './ToolBox';
 import { PromptFamily } from '../planner/prompts';
 import { DEFAULT_CONTEXT_LIMIT } from './compaction';
+import type { ContextProfile } from './modelProfile';
 
 export const SUBAGENT_MAX_STEPS = 20;
 export const SUBAGENT_TYPES = ['explore'] as const;
@@ -22,6 +23,9 @@ export interface SubagentDeps {
   rules?: string;
   family?: PromptFamily;
   signal: AbortSignal;
+  contextLimitTokens?: number;
+  contextProfile?: ContextProfile;
+  deterministicContext?: boolean;
 }
 
 export function normalizeSubagentType(value: unknown): string {
@@ -45,13 +49,17 @@ export async function runSubagent(request: SubagentRequest, deps: SubagentDeps):
     title: request.description.trim() || 'Subagent task',
     steps: [],
   };
+  const compact = deps.contextProfile?.tier === 'compact';
   const agent = new AgentService(deps.provider, deps.model, deps.toolbox, {
-    maxSteps: SUBAGENT_MAX_STEPS,
+    maxSteps: compact ? 12 : SUBAGENT_MAX_STEPS,
     tools: deps.tools,
     rules: deps.rules,
     family: deps.family,
-    autoCompact: false,
-    contextLimitTokens: DEFAULT_CONTEXT_LIMIT,
+    autoCompact: true,
+    contextLimitTokens: deps.contextLimitTokens ?? DEFAULT_CONTEXT_LIMIT,
+    ...(deps.contextProfile ? { contextProfile: deps.contextProfile } : {}),
+    ...(deps.deterministicContext ? { deterministicContext: true } : {}),
+    requireFinish: false,
   });
   const result = await agent.run(plan, prompt, deps.signal, {
     onTextDelta: (delta) => {

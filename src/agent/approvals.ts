@@ -5,7 +5,7 @@ export function commandApprovalPrefix(command: string): string {
   if (tokens.length === 0) {
     return '';
   }
-  return `${tokens.slice(0, 2).join(' ')} *`;
+  return `${tokens.slice(0, 3).join(' ')} *`;
 }
 
 export class ApprovalMemory {

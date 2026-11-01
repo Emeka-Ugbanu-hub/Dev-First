@@ -131,10 +131,12 @@ import { MemoryStore } from '../memory/MemoryStore';
 import { BackgroundProcesses } from '../agent/BackgroundProcesses';
 import { OriginalContentProvider } from '../diff/OriginalContentProvider';
 import { listWorkspaceFiles } from '../util/fsWalk';
-import { ActivityMeta, executionTools, plannerTools, subagentTools } from '../agent/tools';
+import { ActivityMeta, compactExecutorToolView, executionTools, loadToolsTool, plannerTools, subagentTools } from '../agent/tools';
 import { attachToolPreflights } from '../agent/compoundPreflight';
+import { PARALLEL_SAFE } from '../agent/parallelTools';
+import { clearRepoMapCache } from '../agent/repoMap';
 import type { ToolPreflight } from '../agent/compoundPreflight';
-import { planCheckRequirementFromPlan } from '../agent/verificationPolicy';
+import { matchesRiskPath, planCheckRequirementFromPlan } from '../agent/verificationPolicy';
 import { checkFinish } from '../agent/finishGate';
 import type { FinishGateResult } from '../agent/finishGate';
 import { reliabilityStateForPlan, reliabilityVerification } from '../agent/reliabilityState';
@@ -449,7 +451,7 @@ export class SessionController {
   private disposed = false;
   private knowledgeRefresh: Promise<void> | null = null;
   private rulesBaseCache: { projectRules: string | undefined; memory: string } | null = null;
-  private toolRegistryCache: { planner: ToolDef[]; executor: ToolDef[] } | null = null;
+  private toolRegistryCache: { planner: ToolDef[]; executor: ToolDef[]; lazyExecutor: ToolDef[] } | null = null;
   private plannerToolCache: ToolDef[] | null = null;
   private questionToolCache: ToolDef[] | null = null;
   private preparedProvider: { key: string; provider: LLMProvider } | undefined;
@@ -510,6 +512,7 @@ export class SessionController {
     this.codebaseIndex = new CodebaseIndex({
       root: workspaceRoot() ?? process.cwd(),
       storageFile: path.join(context.globalStorageUri.fsPath, 'codebase-index.json'),
+      maxFiles: getConfig().codebaseIndexMaxFiles,
       onProgress: (message) => {
         // Background indexing must never create an empty assistant row. Only
         // surface progress when a request is already displaying a stage.
@@ -557,6 +560,7 @@ export class SessionController {
         const codebaseWatcher = vscode.workspace.createFileSystemWatcher('**/*');
         const invalidateCodebase = (uri: vscode.Uri) => {
           this.codebaseIndex.invalidate(uri.fsPath);
+          this.semanticIndex?.invalidate(uri.fsPath);
           this.invalidateActiveCaches();
         };
         codebaseWatcher.onDidChange(invalidateCodebase);
@@ -1814,9 +1818,29 @@ export class SessionController {
     );
   }
 
+  private async codebaseEvidenceForRequest(request: string, limit = 4): Promise<string | undefined> {
+    try {
+      const fast = (await this.codebaseIndex.evidenceFast(request, limit)).trim();
+      if (fast) return fast;
+      if (await this.codebaseIndex.waitForReady(350)) {
+        return (await this.codebaseIndex.evidenceFast(request, limit)).trim() || undefined;
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async preparePlannerConversation(provider: LLMProvider, model = getConfig().model, local = false): Promise<ChatMessage[]> {
     const pendingDecisionIds = this.sessionPending ? [this.sessionPending.id] : this.currentRun?.pending ? [this.currentRun.pending.id] : [];
     const bootstrap = await projectBootstrap(workspaceRoot() ?? process.cwd());
+    const codebaseEvidence = await this.codebaseEvidenceForRequest(
+      this.lastRequest ?? '',
+      this.buildContextProfile().tier === 'compact' ? 4 : 6,
+    );
+    const evidence = [buildTaskEvidencePack(this.context.globalState, this.lastRequest ?? '', 3600, workspaceRoot()), codebaseEvidence]
+      .filter((entry): entry is string => Boolean(entry))
+      .join('\n\n') || undefined;
     const fingerprint = sha1Of(JSON.stringify({
       conversation: this.conversation,
       archivedConversation: this.archivedConversation,
@@ -1830,7 +1854,7 @@ export class SessionController {
       contextLimit: this.effectiveContextLimit(),
       diagnosticsSummary: this.diagnosticsSummary,
       changedFiles: this.currentRun?.changedFiles,
-      evidence: buildTaskEvidencePack(this.context.globalState, this.lastRequest ?? '', 3600, workspaceRoot()),
+      evidence,
       bootstrap,
     }));
     if (this.plannerConversationCache?.fingerprint === fingerprint) {
@@ -1846,7 +1870,7 @@ export class SessionController {
       budget: relevanceBudget(this.buildContextProfile().tier),
       pinned: this.buildPinnedContext(),
       completedRunBoundary: this.completedRunBoundary,
-      evidence: buildTaskEvidencePack(this.context.globalState, this.lastRequest ?? '', 3600, workspaceRoot()),
+      evidence,
       bootstrap,
     });
     this.completedRunBoundary = false;
@@ -2411,18 +2435,25 @@ export class SessionController {
       this.setStage('Thinking…');
     }
     const materialized = await this.savePastesToFiles(text, pastes, root);
-    let route = classifyIncomingMessage(
-      materialized,
-      this.taskState,
-      this.phase === 'planning' || this.phase === 'executing',
-    );
-    let routeResponse: string | undefined;
+    const fastAcknowledgement = !this.plan
+      && this.phase !== 'planning'
+      && this.phase !== 'executing'
+      && /^(?:ok|okay|thanks|thank you|got it|cool|nice|great|sounds good)[.!]?$/i.test(materialized.trim());
+    let route = fastAcknowledgement
+      ? 'acknowledgement'
+      : classifyIncomingMessage(
+        materialized,
+        this.taskState,
+        this.phase === 'planning' || this.phase === 'executing',
+      );
+    let routeResponse: string | undefined = fastAcknowledgement ? 'Got it.' : undefined;
     let provisionalMode: PlanningMode | undefined;
     const messageId = submittedMessage.id;
     const stateBefore = this.taskState.state;
-    // Preflight every message before planner preparation. The model decides
-    // the semantic route; the local result is only a failure fallback.
-    const provider = await this.buildProvider();
+    // Preflight every non-trivial message before planner preparation. The
+    // model decides the semantic route; the local result is only a failure
+    // fallback. Exact idle acknowledgements skip the extra model call.
+    const provider = fastAcknowledgement ? undefined : await this.buildProvider();
     if (provider) {
       const config = getConfig();
       const decision = await classifyMessageRoute(provider, config.model, materialized, this.taskState, this.plan);
@@ -2433,7 +2464,7 @@ export class SessionController {
           provisionalMode = decision.mode;
         }
       }
-    } else if (ownsRouteStage) {
+    } else if (!fastAcknowledgement && ownsRouteStage) {
       this.endStreaming();
     }
     if (route === 'smalltalk' || route === 'acknowledgement') {
@@ -2881,9 +2912,25 @@ export class SessionController {
   }
 
   private isDirectRun(plan: Plan): boolean {
-    return plan.intent !== 'explanation'
-      && (plan.planningMode === 'skip' || plan.trivial === true)
-      && !plan.skippedSteps?.length;
+    if (plan.intent === 'explanation' || plan.skippedSteps?.length) {
+      return false;
+    }
+    if (plan.planningMode !== 'skip' && plan.trivial !== true) {
+      return false;
+    }
+    const steps = plan.steps ?? [];
+    const expected = plan.expectedFiles ?? [];
+    if (steps.length > 1 || expected.length > 1) {
+      return false;
+    }
+    if (expected.some((file) => file.action === 'delete' || matchesRiskPath(file.path))) {
+      return false;
+    }
+    const text = steps.join(' ');
+    if (/(?:^|\b)(?:install|uninstall|remove|delete|drop|migrate|migration|deploy|publish|reset|purge|format|sudo)\b/i.test(text)) {
+      return false;
+    }
+    return true;
   }
 
   private async handleApprove(): Promise<void> {
@@ -2983,6 +3030,7 @@ export class SessionController {
       newDiagnosticErrors: summary.newDiagnosticErrors,
       diagnosticsAvailable: summary.diagnosticsAvailable,
       verificationRan: summary.verificationRan,
+      verificationFailures: summary.verificationFailures,
       ...(planRequiredCheck ? { planRequiredCheck } : {}),
       baselinesAvailable,
     });
@@ -3030,6 +3078,9 @@ export class SessionController {
       supportsReasoning: executorReasoningSupported,
       override: config.contextProfile,
     });
+    const initialEvidence = (plan.expectedFiles?.length ?? 0) === 0
+      ? await this.codebaseEvidenceForRequest(this.lastRequest ?? '', contextProfile.tier === 'compact' ? 4 : 6)
+      : undefined;
 
     this.diffManager.setRunContext({
       id: this.lastUserMessageId ?? randomId('run'),
@@ -3108,6 +3159,7 @@ export class SessionController {
     const agent = new AgentService(executionProvider, executionModel, executionToolbox, {
       maxSteps: config.maxSteps,
       tools: registry.executor,
+      lazyTools: registry.lazyExecutor,
       rules,
       family,
       autoCompact: config.autoCompact,
@@ -3120,6 +3172,8 @@ export class SessionController {
       profileReasoning: executorReasoningSupported,
       deterministicContext: preset.local,
       retrievalPasses: contextProfile.tier === 'compact' ? 1 : 2,
+      requireFinish: true,
+      ...(initialEvidence ? { initialEvidence } : {}),
       ...(this.eventLedger.condensed(1400) ? { ledger: this.eventLedger.condensed(1400) } : {}),
       finishCheck: (summary) => this.checkRunFinish(summary),
       taskState: {
@@ -3160,14 +3214,14 @@ export class SessionController {
       if (result.files?.length) {
         this.diffManager.setFileSummaries(result.files);
       }
-      runStopped = Boolean(result.incomplete);
+      runStopped = Boolean(result.incomplete || result.stoppedByLoop || result.stoppedByMistakes || result.reachedLimit);
       const planSnapshot = runStopped ? undefined : this.completePlan(plan);
       if (result.summary) {
         const summaryText = result.incomplete
           ? `${result.summary}\n\nRun ended incomplete — ${result.incomplete.issues[0] ?? 'finish check failed'}`
           : result.summary;
         const runId = this.diffManager.getCurrentRunId();
-        this.addCompletionMessage(summaryText, planSnapshot, runId, runId ? this.diffManager.runFiles(runId) : []);
+        this.addCompletionMessage(summaryText, planSnapshot, runId, runId ? this.diffManager.runFiles(runId) : [], !runStopped);
       }
       if (result.reachedLimit) {
         this.addNotice(
@@ -3546,9 +3600,10 @@ export class SessionController {
     this.post({ type: 'redoState', canRedo: false });
   }
 
-  private async buildToolRegistry(): Promise<{ planner: ToolDef[]; executor: ToolDef[] }> {
+  private async buildToolRegistry(): Promise<{ planner: ToolDef[]; executor: ToolDef[]; lazyExecutor: ToolDef[] }> {
     if (this.toolRegistryCache) {
       this.registerToolPreflights(this.toolRegistryCache.executor);
+      this.registerToolPreflights(this.toolRegistryCache.lazyExecutor);
       return this.toolRegistryCache;
     }
     const planner = await this.buildPlannerToolRegistry();
@@ -3560,14 +3615,33 @@ export class SessionController {
     await this.mcp.ensureLoaded(root);
     const mcpTools = this.mcp.tools();
     const reasoningSwitch = this.reasoningSwitchEnabled();
-    const executor = attachToolPreflights(
+    const allExecutor = attachToolPreflights(
       executionTools({ skills: skillNames, semanticSearch, memory, mcpTools, reasoningSwitch, task: true }),
     );
+    const config = getConfig();
+    const compact = this.buildContextProfile().tier === 'compact' || Boolean((findPreset(config.preset) ?? PRESETS[0]).local);
+    const coreNames = new Set([
+      'inspect_file_context', 'investigate_issue', 'bounded_investigation',
+      'local_hybrid_search', 'find_and_read', 'find_symbol', 'document_symbols',
+      'find_references', 'read_file', 'search_text',
+      'fix_in_file', 'apply_change_set', 'fix_diagnostic',
+      'run_terminal_command', 'todo_write', 'finish',
+    ]);
+    const executor = compact
+      ? allExecutor.filter((tool) => coreNames.has(tool.name)).map(compactExecutorToolView)
+      : allExecutor;
+    const lazyExecutor = compact
+      ? allExecutor.filter((tool) => !coreNames.has(tool.name))
+      : [];
+    if (lazyExecutor.length > 0) {
+      executor.push(loadToolsTool(lazyExecutor.map((tool) => tool.name)));
+    }
     this.toolRegistryCache = {
       planner,
       executor,
+      lazyExecutor,
     };
-    this.registerToolPreflights(executor);
+    this.registerToolPreflights(allExecutor);
     return this.toolRegistryCache;
   }
 
@@ -3648,7 +3722,14 @@ export class SessionController {
         root: workspaceRoot() ?? process.cwd(),
         storageFile: path.join(this.context.globalStorageUri.fsPath, 'semantic-index.json'),
         embed,
+        maxFiles: config.semanticIndexMaxFiles,
+        onProgress: (message) => {
+          if (this.streamingMessageId && this.phase !== 'idle') this.setStage(message);
+        },
       });
+      if (this.buildContextProfile().tier !== 'compact') {
+        this.semanticIndex.startBackgroundIndex();
+      }
     }
     return this.semanticIndex;
   }
@@ -3781,10 +3862,14 @@ export class SessionController {
   private invalidateActiveCaches(): void {
     this.activePlannerToolbox?.resetReadCache();
     this.activeExecutorToolbox?.resetReadCache();
+    clearRepoMapCache();
   }
 
   private buildToolbox(allowTask = true, dedupResponse: 'marker' | 'full' = 'full'): ToolBox {
     const config = getConfig();
+    const tier = this.buildContextProfile().tier;
+    const maxReadBytes = tier === 'compact' ? 16 * 1024 : tier === 'standard' ? 32 * 1024 : 50 * 1024;
+    const spillPreviewChars = tier === 'compact' ? 8_000 : tier === 'standard' ? 16_000 : 20_000;
     const controller = this;
     class JournalToolBox extends ToolBox {
       async execute(name: string, argsJson: string, context: ToolExecutionContext): Promise<string> {
@@ -3825,6 +3910,8 @@ export class SessionController {
       ...(allowTask ? { runTask: (request, signal) => this.runTask(request, signal) } : {}),
       approvalMemory: this.approvalMemory,
       externalDirectories: this.externalDirectories,
+      maxReadBytes,
+      spillPreviewChars,
       recentRunOperations: (filePath) => this.recentRunOperations(filePath),
       contextShunt: {
         summarize: (input) => this.summarizeContextWithWorker(input),
@@ -3891,17 +3978,27 @@ export class SessionController {
     const config = getConfig();
     const root = workspaceRoot() ?? process.cwd();
     const rules = await this.buildRules(root, request.prompt);
-    const family = promptFamilyFor(config.provider, config.model);
+    const editSelection = await this.resolveRoleSelection('editor', provider);
+    const subagentProvider = editSelection?.provider ?? provider;
+    const subagentModel = editSelection?.model ?? config.model;
+    const family = promptFamilyFor(editSelection?.preset.provider ?? config.provider, subagentModel);
+    const profile = this.buildContextProfile();
+    const local = Boolean((findPreset(config.preset) ?? PRESETS[0]).local);
     this.subagentDepth += 1;
     try {
       return await runSubagent(request, {
-        provider,
-        model: config.model,
+        provider: subagentProvider,
+        model: subagentModel,
         toolbox: this.buildToolbox(false),
-        tools: subagentTools({ semanticSearch: Boolean(this.getSemanticIndex()) }),
+        tools: subagentTools({
+          semanticSearch: Boolean(this.getSemanticIndex()) && profile.tier !== 'compact',
+        }),
         rules,
         family,
         signal: signal ?? this.abortController?.signal ?? new AbortController().signal,
+        contextLimitTokens: this.effectiveContextLimit(),
+        contextProfile: profile,
+        deterministicContext: local,
       });
     } finally {
       this.subagentDepth -= 1;
@@ -3953,13 +4050,7 @@ export class SessionController {
     if (editor) userText += editor;
     this.appendUserConversation(submittedMessage, userText, images);
     this.setStage('ANSWER — locating relevant files…');
-    let codebaseEvidence = '';
-    try {
-      codebaseEvidence = await this.codebaseIndex.evidence(text, 8);
-    } catch {
-      // The normal read/search tools remain the fallback if indexing is not
-      // available (for example while a workspace is being replaced).
-    }
+    const codebaseEvidence = await this.codebaseEvidenceForRequest(text, 8) ?? '';
     const request = composePlannerRequest({
       conversation: this.conversation,
       contextIndex: this.contextIndex,
@@ -3999,7 +4090,9 @@ export class SessionController {
       // One initial read pass plus one bounded refinement keeps small local
       // models from wandering through the repository while still allowing a
       // first tool result to guide one targeted follow-up.
-      const maxReadRounds = this.buildContextProfile().tier === 'compact' ? 2 : 3;
+      const answerProfile = this.buildContextProfile();
+      const maxReadRounds = answerProfile.tier === 'compact' ? 2 : 3;
+      const answerTokens = answerProfile.tier === 'compact' ? 1400 : 2000;
       for (let turn = 0; turn < maxReadRounds; turn++) {
         this.setStage(turn === 0 ? 'ANSWER — waiting for response…' : 'ANSWER — processing read results…');
         let textDelta = '';
@@ -4008,7 +4101,7 @@ export class SessionController {
         for await (const event of chatWithRetry(provider, messages, {
           model: getConfig().model,
           tools: tools.length > 0 ? tools : undefined,
-          maxTokens: 1400,
+          maxTokens: answerTokens,
           temperature: 0.2,
           reasoning: { enabled: false },
           // Respect the model/Modelfile-derived context window. Do not impose
@@ -4035,13 +4128,28 @@ export class SessionController {
           return true;
         }
         messages.push({ role: 'assistant', content: textDelta, toolCalls: calls, ...(reasoning ? { reasoning } : {}) });
-        for (const call of calls) {
+        const readOne = async (call: ToolCall): Promise<string> => {
           this.setStage(`ANSWER — reading ${call.name}…`);
-          const result = await this.executePlannerToolOn(questionToolbox, call, () => ({
+          return this.executePlannerToolOn(questionToolbox, call, () => ({
             usedTokens: estimateTokens(messages),
             limitTokens: this.effectiveContextLimit(),
           }));
-          messages.push({ role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
+        };
+        const questionResults = new Map<string, string>();
+        const concurrentCalls = calls.filter((call) => PARALLEL_SAFE.has(call.name));
+        const sequentialCalls = calls.filter((call) => !PARALLEL_SAFE.has(call.name));
+        const concurrentResults = await Promise.all(concurrentCalls.map((call) => readOne(call)));
+        concurrentCalls.forEach((call, index) => questionResults.set(call.id, concurrentResults[index]));
+        for (const call of sequentialCalls) {
+          questionResults.set(call.id, await readOne(call));
+        }
+        for (const call of calls) {
+          messages.push({
+            role: 'tool',
+            toolCallId: call.id,
+            toolName: call.name,
+            content: questionResults.get(call.id) ?? 'Error: tool did not return a result.',
+          });
         }
       }
       this.endStreaming();
@@ -4656,9 +4764,22 @@ export class SessionController {
     planSnapshot?: UiMessage['planSnapshot'],
     runId?: string,
     changedFiles?: UiMessage['changedFiles'],
+    retainTakeaways = false,
   ): void {
     const { text: withoutFailure, failureConcept } = extractFailureConcept(text);
     const { text: body, takeaways } = extractTakeaways(withoutFailure);
+    if (retainTakeaways && takeaways?.length && getConfig().memory) {
+      void (async () => {
+        let saved = 0;
+        for (const takeaway of takeaways) {
+          const result = await this.memory.save(takeaway, 'Run takeaways').catch(() => 'Error:');
+          if (result.startsWith('Saved')) saved++;
+        }
+        if (saved > 0) {
+          this.addNotice(`Saved ${saved} takeaway${saved === 1 ? '' : 's'} to project memory.`);
+        }
+      })();
+    }
     const message: UiMessage = {
       id: randomId('msg'),
       role: 'assistant',

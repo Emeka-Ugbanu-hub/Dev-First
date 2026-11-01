@@ -39,11 +39,23 @@ export interface WalkOptions {
   extensions?: Set<string>;
 }
 
-export async function listWorkspaceFiles(root: string, options: WalkOptions = {}): Promise<string[]> {
-  const results: string[] = [];
+export interface WorkspaceFileList {
+  files: string[];
+  truncated: boolean;
+}
+
+export async function listWorkspaceFilesDetailed(root: string, options: WalkOptions = {}): Promise<WorkspaceFileList> {
   const maxEntries = options.maxEntries ?? 2000;
-  await walk(root, root, results, options, 0, maxEntries);
-  return results;
+  const results: string[] = [];
+  await walk(root, root, results, options, 0, maxEntries + 1);
+  return {
+    files: results.slice(0, maxEntries),
+    truncated: results.length > maxEntries,
+  };
+}
+
+export async function listWorkspaceFiles(root: string, options: WalkOptions = {}): Promise<string[]> {
+  return (await listWorkspaceFilesDetailed(root, options)).files;
 }
 
 async function walk(

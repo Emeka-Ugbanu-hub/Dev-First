@@ -197,6 +197,8 @@ export interface RunStats {
   promptTokens: number;
   verificationRuns: number;
   stopReason: 'finish' | 'step-limit' | 'incomplete' | 'loop' | 'mistakes' | 'aborted';
+  durationMs?: number;
+  timeToFirstTokenMs?: number;
 }
 
 export interface RunRecord {

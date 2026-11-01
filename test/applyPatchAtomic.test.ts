@@ -45,6 +45,38 @@ afterEach(async () => {
 });
 
 describe('apply_patch validate then commit', () => {
+  it('requires a read before overwriting an existing file', async () => {
+    const file = path.join(root, 'existing.txt');
+    await fs.writeFile(file, 'original\n', 'utf-8');
+    const box = toolbox();
+
+    const result = await box.execute(
+      'write_file',
+      JSON.stringify({ path: 'existing.txt', content: 'overwrite\n' }),
+      context,
+    );
+
+    expect(result).toContain('read the existing file');
+    expect(await fs.readFile(file, 'utf-8')).toBe('original\n');
+  });
+
+  it('refuses to overwrite a file that changed after it was read', async () => {
+    const file = path.join(root, 'stale.txt');
+    await fs.writeFile(file, 'original\n', 'utf-8');
+    const box = toolbox();
+    await box.execute('read_file', JSON.stringify({ path: 'stale.txt' }), context);
+    await fs.writeFile(file, 'external change\n', 'utf-8');
+
+    const result = await box.execute(
+      'write_file',
+      JSON.stringify({ path: 'stale.txt', content: 'agent overwrite\n' }),
+      context,
+    );
+
+    expect(result).toContain('changed since it was read');
+    expect(await fs.readFile(file, 'utf-8')).toBe('external change\n');
+  });
+
   it('applies every operation when all hunks resolve', async () => {
     await fs.writeFile(path.join(root, 'b.txt'), 'present\n', 'utf-8');
     const result = await toolbox().execute(

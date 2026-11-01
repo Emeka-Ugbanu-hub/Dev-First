@@ -37,7 +37,7 @@ import type { HostMessage, Plan, TerminalApprovalDecision } from '../src/shared/
 import type { ToolBox } from '../src/agent/ToolBox';
 import { AgentService } from '../src/agent/AgentService';
 import type { AgentOptions, FinishCheckSummary } from '../src/agent/AgentService';
-import { executionTools } from '../src/agent/tools';
+import { executionTools, loadToolsTool } from '../src/agent/tools';
 import { SessionController } from '../src/session/SessionController';
 
 class ScriptedProvider implements LLMProvider {
@@ -120,6 +120,52 @@ afterEach(() => {
 });
 
 describe('AgentService finish gate', () => {
+  it('requires execution to end through finish instead of prose', async () => {
+    const provider = new ScriptedProvider([
+      [{ type: 'text', text: 'Done.' }],
+      [{ type: 'text', text: 'Still done.' }],
+    ]);
+    const toolbox = { execute: vi.fn(async () => 'ok') } as unknown as ToolBox;
+    const agent = new AgentService(provider, 'gpt-test', toolbox, {
+      maxSteps: 6,
+      tools: executionTools(),
+      autoCompact: false,
+      contextLimitTokens: 128000,
+      requireFinish: true,
+    });
+
+    const result = await agent.run(planArgs(), 'do it', new AbortController().signal, callbacks());
+
+    expect(provider.calls).toHaveLength(2);
+    expect(result.incomplete?.issues).toContain('finish tool was not called');
+    expect(result.reachedLimit).toBe(false);
+  });
+
+  it('loads optional tools on demand before the next model turn', async () => {
+    const provider = new ScriptedProvider([
+      [toolCallEvent('load_tools', { names: ['web_search'] })],
+      [toolCallEvent('finish', { summary: 'Done.' })],
+    ]);
+    const toolbox = { execute: vi.fn(async () => 'ok') } as unknown as ToolBox;
+    const all = executionTools();
+    const core = all.filter((tool) => tool.name === 'finish');
+    const lazy = all.filter((tool) => tool.name === 'web_search');
+    const agent = new AgentService(provider, 'gpt-test', toolbox, {
+      maxSteps: 6,
+      tools: [...core, loadToolsTool(lazy.map((tool) => tool.name))],
+      lazyTools: lazy,
+      autoCompact: false,
+      contextLimitTokens: 128000,
+      requireFinish: true,
+    });
+
+    const result = await agent.run(planArgs(), 'do it', new AbortController().signal, callbacks());
+
+    expect(result.summary).toBe('Done.');
+    expect(provider.calls[0].options.tools?.map((tool) => tool.name)).not.toContain('web_search');
+    expect(provider.calls[1].options.tools?.map((tool) => tool.name)).toContain('web_search');
+  });
+
   it('accepts a consistent finish immediately with no extra model call', async () => {
     const finishCheck = vi.fn(() => ({ ok: true as const }));
     const { provider, agent } = buildAgent([[toolCallEvent('finish', { summary: 'Done.' })]], finishCheck);
@@ -564,6 +610,35 @@ function createController(posted: HostMessage[]): { controller: SessionControlle
 function posts<T extends HostMessage['type']>(posted: HostMessage[], type: T) {
   return posted.filter((message): message is Extract<HostMessage, { type: T }> => message.type === type);
 }
+
+describe('SessionController finish wiring', () => {
+  it('passes verification failures into the finish gate', async () => {
+    const posted: HostMessage[] = [];
+    const { controller } = createController(posted);
+    (controller as unknown as { plan: Plan }).plan = {
+      version: 1,
+      status: 'approved',
+      intent: 'plan',
+      steps: [],
+      expectedFiles: [],
+    };
+    const result = await (controller as unknown as {
+      checkRunFinish(summary: FinishCheckSummary): Promise<{ ok: boolean; issues?: string[] }>;
+    }).checkRunFinish({
+      changedFiles: [],
+      recentToolFailures: [],
+      newDiagnosticErrors: 0,
+      diagnosticsAvailable: false,
+      verificationRan: [],
+      verificationFailures: ['verification failed: test npm test'],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.issues).toEqual(expect.arrayContaining([
+      expect.stringContaining('verification failed'),
+    ]));
+    controller.dispose();
+  });
+});
 
 describe('SessionController incomplete finish', () => {
   it('adds the incomplete line to the finish summary', async () => {

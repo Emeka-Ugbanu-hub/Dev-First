@@ -329,6 +329,10 @@ export interface ToolBoxOptions {
   contextShunt?: ContextShunt;
   /** Marker-only dedup keeps planner context small; full keeps the cached result. */
   dedupResponse?: 'marker' | 'full';
+  /** Context-tier read budget; defaults to the 50 KB maximum. */
+  maxReadBytes?: number;
+  /** Context-tier spill preview size. */
+  spillPreviewChars?: number;
 }
 
 export interface AdaptiveVerificationSnapshot {
@@ -347,6 +351,7 @@ export class ToolBox {
   private readonly verificationFailures: string[] = [];
   private readonly diagnosticStats = new Map<string, { baseline: number; latest: number }>();
   private readonly mutationHashes = new Map<string, string>();
+  private readonly readHashes = new Map<string, string>();
   private readonly pureResultCache = new Map<string, string>();
   private readonly dedupResponse: 'marker' | 'full';
   private diagnosticsObserved = false;
@@ -363,6 +368,7 @@ export class ToolBox {
 
   resetReadCache(): void {
     this.readCache.clear();
+    this.readHashes.clear();
     this.pureResultCache.clear();
   }
 
@@ -398,11 +404,13 @@ export class ToolBox {
 
   private async applyChange(absolute: string, content: string): Promise<string> {
     this.recordMutation(absolute, sha1Of(content));
+    this.readHashes.set(absolute, sha1Of(content));
     return this.options.diffManager.applyChange(absolute, content);
   }
 
   private async applyDeletion(absolute: string): Promise<string> {
     this.recordMutation(absolute, '');
+    this.readHashes.delete(absolute);
     return this.options.diffManager.applyDeletion(absolute);
   }
 
@@ -545,7 +553,7 @@ export class ToolBox {
       const text = withDerivedChangedFiles(await this.adaptiveVerification(name, args, context, outcome.text));
       const returned = outcome.spilled || SKIP_SPILL.has(name)
         ? text
-        : await spillOutput(text, name);
+        : await spillOutput(text, name, this.options.spillPreviewChars);
       if (cacheKey && !text.startsWith('Error:')) {
         this.pureResultCache.set(cacheKey, returned);
         if (this.pureResultCache.size > 64) {
@@ -677,9 +685,9 @@ export class ToolBox {
       case 'semantic_search':
         return { text: await this.semanticSearch(args, context) };
       case 'browser_navigate':
-        return { text: await this.browserNavigate(args) };
+        return { text: await this.browserNavigate(args, context) };
       case 'browser_evaluate':
-        return { text: await this.browserEvaluate(args) };
+        return { text: await this.browserEvaluate(args, context) };
       case 'browser_screenshot':
         return { text: await this.browserScreenshot() };
       default:
@@ -783,12 +791,13 @@ export class ToolBox {
     if (content.includes('\u0000')) {
       return `Error: ${display} appears to be a binary file.`;
     }
+    this.readHashes.set(absolute, sha1Of(content));
     const lines = content.replace(/\r\n/g, '\n').split('\n');
     const start = clampInt(args.start_line, 1, lines.length) ?? 1;
     const requestedEnd = headOnly
       ? Math.min(lines.length, start + 79)
       : clampInt(args.end_line, start, lines.length) ?? Math.min(lines.length, start + 1999);
-    const end = budgetEndLine(lines, start, requestedEnd, MAX_READ_BYTES);
+    const end = budgetEndLine(lines, start, requestedEnd, this.options.maxReadBytes ?? MAX_READ_BYTES);
     const hasMore = end < lines.length;
     const body = formatNumberedLines(lines.slice(start - 1, end), start, hasMore);
     return headOnly
@@ -818,7 +827,7 @@ export class ToolBox {
           break;
         }
         const size = Buffer.byteLength(line, 'utf-8') + 1;
-        if (lines.length > 0 && bytes + size > MAX_READ_BYTES) {
+        if (lines.length > 0 && bytes + size > (this.options.maxReadBytes ?? MAX_READ_BYTES)) {
           stopped = true;
           break;
         }
@@ -992,8 +1001,12 @@ export class ToolBox {
     if (results.length === 0) {
       return `No indexed locations matched "${query}".`;
     }
+    const stats = index.stats();
     return [
       `Local hybrid search: "${query}" — ${results.length} result(s)`,
+      ...(stats.truncated
+        ? [`[Index coverage: ${stats.files} of ${stats.scannedFiles}+ scanned files; limit ${stats.maxFiles}. Use search_text for the remainder.]`]
+        : []),
       ...results.map((result) => {
         const symbols = result.symbols.slice(0, 8).map((symbol) => `${symbol.name} (${symbol.kind}:${symbol.line})`).join(', ');
         const imports = result.imports.slice(0, 6).map((item) => `${item.specifier}:${item.line}`).join(', ');
@@ -1047,7 +1060,26 @@ export class ToolBox {
       return 'The developer denied this edit. Do not retry it unless asked.';
     }
     const content = typeof args.content === 'string' ? args.content : '';
+    const knownHash = this.readHashes.get(absolute);
+    let exists = false;
+    try {
+      exists = (await fs.stat(absolute)).isFile();
+    } catch {}
+    if (exists && knownHash === undefined) {
+      return 'Error: read the existing file before overwriting it, or use edit_file/apply_patch for a targeted change.';
+    }
+    if (knownHash !== undefined) {
+      try {
+        const current = await fs.readFile(absolute, 'utf-8');
+        if (sha1Of(current) !== knownHash) {
+          return 'Error: the file changed since it was read. Re-read it before overwriting, or use edit_file/apply_patch for a targeted change.';
+        }
+      } catch {
+        // A missing file is a create, not a stale overwrite.
+      }
+    }
     const result = await withFileLock(absolute, () => this.applyChange(absolute, content));
+    this.readHashes.set(absolute, sha1Of(content));
     return result + (await this.diagnosticsFor([absolute]));
   }
 
@@ -1418,19 +1450,42 @@ export class ToolBox {
       return 'Error: query is required.';
     }
     const limit = clampInt(args.max_results, 1, 20) ?? 8;
+    if (!(await this.options.semanticIndex.ready())) {
+      this.options.semanticIndex.startBackgroundIndex();
+      return 'Semantic search is warming its local index. Use local_hybrid_search, find_and_read, or search_text now; semantic results will be available on a later turn.';
+    }
     const results = await this.options.semanticIndex.search(query, limit);
     if (results.length === 0) {
       return 'No relevant code found.';
     }
+    const stats = this.options.semanticIndex.stats();
+    const coverage = stats.truncated
+      ? `\n\n[Semantic index coverage: ${stats.files} of ${stats.scannedFiles} scanned files; limit ${stats.maxFiles}. Use local_hybrid_search/search_text for the remainder.]`
+      : '';
     return results
       .map((result) => {
         const snippet = result.text.length > 900 ? `${result.text.slice(0, 900)}\n...` : result.text;
         return `${result.path}:${result.start}-${result.end} (score ${result.score.toFixed(3)})\n${snippet}`;
       })
-      .join('\n\n---\n\n');
+      .join('\n\n---\n\n') + coverage;
   }
 
-  private async browserNavigate(args: Record<string, any>): Promise<string> {
+  private async browserApproved(
+    action: 'navigate' | 'evaluate',
+    target: string,
+    context: ToolExecutionContext,
+  ): Promise<boolean> {
+    if (this.options.yolo) {
+      return true;
+    }
+    if (action === 'navigate' && /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?(?:\/|$)/i.test(target)) {
+      return true;
+    }
+    const decision = await context.requestTerminalApproval(`browser_${action}: ${target.slice(0, 160)}`, this.options.root);
+    return decision !== 'deny';
+  }
+
+  private async browserNavigate(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     if (!this.options.browser) {
       return 'Error: browser automation is not available.';
     }
@@ -1438,16 +1493,22 @@ export class ToolBox {
     if (!url) {
       return 'Error: url is required.';
     }
+    if (!(await this.browserApproved('navigate', url, context))) {
+      return 'The developer denied browser navigation. Do not retry it unless asked.';
+    }
     return this.options.browser.navigate(url);
   }
 
-  private async browserEvaluate(args: Record<string, any>): Promise<string> {
+  private async browserEvaluate(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     if (!this.options.browser) {
       return 'Error: browser automation is not available.';
     }
     const expression = typeof args.expression === 'string' ? args.expression : '';
     if (!expression.trim()) {
       return 'Error: expression is required.';
+    }
+    if (!(await this.browserApproved('evaluate', expression, context))) {
+      return 'The developer denied browser evaluation. Do not retry it unless asked.';
     }
     return this.options.browser.evaluate(expression);
   }
@@ -1577,7 +1638,7 @@ export class ToolBox {
     }
     const evidence: CompoundEvidence[] = [];
     const allLines = read.text.replace(/\r\n/g, '\n').split('\n');
-    const endLine = budgetEndLine(allLines, 1, Math.min(200, allLines.length), MAX_READ_BYTES);
+    const endLine = budgetEndLine(allLines, 1, Math.min(200, allLines.length), this.options.maxReadBytes ?? MAX_READ_BYTES);
     const lines = allLines.slice(0, endLine);
     evidence.push({
       kind: 'content',

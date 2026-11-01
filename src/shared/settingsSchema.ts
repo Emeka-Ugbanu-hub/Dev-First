@@ -215,6 +215,22 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     type: 'boolean',
   },
   {
+    key: 'semanticIndexMaxFiles',
+    tab: 'behavior',
+    group: 'Accuracy',
+    label: 'Semantic index file limit',
+    description: 'Maximum first-party files included in the semantic index.',
+    type: 'number',
+  },
+  {
+    key: 'codebaseIndexMaxFiles',
+    tab: 'behavior',
+    group: 'Accuracy',
+    label: 'Codebase index file limit',
+    description: 'Maximum files included in the model-free codebase locator.',
+    type: 'number',
+  },
+  {
     key: 'embeddingsProvider',
     tab: 'behavior',
     group: 'Accuracy',

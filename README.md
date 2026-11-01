@@ -59,7 +59,7 @@ Use a hosted provider or a local model through Ollama or LM Studio. Connect one 
 - **Scanner model:** code and risk scanning.
 - **Autocomplete model:** inline completions, with chat fallback when supported.
 
-Each role can have its own provider, model, and supported reasoning level, or inherit the main connection. Live model metadata is used when available, with cached information when a provider is temporarily unavailable.
+Each role can have its own provider, model, and supported reasoning level, or inherit the main connection. Live model metadata is used when available, with cached information when a provider is temporarily unavailable. On compact/local models the executor starts with a core tool set; optional tools such as semantic search, web access, browser automation, MCP, and subagents are loaded with `load_tools` only when a step needs them.
 
 Supported presets include OpenAI, Anthropic, Gemini, OpenRouter, Groq, DeepSeek, Ollama, LM Studio, and custom OpenAI-compatible endpoints. Local models can be used without an API key.
 
@@ -115,7 +115,7 @@ Open the **gear icon** for the in-panel settings view: **Provider** (connection 
 | `devFirst.sandbox` | `workspace-write` | OS sandbox for terminal writes (`off` or `workspace-write`); the approval card can bypass it once per command |
 | `devFirst.autoApproveTerminal` | `false` | Skip the Allow/Deny card for terminal commands |
 | `devFirst.autoApproveEdits` | `true` | Apply `write_file`, `edit_file`, and `apply_patch` without asking |
-| `devFirst.autoApproveMcp` | `true` | Run MCP tool calls without asking |
+| `devFirst.autoApproveMcp` | `false` | Run MCP tool calls without asking |
 | `devFirst.safeCommandsOnly` | `true` | With terminal auto-approve on, only read-only commands run automatically |
 | `devFirst.yolo` | `false` | Auto-approve everything: edits, all commands, and MCP tools |
 | `devFirst.headerTimeout` | `120` | Seconds to wait for model response headers; `0` disables |
@@ -123,7 +123,9 @@ Open the **gear icon** for the in-panel settings view: **Provider** (connection 
 | `devFirst.checkDiagnostics` | `true` | Feed language-server diagnostics for touched files back after edits |
 | `devFirst.parallelTools` | `true` | Run independent read-only tool calls in parallel |
 | `devFirst.memory` | `true` | Save and recall durable project facts across sessions |
-| `devFirst.semanticIndex` | `true` | Enable `semantic_search` with the bundled local embedding model |
+| `devFirst.semanticIndex` | `true` | Enable `semantic_search` with the bundled local embedding model; compact/local executors load it on demand |
+| `devFirst.semanticIndexMaxFiles` | `2000` | Maximum first-party files in the semantic index |
+| `devFirst.codebaseIndexMaxFiles` | `20000` | Maximum files in the model-free codebase locator |
 | `devFirst.embeddingsProvider` | `local` | `local` = bundled MiniLM (offline) · `api` = provider embeddings |
 
 ### Verification

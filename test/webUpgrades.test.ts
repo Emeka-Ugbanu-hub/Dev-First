@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { clampTimeoutSeconds, fetchLlmsTxt, fetchUrl, htmlToMarkdown, normalizeDocumentationUrl, parseDuckDuckGoResults, selectRegistryMetadata } from '../src/agent/web';
+import { clampTimeoutSeconds, fetchLlmsTxt, fetchUrl, htmlToMarkdown, isPrivateHost, normalizeDocumentationUrl, parseDuckDuckGoResults, selectRegistryMetadata } from '../src/agent/web';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -40,6 +40,19 @@ describe('documentation adapters', () => {
     vi.stubGlobal('fetch', fetchMock);
     await expect(fetchLlmsTxt('https://docs.example.com/guide')).resolves.toContain('/guide');
     expect(fetchMock.mock.calls[0][0]).toBe('https://docs.example.com/llms.txt');
+  });
+});
+
+describe('private URL blocking', () => {
+  it('blocks local and private hosts before any request', async () => {
+    expect(isPrivateHost('localhost')).toBe(true);
+    expect(isPrivateHost('127.0.0.1')).toBe(true);
+    expect(isPrivateHost('192.168.1.10')).toBe(true);
+    expect(isPrivateHost('example.com')).toBe(false);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchUrl('http://127.0.0.1/admin', 1000)).resolves.toContain('local/private');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

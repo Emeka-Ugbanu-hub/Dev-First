@@ -148,6 +148,30 @@ describe('direct trivial runs', () => {
     controller.dispose();
   });
 
+  it('does not run a trivial plan that spans multiple files', async () => {
+    stubFetch([
+      toolSse('submit_plan', {
+        intent: 'plan',
+        trivial: true,
+        steps: ['Change both files'],
+        expectedFiles: [
+          { path: 'src/a.ts', action: 'add', reason: 'first' },
+          { path: 'src/b.ts', action: 'add', reason: 'second' },
+        ],
+      }),
+    ]);
+    const run = vi.spyOn(AgentService.prototype, 'run').mockResolvedValue({ reachedLimit: false });
+    const posted: HostMessage[] = [];
+    const controller = createController(posted);
+
+    await controller.handleMessage({ type: 'sendMessage', text: 'change both files' });
+
+    expect(run).not.toHaveBeenCalled();
+    expect(controller.getState().plan?.status).toBe('draft');
+    expect(posts(posted, 'plan').some((message) => message.plan?.status === 'draft')).toBe(true);
+    controller.dispose();
+  });
+
   it('never starts the executor for a non-trivial plan before handleApprove', async () => {
     stubFetch([
       toolSse('submit_plan', {

@@ -774,6 +774,31 @@ const PLANNER_TOOL_DESCRIPTIONS: Record<string, string> = {
   use_skill: 'Load a matching project skill by name.',
 };
 
+const COMPACT_EXECUTOR_DESCRIPTIONS: Record<string, string> = {
+  inspect_file_context: 'Read a compact file snapshot with content, symbols, imports, and diagnostics.',
+  investigate_issue: 'Investigate a file and optional line with references and diagnostics.',
+  bounded_investigation: 'Run bounded read-only investigation across a small scope and return evidence.',
+  local_hybrid_search: 'Fast local search over indexed paths, symbols, imports, and exports; no model call.',
+  find_and_read: 'Find text or a symbol and read compact ranges around the best matches.',
+  find_symbol: 'Find symbols by name with file, line, kind, and container.',
+  document_symbols: 'List a file symbol tree with line numbers.',
+  find_references: 'Find references to a symbol in the workspace.',
+  read_file: 'Read numbered lines from a file; use start_line and end_line for large files.',
+  search_text: 'Search file contents and return file:line matches.',
+  fix_in_file: 'Apply a targeted patch in one file and verify diagnostics.',
+  apply_change_set: 'Apply a verified multi-file change set with diagnostics.',
+  fix_diagnostic: 'Repair a specific diagnostic in a file.',
+  run_terminal_command: 'Run a shell command in the workspace; approval and sandbox rules apply.',
+  todo_write: 'Update the full task list with exactly one in-progress item.',
+  finish: 'Finish the approved task with a summary and per-file walkthrough.',
+};
+
+export function compactExecutorToolView(tool: ToolDef): ToolDef {
+  const description = COMPACT_EXECUTOR_DESCRIPTIONS[tool.name] ?? PLANNER_TOOL_DESCRIPTIONS[tool.name];
+  if (!description) return tool;
+  return { ...tool, description };
+}
+
 function plannerToolView(tool: ToolDef): ToolDef {
   return {
     ...tool,
@@ -891,6 +916,24 @@ export function executionTools(options: ToolRegistryOptions = {}): ToolDef[] {
   return tools;
 }
 
+export function loadToolsTool(names: string[]): ToolDef {
+  return {
+    name: 'load_tools',
+    description: `Load optional tools that were hidden to save context. Available: ${names.join(', ')}. Load only the tools the current step needs; their schemas become available on the next turn.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        names: {
+          type: 'array',
+          items: names.length > 0 ? { type: 'string', enum: names } : { type: 'string' },
+          description: 'Optional tool names to enable.',
+        },
+      },
+      required: ['names'],
+    },
+  };
+}
+
 export function subagentTools(options: { semanticSearch?: boolean } = {}): ToolDef[] {
   const tools: ToolDef[] = [readFileTool, listFilesTool, searchTextTool];
   if (options.semanticSearch) {
@@ -994,6 +1037,8 @@ export function describeToolCall(call: ToolCall): string {
       return `Browser eval ${truncate(String(args.expression ?? ''), 40)}`;
     case 'browser_screenshot':
       return 'Screenshot page';
+    case 'load_tools':
+      return 'Load optional tools';
     case 'finish':
       return 'Finish';
     case 'submit_plan':

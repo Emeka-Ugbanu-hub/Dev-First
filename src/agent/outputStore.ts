@@ -53,7 +53,7 @@ export function countLines(text: string): number {
   return text.length === 0 ? 0 : text.split('\n').length;
 }
 
-export async function spillOutput(text: string, label: string): Promise<string> {
+export async function spillOutput(text: string, label: string, maxPreviewChars = SPILL_PREVIEW_CHARS): Promise<string> {
   const lines = countLines(text);
   const bytes = Buffer.byteLength(text, 'utf-8');
   if (lines <= SPILL_MAX_LINES && bytes <= SPILL_MAX_BYTES) {
@@ -72,12 +72,12 @@ export async function spillOutput(text: string, label: string): Promise<string> 
   } catch {
     return text;
   }
-  return spillPreview(text, target.relative);
+  return spillPreview(text, target.relative, maxPreviewChars);
 }
 
-export function spillPreview(text: string, relativePath: string): string {
-  const headBudget = Math.floor(SPILL_PREVIEW_CHARS * 0.4);
-  const tailBudget = SPILL_PREVIEW_CHARS - headBudget;
+export function spillPreview(text: string, relativePath: string, maxPreviewChars = SPILL_PREVIEW_CHARS): string {
+  const headBudget = Math.floor(maxPreviewChars * 0.4);
+  const tailBudget = maxPreviewChars - headBudget;
   let head = text.slice(0, headBudget);
   let tail = text.slice(Math.max(0, text.length - tailBudget));
   const headBreak = head.lastIndexOf('\n');

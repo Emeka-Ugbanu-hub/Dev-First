@@ -1,12 +1,14 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
-import { listWorkspaceFiles, TEXT_EXTENSIONS } from '../util/fsWalk';
+import { listWorkspaceFilesDetailed, TEXT_EXTENSIONS } from '../util/fsWalk';
 
 const MAX_FILE_BYTES = 100_000;
-const MAX_FILES = 2000;
+const DEFAULT_MAX_FILES = 2000;
 const CHUNK_LINES = 60;
 const CHUNK_OVERLAP = 10;
+const EXCLUDED_SEGMENTS = /(^|\/)(__tests?__|tests?|specs?|fixtures?|mocks?|snapshots?|dist|build|coverage|node_modules)(\/|$)/i;
+const EXCLUDED_EXTENSIONS = /\.(?:test|spec)\.[^.]+$|\.(?:md|mdx|lock|json|ya?ml|toml)$/i;
 
 interface Chunk {
   start: number;
@@ -18,6 +20,8 @@ interface Chunk {
 interface FileEntry {
   hash: string;
   chunks: Chunk[];
+  size?: number;
+  mtimeMs?: number;
 }
 
 interface IndexData {
@@ -39,14 +43,36 @@ export interface SemanticIndexOptions {
   embed: (texts: string[]) => Promise<number[][]>;
   onProgress?: (message: string) => void;
   signal?: AbortSignal;
+  maxFiles?: number;
+}
+
+function isSemanticCandidate(relative: string): boolean {
+  return !EXCLUDED_SEGMENTS.test(relative) && !EXCLUDED_EXTENSIONS.test(relative);
 }
 
 export class SemanticIndex {
   private data: IndexData = { version: 1, files: {} };
   private loaded = false;
   private building: Promise<void> | undefined;
+  private dirty = true;
+  private fullScan = true;
+  private readonly pendingFiles = new Set<string>();
+  private readonly maxFiles: number;
+  private coverage = { scannedFiles: 0, truncated: false, skippedFiles: 0 };
 
-  constructor(private readonly options: SemanticIndexOptions) {}
+  constructor(private readonly options: SemanticIndexOptions) {
+    this.maxFiles = Math.max(1, options.maxFiles ?? DEFAULT_MAX_FILES);
+  }
+
+  startBackgroundIndex(): void {
+    if (!this.dirty || this.building) return;
+    void this.ensureIndexed().catch(() => undefined);
+  }
+
+  async ready(): Promise<boolean> {
+    await this.load();
+    return this.loaded && !this.dirty;
+  }
 
   async search(query: string, limit: number): Promise<SemanticSearchResult[]> {
     await this.ensureIndexed();
@@ -74,6 +100,10 @@ export class SemanticIndex {
   }
 
   async ensureIndexed(): Promise<void> {
+    await this.load();
+    if (!this.dirty && this.loaded) {
+      return;
+    }
     if (this.building) {
       return this.building;
     }
@@ -83,25 +113,67 @@ export class SemanticIndex {
     return this.building;
   }
 
+  invalidate(filePath?: string): void {
+    this.dirty = true;
+    if (filePath) {
+      const relative = path.relative(this.options.root, path.resolve(filePath));
+      if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+        this.pendingFiles.add(relative.split(path.sep).join('/'));
+        return;
+      }
+    }
+    this.fullScan = true;
+  }
+
   clear(): void {
     this.data = { version: 1, files: {} };
     this.loaded = true;
+    this.dirty = true;
+    this.fullScan = true;
+    this.pendingFiles.clear();
+    this.coverage = { scannedFiles: 0, truncated: false, skippedFiles: 0 };
   }
 
-  stats(): { files: number; chunks: number } {
+  stats(): {
+    files: number;
+    chunks: number;
+    ready: boolean;
+    truncated: boolean;
+    maxFiles: number;
+    scannedFiles: number;
+    skippedFiles: number;
+  } {
     let chunks = 0;
     for (const entry of Object.values(this.data.files)) {
       chunks += entry.chunks.length;
     }
-    return { files: Object.keys(this.data.files).length, chunks };
+    return {
+      files: Object.keys(this.data.files).length,
+      chunks,
+      ready: this.loaded && !this.dirty,
+      truncated: this.coverage.truncated,
+      maxFiles: this.maxFiles,
+      scannedFiles: this.coverage.scannedFiles,
+      skippedFiles: this.coverage.skippedFiles,
+    };
   }
 
   private async build(): Promise<void> {
-    await this.load();
-    const files = await listWorkspaceFiles(this.options.root, {
+    if (!this.fullScan && this.pendingFiles.size > 0) {
+      await this.buildPending();
+      return;
+    }
+    const listing = await listWorkspaceFilesDetailed(this.options.root, {
       extensions: TEXT_EXTENSIONS,
-      maxEntries: MAX_FILES,
+      maxEntries: this.maxFiles * 4,
     });
+    const candidates = listing.files.filter(isSemanticCandidate);
+    const files = candidates.slice(0, this.maxFiles);
+    this.coverage = {
+      scannedFiles: listing.files.length,
+      truncated: listing.truncated || candidates.length > this.maxFiles,
+      skippedFiles: listing.files.length - candidates.length,
+    };
     const fileSet = new Set(files);
     for (const rel of Object.keys(this.data.files)) {
       if (!fileSet.has(rel)) {
@@ -109,72 +181,115 @@ export class SemanticIndex {
       }
     }
 
-    const pending: Array<{ rel: string; hash: string; chunks: Array<{ start: number; end: number; text: string }> }> = [];
-    for (const rel of files) {
-      if (this.options.signal?.aborted) {
-        break;
-      }
-      const absolute = path.join(this.options.root, rel);
-      let stat;
-      try {
-        stat = await fs.stat(absolute);
-      } catch {
-        continue;
-      }
-      if (stat.size > MAX_FILE_BYTES) {
-        continue;
-      }
-      let content: string;
-      try {
-        content = await fs.readFile(absolute, 'utf-8');
-      } catch {
-        continue;
-      }
-      if (content.includes('\u0000')) {
-        continue;
-      }
-      const hash = createHash('sha1').update(content).digest('hex');
-      if (this.data.files[rel]?.hash === hash) {
-        continue;
-      }
-      pending.push({ rel, hash, chunks: chunkText(content) });
-    }
-
-    if (pending.length === 0) {
-      this.options.onProgress?.('Semantic index is up to date.');
-      return;
-    }
-
     let updated = 0;
-    for (let index = 0; index < pending.length; index++) {
+    let paused = false;
+    for (let index = 0; index < files.length; index++) {
       if (this.options.signal?.aborted) {
+        paused = true;
         break;
       }
-      const item = pending[index];
-      this.options.onProgress?.(`Indexing ${item.rel} (${index + 1}/${pending.length})…`);
+      const rel = files[index];
+      this.options.onProgress?.(`Indexing ${rel} (${index + 1}/${files.length})…`);
       try {
-        const vectors = await this.options.embed(item.chunks.map((chunk) => chunk.text));
-        this.data.files[item.rel] = {
-          hash: item.hash,
-          chunks: item.chunks.map((chunk, chunkIndex) => ({
-            ...chunk,
-            vector: vectors[chunkIndex] ?? [],
-          })),
-        };
-        updated++;
+        if (await this.updateFile(rel)) updated++;
       } catch (error) {
         this.options.onProgress?.(
-          `Indexing stopped: ${error instanceof Error ? error.message : String(error)}`,
+          `Semantic indexing paused: ${error instanceof Error ? error.message : String(error)}`,
         );
+        paused = true;
         break;
       }
     }
-
-    if (updated > 0) {
-      await this.save();
-    }
+    this.fullScan = false;
+    this.loaded = true;
+    this.dirty = paused || this.pendingFiles.size > 0;
+    if (updated > 0) await this.save();
     const stats = this.stats();
-    this.options.onProgress?.(`Index ready: ${stats.files} files, ${stats.chunks} chunks.`);
+    this.options.onProgress?.(
+      `Semantic index ready: ${stats.files} files, ${stats.chunks} chunks${stats.truncated ? ` (coverage capped at ${this.maxFiles})` : ''}.`,
+    );
+  }
+
+  private async buildPending(): Promise<void> {
+    const pending = [...this.pendingFiles];
+    this.pendingFiles.clear();
+    let updated = 0;
+    let paused = false;
+    for (const rel of pending) {
+      if (this.options.signal?.aborted) {
+        paused = true;
+        break;
+      }
+      try {
+        if (await this.updateFile(rel)) updated++;
+      } catch (error) {
+        this.options.onProgress?.(
+          `Semantic indexing paused: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        paused = true;
+        break;
+      }
+    }
+    this.loaded = true;
+    this.dirty = paused || this.pendingFiles.size > 0;
+    if (updated > 0) await this.save();
+    const stats = this.stats();
+    this.options.onProgress?.(`Semantic index updated: ${stats.files} files, ${stats.chunks} chunks.`);
+  }
+
+  private async updateFile(relative: string): Promise<boolean> {
+    const absolute = path.join(this.options.root, relative);
+    let stat;
+    try {
+      stat = await fs.stat(absolute);
+    } catch {
+      if (this.data.files[relative]) {
+        delete this.data.files[relative];
+        return true;
+      }
+      return false;
+    }
+    const previous = this.data.files[relative];
+    if (previous && previous.size === stat.size && previous.mtimeMs === stat.mtimeMs) {
+      return false;
+    }
+    if (stat.size > MAX_FILE_BYTES) {
+      const removed = Boolean(this.data.files[relative]);
+      delete this.data.files[relative];
+      return removed;
+    }
+    let content: string;
+    try {
+      content = await fs.readFile(absolute, 'utf-8');
+    } catch {
+      return false;
+    }
+    if (content.includes('\u0000')) {
+      const removed = Boolean(this.data.files[relative]);
+      delete this.data.files[relative];
+      return removed;
+    }
+    const hash = createHash('sha1').update(content).digest('hex');
+    if (previous?.hash === hash) {
+      this.data.files[relative] = { ...previous, size: stat.size, mtimeMs: stat.mtimeMs };
+      return false;
+    }
+    const chunks = chunkText(content);
+    if (chunks.length === 0) {
+      this.data.files[relative] = { hash, chunks: [], size: stat.size, mtimeMs: stat.mtimeMs };
+      return true;
+    }
+    const vectors = await this.options.embed(chunks.map((chunk) => chunk.text));
+    this.data.files[relative] = {
+      hash,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      chunks: chunks.map((chunk, index) => ({
+        ...chunk,
+        vector: vectors[index] ?? [],
+      })),
+    };
+    return true;
   }
 
   private async load(): Promise<void> {

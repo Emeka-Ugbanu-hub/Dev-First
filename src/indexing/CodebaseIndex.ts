@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
-import { listWorkspaceFiles, TEXT_EXTENSIONS } from '../util/fsWalk';
+import { listWorkspaceFilesDetailed, TEXT_EXTENSIONS } from '../util/fsWalk';
 
 const INDEX_VERSION = 1;
 const MAX_FILES = 5000;
@@ -51,6 +51,7 @@ export interface CodebaseIndexOptions {
   root: string;
   storageFile: string;
   onProgress?: (message: string) => void;
+  maxFiles?: number;
 }
 
 /**
@@ -63,8 +64,14 @@ export class CodebaseIndex {
   private loaded = false;
   private refreshPromise: Promise<void> | undefined;
   private dirty = true;
+  private fullScan = true;
+  private readonly pendingFiles = new Set<string>();
+  private readonly maxFiles: number;
+  private coverage = { scannedFiles: 0, truncated: false };
 
-  constructor(private readonly options: CodebaseIndexOptions) {}
+  constructor(private readonly options: CodebaseIndexOptions) {
+    this.maxFiles = Math.max(1, options.maxFiles ?? MAX_FILES);
+  }
 
   startBackgroundRefresh(): void {
     void this.refresh();
@@ -82,7 +89,13 @@ export class CodebaseIndex {
     this.dirty = true;
     if (filePath) {
       const relative = this.relative(filePath);
-      if (relative) delete this.data.files[relative];
+      if (relative) {
+        this.pendingFiles.add(relative);
+      } else {
+        this.fullScan = true;
+      }
+    } else {
+      this.fullScan = true;
     }
     // Refresh is intentionally scheduled instead of run inline from a file
     // watcher, so editor saves never block typing or the chat request.
@@ -93,11 +106,38 @@ export class CodebaseIndex {
 
   async evidence(query: string, limit = 8): Promise<string> {
     await this.refresh();
+    return this.renderEvidence(query, limit, false);
+  }
+
+  /** Use the persisted snapshot immediately while a background refresh runs. */
+  async evidenceFast(query: string, limit = 8): Promise<string> {
+    await this.load();
+    if (Object.keys(this.data.files).length === 0) return '';
+    return this.renderEvidence(query, limit, true);
+  }
+
+  /** Wait briefly for the first useful index snapshot without blocking the task. */
+  async waitForReady(timeoutMs = 350): Promise<boolean> {
+    if (this.loaded && !this.dirty) return true;
+    await Promise.race([
+      this.refresh().catch(() => undefined),
+      new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, timeoutMs))),
+    ]);
+    return this.loaded && !this.dirty;
+  }
+
+  private renderEvidence(query: string, limit: number, snapshot: boolean): string {
     const results = this.search(query, limit);
     const fallback = results.length > 0 ? results : this.search('', Math.min(limit, 4));
     if (fallback.length === 0) return '';
+    const coverage = this.coverage;
     const lines = [
-      '[Deterministic codebase index — verified locations; read these files for details]',
+      snapshot
+        ? '[Deterministic codebase index snapshot — background refresh may still be running]'
+        : '[Deterministic codebase index — verified locations; read these files for details]',
+      ...(coverage.truncated
+        ? [`Index coverage: ${Object.keys(this.data.files).length} of ${coverage.scannedFiles}+ files; the file limit is ${this.maxFiles}. Use search_text for files outside the index.`]
+        : []),
     ];
     for (const result of fallback) {
       const symbols = result.symbols
@@ -126,14 +166,32 @@ export class CodebaseIndex {
     return this.search(query, limit);
   }
 
-  stats(): { files: number; symbols: number; imports: number; ready: boolean } {
+  stats(): {
+    files: number;
+    symbols: number;
+    imports: number;
+    ready: boolean;
+    refreshing: boolean;
+    scannedFiles: number;
+    truncated: boolean;
+    maxFiles: number;
+  } {
     let symbols = 0;
     let imports = 0;
     for (const file of Object.values(this.data.files)) {
       symbols += file.symbols.length;
       imports += file.imports.length;
     }
-    return { files: Object.keys(this.data.files).length, symbols, imports, ready: this.loaded && !this.dirty };
+    return {
+      files: Object.keys(this.data.files).length,
+      symbols,
+      imports,
+      ready: this.loaded && !this.dirty,
+      refreshing: Boolean(this.refreshPromise),
+      scannedFiles: this.coverage.scannedFiles,
+      truncated: this.coverage.truncated,
+      maxFiles: this.maxFiles,
+    };
   }
 
   private search(query: string, limit: number): CodebaseEvidence[] {
@@ -181,10 +239,16 @@ export class CodebaseIndex {
   private async build(): Promise<void> {
     await this.load();
     if (!this.dirty) return;
-    const files = await listWorkspaceFiles(this.options.root, {
+    if (!this.fullScan && this.pendingFiles.size > 0) {
+      await this.buildPending();
+      return;
+    }
+    const listing = await listWorkspaceFilesDetailed(this.options.root, {
       extensions: TEXT_EXTENSIONS,
-      maxEntries: MAX_FILES,
+      maxEntries: this.maxFiles,
     });
+    const files = listing.files;
+    this.coverage = { scannedFiles: files.length, truncated: listing.truncated };
     const fileSet = new Set(files);
     for (const file of Object.keys(this.data.files)) {
       if (!fileSet.has(file)) delete this.data.files[file];
@@ -195,41 +259,69 @@ export class CodebaseIndex {
     const worker = async (): Promise<void> => {
       while (cursor < files.length) {
         const index = cursor++;
-        const relative = files[index];
-        const absolute = path.join(this.options.root, relative);
-        let stat;
-        try {
-          stat = await fs.stat(absolute);
-        } catch {
-          continue;
-        }
-        const previous = this.data.files[relative];
-        if (previous && previous.size === stat.size && previous.mtimeMs === stat.mtimeMs) continue;
-        if (stat.size > MAX_FILE_BYTES) {
-          delete this.data.files[relative];
-          continue;
-        }
-        let content: string;
-        try {
-          content = await fs.readFile(absolute, 'utf8');
-        } catch {
-          continue;
-        }
-        if (content.includes('\u0000')) continue;
-        const hash = createHash('sha1').update(content).digest('hex');
-        if (previous?.hash === hash) {
-          this.data.files[relative] = { ...previous, size: stat.size, mtimeMs: stat.mtimeMs };
-          continue;
-        }
-        this.data.files[relative] = parseFile(relative, content, hash, stat.size, stat.mtimeMs);
-        changed++;
+        if (await this.updateFile(files[index])) changed++;
       }
     };
     await Promise.all(Array.from({ length: Math.min(WORKERS, Math.max(1, files.length)) }, () => worker()));
-    this.dirty = false;
+    this.fullScan = false;
+    this.dirty = this.pendingFiles.size > 0;
     this.loaded = true;
     if (changed > 0 || Object.keys(this.data.files).length > 0) await this.save();
     this.options.onProgress?.(`Codebase index ready: ${Object.keys(this.data.files).length} files (${changed} updated).`);
+    if (this.dirty) setTimeout(() => void this.refresh(), 150);
+  }
+
+  private async buildPending(): Promise<void> {
+    const pending = [...this.pendingFiles];
+    this.pendingFiles.clear();
+    let changed = 0;
+    await Promise.all(pending.map(async (relative) => {
+      if (await this.updateFile(relative)) changed++;
+    }));
+    this.loaded = true;
+    this.dirty = this.pendingFiles.size > 0;
+    if (changed > 0) await this.save();
+    this.options.onProgress?.(`Codebase index updated: ${Object.keys(this.data.files).length} files (${changed} changed).`);
+    if (this.dirty) setTimeout(() => void this.refresh(), 150);
+  }
+
+  private async updateFile(relative: string): Promise<boolean> {
+    const absolute = path.join(this.options.root, relative);
+    let stat;
+    try {
+      stat = await fs.stat(absolute);
+    } catch {
+      if (this.data.files[relative]) {
+        delete this.data.files[relative];
+        return true;
+      }
+      return false;
+    }
+    const previous = this.data.files[relative];
+    if (previous && previous.size === stat.size && previous.mtimeMs === stat.mtimeMs) return false;
+    if (stat.size > MAX_FILE_BYTES) {
+      const removed = Boolean(this.data.files[relative]);
+      delete this.data.files[relative];
+      return removed;
+    }
+    let content: string;
+    try {
+      content = await fs.readFile(absolute, 'utf8');
+    } catch {
+      return false;
+    }
+    if (content.includes('\u0000')) {
+      const removed = Boolean(this.data.files[relative]);
+      delete this.data.files[relative];
+      return removed;
+    }
+    const hash = createHash('sha1').update(content).digest('hex');
+    if (previous?.hash === hash) {
+      this.data.files[relative] = { ...previous, size: stat.size, mtimeMs: stat.mtimeMs };
+      return false;
+    }
+    this.data.files[relative] = parseFile(relative, content, hash, stat.size, stat.mtimeMs);
+    return true;
   }
 
   private relative(filePath: string): string | undefined {

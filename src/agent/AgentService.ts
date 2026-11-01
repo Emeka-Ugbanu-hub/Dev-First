@@ -134,12 +134,19 @@ export interface AgentOptions {
   ledger?: string;
   /** Maximum bounded read-only evidence refinement rounds before editing. */
   retrievalPasses?: number;
+  /** Execution runs must end through the finish tool, not a prose-only turn. */
+  requireFinish?: boolean;
+  /** Optional tools hidden from the initial prompt and enabled by load_tools. */
+  lazyTools?: ToolDef[];
+  /** Small deterministic codebase locator evidence for the initial turn. */
+  initialEvidence?: string;
 }
 
 export class AgentService {
   private readonly doomLoop = new DoomLoopDetector();
   private readonly mistakes = new MistakeTracker();
   private readonly convergence = new ConvergenceGuard();
+  private firstResponseAt = 0;
   private runStats: RunStats = {
     turns: 0,
     toolCalls: 0,
@@ -173,6 +180,8 @@ export class AgentService {
     signal: AbortSignal,
     callbacks: AgentCallbacks,
   ): Promise<AgentResult> {
+    const startedAt = Date.now();
+    this.firstResponseAt = 0;
     this.runStats = {
       turns: 0,
       toolCalls: 0,
@@ -181,6 +190,10 @@ export class AgentService {
       stopReason: 'finish',
     };
     const result = await this.runLoop(plan, request, signal, callbacks);
+    this.runStats.durationMs = Date.now() - startedAt;
+    if (this.firstResponseAt > 0) {
+      this.runStats.timeToFirstTokenMs = this.firstResponseAt - startedAt;
+    }
     const stopReason: RunStats['stopReason'] = result.stoppedByLoop
       ? 'loop'
       : result.stoppedByMistakes
@@ -213,7 +226,9 @@ export class AgentService {
     ];
     const readCallPaths = new Map<string, string>();
     const readMessageIndex = new Map<string, number>();
-    const toolsByName = new Map(this.options.tools.map((tool) => [tool.name, tool]));
+    const availableTools = [...this.options.tools];
+    const toolsByName = new Map(availableTools.map((tool) => [tool.name, tool]));
+    const lazyToolsByName = new Map((this.options.lazyTools ?? []).map((tool) => [tool.name, tool]));
     const contextLimit = this.options.contextLimitTokens || DEFAULT_CONTEXT_LIMIT;
     const profile = this.options.contextProfile;
     let latestUsage: UsageTotals | undefined;
@@ -228,6 +243,7 @@ export class AgentService {
     let previousToolNames: string[] = [];
     let previousToolFailed = false;
     let finishRejected = false;
+    let finishNudged = false;
     let lastProgressAt = Date.now();
     let toolCallIndex = 0;
     let completedTodoSteps = 0;
@@ -244,6 +260,15 @@ export class AgentService {
     }
     if (this.options.ledger) {
       messages.push({ role: 'system', content: this.options.ledger });
+    }
+    if (this.options.initialEvidence) {
+      messages.push({ role: 'system', content: this.options.initialEvidence });
+    }
+    if ((this.options.lazyTools?.length ?? 0) > 0) {
+      messages.push({
+        role: 'system',
+        content: 'Optional tools are hidden to save context. If this step needs web access, a browser, MCP, semantic search, background processes, or a subagent, call load_tools with the needed names first.',
+      });
     }
 
     const progressDescription = (): string =>
@@ -321,7 +346,7 @@ export class AgentService {
             projectedMessages,
             {
               model: this.model,
-              tools: this.options.tools,
+              tools: [...availableTools],
               signal,
               reasoning: this.options.resolveReasoning
                 ? this.options.resolveReasoning({
@@ -341,6 +366,9 @@ export class AgentService {
               },
             },
           )) {
+            if (!this.firstResponseAt && (event.type === 'text' || event.type === 'reasoning' || event.type === 'toolCall')) {
+              this.firstResponseAt = Date.now();
+            }
             if (event.type === 'text') {
               text += event.text;
               callbacks.onTextDelta(event.text);
@@ -409,6 +437,27 @@ export class AgentService {
           }
           lastAssistantText = normalizedText;
           repeatedAssistantText = 0;
+          if (this.options.requireFinish && (plan.steps?.length ?? 0) > 0) {
+            if (!finishNudged) {
+              finishNudged = true;
+              messages.push({
+                role: 'user',
+                content:
+                  'Do not end with prose. The approved plan is not complete until you call finish with the summary and files. Call finish now, or continue with the required tool work first.',
+              });
+              continue;
+            }
+            callbacks.onNotice?.('Run ended incomplete — the finish tool was not called.');
+            return {
+              reachedLimit: false,
+              summary: text.trim(),
+              files: [],
+              incomplete: {
+                issues: ['finish tool was not called'],
+                compact: 'The model stopped with prose before calling finish; verification and the finish gate did not complete.',
+              },
+            };
+          }
           const convergence = this.convergence.observe({
             signature: `text:${normalizedText}`,
             producedOutput: true,
@@ -575,7 +624,23 @@ export class AgentService {
       const executeOne = async (call: ToolCall): Promise<void> => {
         callbacks.onToolActivity(call.id, describeToolCall(call), 'running', toolIcon(call.name), activityMeta(call, ''));
         let result: string;
-        if (call.name === 'set_reasoning') {
+        if (call.name === 'load_tools') {
+          const requested = Array.isArray(toolCallArgs(call).names)
+            ? (toolCallArgs(call).names as unknown[]).filter((name): name is string => typeof name === 'string')
+            : [];
+          const loaded: string[] = [];
+          for (const name of requested) {
+            if (toolsByName.has(name)) continue;
+            const definition = lazyToolsByName.get(name);
+            if (!definition) continue;
+            toolsByName.set(name, definition);
+            availableTools.push(definition);
+            loaded.push(name);
+          }
+          result = loaded.length > 0
+            ? `Loaded tools: ${loaded.join(', ')}. They are available from the next model turn.`
+            : `No optional tools were loaded. Available: ${[...lazyToolsByName.keys()].join(', ') || 'none'}.`;
+        } else if (call.name === 'set_reasoning') {
           const args = toolCallArgs(call);
           const level = String(args.level ?? '').trim();
           result = callbacks.setReasoning
@@ -940,9 +1005,10 @@ export class AgentService {
     signal: AbortSignal,
     callbacks: AgentCallbacks,
   ): Promise<string | undefined> {
+    const compact = this.options.contextProfile?.tier === 'compact';
     const targets = [...new Set((plan.expectedFiles ?? [])
       .map((file) => file.path.trim())
-      .filter(Boolean))].slice(0, 8);
+      .filter(Boolean))].slice(0, compact ? 3 : 8);
     if (targets.length === 0) return undefined;
     const context = {
       requestTerminalApproval: async (): Promise<TerminalApprovalDecision> => 'deny',
@@ -965,7 +1031,7 @@ export class AgentService {
       '[Deterministic edit localization]',
       'The following symbol trees came from the language service. Use them to target exact functions; verify contents before changing them.',
       ...useful,
-    ].join('\n\n').slice(0, 7000);
+    ].join('\n\n').slice(0, compact ? 3000 : 7000);
   }
 
   private async forceCompact(
@@ -1028,7 +1094,7 @@ export class AgentService {
       newDiagnosticErrors: snapshot?.newDiagnosticErrors ?? 0,
       diagnosticsAvailable: snapshot?.diagnosticsAvailable ?? false,
       verificationRan: snapshot?.verificationRan ?? [],
-      verificationFailures: [...new Set(verificationFailures)],
+      verificationFailures: [...new Set([...(snapshot?.verificationFailures ?? []), ...verificationFailures])],
     };
   }
 }
