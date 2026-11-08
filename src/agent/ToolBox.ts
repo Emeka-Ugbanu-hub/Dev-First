@@ -1,6 +1,8 @@
 import { createReadStream, promises as fs } from 'fs';
+import { createHash } from 'crypto';
 import * as path from 'path';
 import * as readline from 'readline';
+import { StringDecoder } from 'string_decoder';
 import { fileURLToPath, pathToFileURL } from 'url';
 import * as vscode from 'vscode';
 import { DiffManager } from '../diff/DiffManager';
@@ -32,6 +34,8 @@ import {
   memorySaveTool,
   outgoingCallsTool,
   readFileTool,
+  skimFileTool,
+  readOutputTool,
   runTerminalTool,
   searchTextTool,
   semanticSearchTool,
@@ -53,7 +57,7 @@ import {
   suggestSimilar,
   truncateLine,
 } from './fileRead';
-import { initOutputStore, spillOutput } from './outputStore';
+import { initOutputStore, readSpilledOutputRange, spillOutput } from './outputStore';
 import { buildScopedRepoMap } from './repoMap';
 import { runTerminalCommand } from './terminal';
 import { collectFileDiagnostics, diagnosticLines, diagnosticsSection, formatDiagnostics } from './diagnostics';
@@ -174,9 +178,12 @@ import { ApprovalMemory, ExternalDirectoryConsent } from './approvals';
 import type { SubagentRequest } from './subagent';
 
 const MAX_STREAM_BYTES = 50 * 1024 * 1024;
+const LARGE_FILE_LINE_THRESHOLD = 500;
+const MAX_READ_RANGE_LINES = 500;
+const MAX_SKIM_SYMBOLS = 120;
 const MAX_LIST_ENTRIES = 500;
 const MAX_SEARCH_RESULTS = 100;
-const SKIP_SPILL = new Set(['todo_write']);
+const SKIP_SPILL = new Set(['todo_write', 'skim_file', 'read_output']);
 const BOUNDED_DEFAULT_OPERATIONS = 6;
 const BOUNDED_HARD_CAP = 8;
 const BOUNDED_OP_BYTES = 8 * 1024;
@@ -185,6 +192,8 @@ const WEB_FETCH_MAX_COUNT = 12;
 const WEB_FETCH_MAX_BYTES = 2 * 1024 * 1024;
 const BOUNDED_ALLOWED_TOOLS = new Set([
   'read_file',
+  'skim_file',
+  'read_output',
   'list_files',
   'search_text',
   'semantic_search',
@@ -215,6 +224,89 @@ const ADAPTIVE_SYMBOL_TOOLS = new Set([
   'refactor_symbol',
   'update_related_files',
 ]);
+
+async function fileSha1(absolute: string): Promise<string> {
+  const hash = createHash('sha1');
+  for await (const chunk of createReadStream(absolute)) {
+    hash.update(chunk as Buffer);
+  }
+  return hash.digest('hex');
+}
+
+async function exceedsLineCount(absolute: string, limit: number): Promise<boolean> {
+  const stream = createReadStream(absolute, { encoding: 'utf8' });
+  const reader = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  let count = 0;
+  try {
+    for await (const _line of reader) {
+      count++;
+      if (count > limit) {
+        return true;
+      }
+    }
+    return false;
+  } finally {
+    reader.close();
+    stream.destroy();
+  }
+}
+
+async function fileOutlineAndDigest(
+  absolute: string,
+): Promise<{ lineCount: number; outline: string[]; truncated: boolean; digest: string }> {
+  const hash = createHash('sha1');
+  const stream = createReadStream(absolute);
+  const decoder = new StringDecoder('utf8');
+  const outline: string[] = [];
+  const structuralLine = /^\s*(?:#{1,6}\s+.+|(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|enum|struct|trait|impl|fn|func|def|namespace|module)\b.*|(?:export\s+)?(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?(?:function|\([^)]*\)\s*=>|[\w$]+\s*=>))/;
+  const maxScanCharsPerLine = 16_384;
+  let currentLine = '';
+  let truncated = false;
+  let lineCount = 0;
+  let bytesSeen = 0;
+  let lastByte = -1;
+  const addPart = (part: string): void => {
+    if (currentLine.length < maxScanCharsPerLine) {
+      currentLine += part.slice(0, maxScanCharsPerLine - currentLine.length);
+    }
+  };
+  const finishLine = (): void => {
+    lineCount++;
+    const line = currentLine.endsWith('\r') ? currentLine.slice(0, -1) : currentLine;
+    if (structuralLine.test(line)) {
+      if (outline.length < MAX_SKIM_SYMBOLS) outline.push(`line ${lineCount}: ${line.trim().slice(0, 240)}`);
+      else truncated = true;
+    }
+    currentLine = '';
+  };
+  const consume = (text: string): void => {
+    let offset = 0;
+    while (offset < text.length) {
+      const newline = text.indexOf('\n', offset);
+      if (newline < 0) {
+        addPart(text.slice(offset));
+        return;
+      }
+      addPart(text.slice(offset, newline));
+      finishLine();
+      offset = newline + 1;
+    }
+  };
+  try {
+    for await (const chunk of stream) {
+      const buffer = chunk as Buffer;
+      bytesSeen += buffer.length;
+      if (buffer.length > 0) lastByte = buffer[buffer.length - 1];
+      hash.update(buffer);
+      consume(decoder.write(buffer));
+    }
+  } finally {
+    stream.destroy();
+  }
+  consume(decoder.end());
+  if (bytesSeen > 0 && lastByte !== 0x0a) finishLine();
+  return { lineCount, outline, truncated, digest: hash.digest('hex') };
+}
 
 /**
  * Project-wide checks are deferred to a single finish pass. Diagnostics and
@@ -249,6 +341,8 @@ const useSkillSchema: ToolDef = {
 const TOOL_SCHEMAS = new Map<string, ToolDef>();
 for (const definition of [
   readFileTool,
+  skimFileTool,
+  readOutputTool,
   listFilesTool,
   searchTextTool,
   localHybridSearchTool,
@@ -286,7 +380,7 @@ for (const definition of [
 }
 
 const PURE_TOOL_NAMES = new Set([
-  'read_file', 'list_files', 'search_text', 'local_hybrid_search', 'find_and_read',
+  'read_file', 'skim_file', 'read_output', 'list_files', 'search_text', 'local_hybrid_search', 'find_and_read',
   'find_symbol', 'document_symbols', 'find_references', 'go_to_definition', 'hover',
   'go_to_implementation', 'incoming_calls', 'outgoing_calls',
 ]);
@@ -352,6 +446,8 @@ export class ToolBox {
   private readonly diagnosticStats = new Map<string, { baseline: number; latest: number }>();
   private readonly mutationHashes = new Map<string, string>();
   private readonly readHashes = new Map<string, string>();
+  /** Files whose complete, untruncated text has actually been returned to the model. */
+  private readonly fullReadHashes = new Set<string>();
   private readonly pureResultCache = new Map<string, string>();
   private readonly dedupResponse: 'marker' | 'full';
   private diagnosticsObserved = false;
@@ -369,6 +465,7 @@ export class ToolBox {
   resetReadCache(): void {
     this.readCache.clear();
     this.readHashes.clear();
+    this.fullReadHashes.clear();
     this.pureResultCache.clear();
   }
 
@@ -404,13 +501,16 @@ export class ToolBox {
 
   private async applyChange(absolute: string, content: string): Promise<string> {
     this.recordMutation(absolute, sha1Of(content));
-    this.readHashes.set(absolute, sha1Of(content));
+    this.fullReadHashes.delete(absolute);
+    const digest = sha1Of(content);
+    this.readHashes.set(absolute, digest);
     return this.options.diffManager.applyChange(absolute, content);
   }
 
   private async applyDeletion(absolute: string): Promise<string> {
     this.recordMutation(absolute, '');
     this.readHashes.delete(absolute);
+    this.fullReadHashes.delete(absolute);
     return this.options.diffManager.applyDeletion(absolute);
   }
 
@@ -553,7 +653,7 @@ export class ToolBox {
       const text = withDerivedChangedFiles(await this.adaptiveVerification(name, args, context, outcome.text));
       const returned = outcome.spilled || SKIP_SPILL.has(name)
         ? text
-        : await spillOutput(text, name, this.options.spillPreviewChars);
+        : await spillOutput(text, name, this.options.spillPreviewChars, this.options.root);
       if (cacheKey && !text.startsWith('Error:')) {
         this.pureResultCache.set(cacheKey, returned);
         if (this.pureResultCache.size > 64) {
@@ -574,6 +674,19 @@ export class ToolBox {
     switch (name) {
       case 'read_file':
         return { text: await this.readFile(args, context) };
+      case 'skim_file':
+        return { text: await this.skimFile(args, context) };
+      case 'read_output':
+        return {
+          text: await readSpilledOutputRange(
+            this.options.root,
+            String(args.path ?? ''),
+            Number(args.start_line),
+            Number(args.end_line),
+            args.start_column === undefined ? undefined : Number(args.start_column),
+            args.end_column === undefined ? undefined : Number(args.end_column),
+          ),
+        };
       case 'list_files':
         return { text: await this.listFiles(args, context) };
       case 'search_text':
@@ -731,6 +844,62 @@ export class ToolBox {
     return absolute;
   }
 
+  private async skimFile(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
+    const display = String(args.path ?? '');
+    const absolute = await this.resolvePath(display, context);
+    let stat;
+    try {
+      stat = await fs.stat(absolute);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+        return await this.notFoundMessage(display, absolute);
+      }
+      throw error;
+    }
+    if (!stat.isFile()) return `Error: ${display} is not a file.`;
+    const kind = await sniffFileKind(absolute, stat.size);
+    if (kind) return `${display} ${kind} (${formatBytes(stat.size)}) and cannot be outlined as text.`;
+    if (stat.size > MAX_STREAM_BYTES) return `Error: ${display} is larger than 50 MB and cannot be skimmed.`;
+
+    const [{ lineCount, outline: fallback, truncated: fallbackTruncated, digest }, providerSymbols] = await Promise.all([
+      fileOutlineAndDigest(absolute),
+      Promise.resolve(vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
+        'vscode.executeDocumentSymbolProvider',
+        vscode.Uri.file(absolute),
+      )).catch(() => [] as vscode.DocumentSymbol[]),
+    ]);
+    this.readHashes.set(absolute, digest);
+    this.fullReadHashes.delete(absolute);
+
+    const outline: string[] = [];
+    let symbolsTruncated = false;
+    const visit = (symbols: vscode.DocumentSymbol[], depth: number): void => {
+      for (const symbol of symbols) {
+        if (outline.length >= MAX_SKIM_SYMBOLS) {
+          symbolsTruncated = true;
+          return;
+        }
+        const start = symbol.range.start.line + 1;
+        const end = Math.max(start, symbol.range.end.line + (symbol.range.end.character === 0 ? 0 : 1));
+        outline.push(`${'  '.repeat(depth)}${vscode.SymbolKind[symbol.kind]} ${symbol.name} — lines ${start}-${end}`);
+        if (symbol.children?.length) visit(symbol.children, depth + 1);
+      }
+    };
+    if (providerSymbols?.length) visit(providerSymbols, 0);
+    const usedFallback = outline.length === 0;
+    const entries = usedFallback ? fallback : outline;
+    const omitted = usedFallback ? fallbackTruncated : symbolsTruncated;
+    return [
+      `File outline: ${display}`,
+      `Lines: ${lineCount}`,
+      `Full-file SHA-1: ${digest}`,
+      usedFallback ? 'Outline source: structural fallback (no language-service symbols).' : 'Outline source: VS Code language-service symbols.',
+      ...(entries.length ? entries : ['No symbols or headings found.']),
+      ...(omitted ? [`… outline limited to ${MAX_SKIM_SYMBOLS} entries.`] : []),
+      `Read exact content with read_file using start_line and end_line (maximum ${MAX_READ_RANGE_LINES} lines per call).`,
+    ].join('\n');
+  }
+
   private async readFile(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     const display = String(args.path);
     const absolute = await this.resolvePath(args.path, context);
@@ -754,17 +923,36 @@ export class ToolBox {
     if (stat.size > MAX_STREAM_BYTES) {
       return `Error: ${display} is larger than 50 MB. Use search_text or read a smaller file.`;
     }
+    const hasStartLine = args.start_line !== undefined;
+    const hasEndLine = args.end_line !== undefined;
+    const hasCompleteRange = hasStartLine && hasEndLine;
+    if (hasCompleteRange) {
+      const start = Number(args.start_line);
+      const end = Number(args.end_line);
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) {
+        return 'Error: start_line and end_line must be valid inclusive line numbers, with end_line at or after start_line.';
+      }
+      if (end - start + 1 > MAX_READ_RANGE_LINES) {
+        return `Error: read_file ranges are limited to ${MAX_READ_RANGE_LINES} lines. Use multiple ranges for larger sections.`;
+      }
+    }
+    if (!hasCompleteRange && await exceedsLineCount(absolute, LARGE_FILE_LINE_THRESHOLD)) {
+      return `Error: ${display} has more than ${LARGE_FILE_LINE_THRESHOLD} lines. Use skim_file first, then read_file with both start_line and end_line for a range of at most ${MAX_READ_RANGE_LINES} lines.`;
+    }
     if (this.options.contextShunt && stat.size >= CONTEXT_SHUNT_BYTES && stat.size <= CONTEXT_SHUNT_MAX_BYTES && args.start_line === undefined && args.end_line === undefined) {
       const source = await fs.readFile(absolute, 'utf-8');
       if (!source.includes('\u0000')) {
+        const digest = sha1Of(source);
+        this.readHashes.set(absolute, digest);
+        this.fullReadHashes.delete(absolute);
         const summary = await this.options.contextShunt.summarize({
           path: display,
           text: source,
-          hash: sha1Of(source),
+          hash: digest,
           signal: context.signal,
         });
         if (summary) {
-          return `${summary}\nUse read_file with start_line/end_line for exact content.`;
+          return `${summary}\nFull-file SHA-1: ${digest}\nUse read_file with start_line/end_line for exact content.`;
         }
       }
     }
@@ -791,7 +979,8 @@ export class ToolBox {
     if (content.includes('\u0000')) {
       return `Error: ${display} appears to be a binary file.`;
     }
-    this.readHashes.set(absolute, sha1Of(content));
+    const digest = sha1Of(content);
+    this.readHashes.set(absolute, digest);
     const lines = content.replace(/\r\n/g, '\n').split('\n');
     const start = clampInt(args.start_line, 1, lines.length) ?? 1;
     const requestedEnd = headOnly
@@ -799,13 +988,22 @@ export class ToolBox {
       : clampInt(args.end_line, start, lines.length) ?? Math.min(lines.length, start + 1999);
     const end = budgetEndLine(lines, start, requestedEnd, this.options.maxReadBytes ?? MAX_READ_BYTES);
     const hasMore = end < lines.length;
+    if (args.start_line === undefined && args.end_line === undefined && !headOnly && !hasMore) {
+      this.fullReadHashes.add(absolute);
+    } else {
+      this.fullReadHashes.delete(absolute);
+    }
     const body = formatNumberedLines(lines.slice(start - 1, end), start, hasMore);
-    return headOnly
+    const guarded = headOnly
       ? `${body}\n\n[READ-GUARD] Context is under pressure; showing the first 80 lines. Use search_text or read_file with start_line/end_line for the relevant range.`
       : body;
+    return `${guarded}\n\n[Full-file SHA-1: ${digest}]`;
   }
 
   private async readFileStreaming(absolute: string, args: Record<string, any>, headOnly = false): Promise<string> {
+    const digest = await fileSha1(absolute);
+    this.readHashes.set(absolute, digest);
+    this.fullReadHashes.delete(absolute);
     const start = clampInt(args.start_line, 1, Number.MAX_SAFE_INTEGER) ?? 1;
     const requestedEnd = headOnly
       ? start + 79
@@ -839,9 +1037,10 @@ export class ToolBox {
       stream.destroy();
     }
     const body = formatNumberedLines(lines, start, stopped);
-    return headOnly
+    const guarded = headOnly
       ? `${body}\n\n[READ-GUARD] Context is under pressure; showing the first 80 lines. Use search_text or read_file with start_line/end_line for the relevant range.`
       : body;
+    return `${guarded}\n\n[Full-file SHA-1: ${digest}]`;
   }
 
   private async notFoundMessage(display: string, absolute: string): Promise<string> {
@@ -1065,8 +1264,8 @@ export class ToolBox {
     try {
       exists = (await fs.stat(absolute)).isFile();
     } catch {}
-    if (exists && knownHash === undefined) {
-      return 'Error: read the existing file before overwriting it, or use edit_file/apply_patch for a targeted change.';
+    if (exists && (knownHash === undefined || !this.fullReadHashes.has(absolute))) {
+      return 'Error: read the complete, untruncated file before replacing it with write_file, or use edit_file/apply_patch for a targeted change.';
     }
     if (knownHash !== undefined) {
       try {
@@ -1080,6 +1279,7 @@ export class ToolBox {
     }
     const result = await withFileLock(absolute, () => this.applyChange(absolute, content));
     this.readHashes.set(absolute, sha1Of(content));
+    this.fullReadHashes.add(absolute);
     return result + (await this.diagnosticsFor([absolute]));
   }
 
@@ -1443,31 +1643,52 @@ export class ToolBox {
 
   private async semanticSearch(args: Record<string, any>, context: ToolExecutionContext): Promise<string> {
     if (!this.options.semanticIndex) {
-      return 'Error: semantic search is not available. Enable devFirst.semanticIndex and use an embeddings-capable provider.';
+      return 'Error: semantic search is not available. Enable devFirst.semanticIndex; the local embedding worker is unavailable.';
     }
     const query = typeof args.query === 'string' ? args.query.trim() : '';
     if (!query) {
       return 'Error: query is required.';
     }
     const limit = clampInt(args.max_results, 1, 20) ?? 8;
+    const lexicalFallback = async (note: string): Promise<string> => {
+      const lexical = await this.localHybridSearch({ query, max_results: limit });
+      return [note, lexical].filter(Boolean).join('\n\n');
+    };
     if (!(await this.options.semanticIndex.ready())) {
       this.options.semanticIndex.startBackgroundIndex();
-      return 'Semantic search is warming its local index. Use local_hybrid_search, find_and_read, or search_text now; semantic results will be available on a later turn.';
+      return lexicalFallback(
+        'Semantic search is warming its local index. Lexical results follow; semantic results will be available on a later turn.',
+      );
     }
-    const results = await this.options.semanticIndex.search(query, limit);
+    let results: Awaited<ReturnType<typeof this.options.semanticIndex.search>>;
+    try {
+      results = await this.options.semanticIndex.search(query, limit);
+    } catch (error) {
+      return lexicalFallback(
+        `Semantic search failed (${errorMessage(error)}). Lexical results follow.`,
+      );
+    }
     if (results.length === 0) {
-      return 'No relevant code found.';
+      return lexicalFallback('No semantic matches found. Lexical results follow.');
     }
     const stats = this.options.semanticIndex.stats();
     const coverage = stats.truncated
       ? `\n\n[Semantic index coverage: ${stats.files} of ${stats.scannedFiles} scanned files; limit ${stats.maxFiles}. Use local_hybrid_search/search_text for the remainder.]`
       : '';
-    return results
-      .map((result) => {
+    const semanticPaths = new Set(results.map((result) => result.path));
+    const lexical = await this.options.codebaseIndex?.hybridSearch(query, limit) ?? [];
+    const lexicalOnly = lexical.filter((result) => !semanticPaths.has(result.path)).slice(0, Math.max(2, Math.ceil(limit / 2)));
+    const lexicalBlock = lexicalOnly.length > 0
+      ? `Lexical matches:\n${lexicalOnly.map((result) => `- ${result.path} (score=${result.score})`).join('\n')}`
+      : '';
+    return [
+      ...results.map((result) => {
         const snippet = result.text.length > 900 ? `${result.text.slice(0, 900)}\n...` : result.text;
         return `${result.path}:${result.start}-${result.end} (score ${result.score.toFixed(3)})\n${snippet}`;
-      })
-      .join('\n\n---\n\n') + coverage;
+      }),
+      lexicalBlock,
+      coverage,
+    ].filter(Boolean).join('\n\n---\n\n');
   }
 
   private async browserApproved(

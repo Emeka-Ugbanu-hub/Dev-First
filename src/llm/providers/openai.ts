@@ -1,4 +1,4 @@
-import { ChatMessage, ChatOptions, LLMProvider, StreamEvent, ToolCall } from '../types';
+import { ChatMessage, ChatOptions, LLMProvider, StreamEvent, StreamStopReason, ToolCall } from '../types';
 
 const REASONING_MODEL = /^(o\d|gpt-5)/i;
 const DEEPSEEK_MODEL = /deepseek/i;
@@ -11,6 +11,7 @@ import { hasInterleavedReasoning } from '../catalog';
 import { HttpError, isReasoningRejection, isStreamOptionsRejection } from '../errors';
 import { FetchTimeouts, fetchWithTimeouts, resolveTimeouts } from '../timeout';
 import { consolidateSystemMessages } from '../messageNormalizer';
+import { safeLocalContextCap } from '../localContext';
 
 export interface OpenAIProviderConfig {
   apiKey: string;
@@ -18,6 +19,7 @@ export interface OpenAIProviderConfig {
   deepSeek?: boolean;
   ollama?: boolean;
   ollamaReasoningViaV1?: boolean;
+  localContextCapTokens?: number;
   providerId?: string;
   timeouts?: Partial<FetchTimeouts>;
 }
@@ -75,6 +77,7 @@ export class OpenAIProvider implements LLMProvider {
       }
 
       const toolCalls = new Map<number, ToolCall>();
+      let finishReason: string | undefined;
 
       for await (const line of sseLines(response)) {
         if (!line.startsWith('data:')) {
@@ -91,7 +94,11 @@ export class OpenAIProvider implements LLMProvider {
             yield usageEvent;
           }
         }
-        const delta = json?.choices?.[0]?.delta;
+        const choice = json?.choices?.[0];
+        if (typeof choice?.finish_reason === 'string' && choice.finish_reason) {
+          finishReason = choice.finish_reason;
+        }
+        const delta = choice?.delta;
         if (!delta) {
           continue;
         }
@@ -133,7 +140,7 @@ export class OpenAIProvider implements LLMProvider {
           };
         }
       }
-      yield { type: 'done' };
+      yield { type: 'done', reason: openAIStopReason(finishReason, toolCalls.size > 0) };
       return;
     }
   }
@@ -241,10 +248,14 @@ export class OpenAIProvider implements LLMProvider {
     const modelOptions: Record<string, unknown> = {};
     if (options.temperature !== undefined) modelOptions.temperature = options.temperature;
     if (options.maxTokens !== undefined) modelOptions.num_predict = options.maxTokens;
-    // Match num_ctx to the window the app budgeted for. Without this Ollama
-    // silently truncates at the model default (often 4096), which makes the
-    // model go quiet after a few tool round-trips.
-    if (options.contextTokens !== undefined) modelOptions.num_ctx = options.contextTokens;
+    // Let Ollama use the model/Modelfile context by default. Only send num_ctx
+    // when the developer explicitly sets a local cap.
+    const localCap = safeLocalContextCap(this.config.localContextCapTokens);
+    if (localCap > 0) {
+      modelOptions.num_ctx = options.contextTokens && options.contextTokens > 0
+        ? Math.min(options.contextTokens, localCap)
+        : localCap;
+    }
     if (Object.keys(modelOptions).length) body.options = modelOptions;
 
     const response = await fetchWithTimeouts(
@@ -260,8 +271,12 @@ export class OpenAIProvider implements LLMProvider {
       throw new HttpError(response.status, `Ollama request failed (${await formatHttpError(response)})`);
     }
     const toolCalls = new Map<number, ToolCall>();
+    let doneReason: string | undefined;
     for await (const line of sseLines(response)) {
       const chunk = parseJsonLoose(line) as any;
+      if (typeof chunk?.done_reason === 'string' && chunk.done_reason) {
+        doneReason = chunk.done_reason;
+      }
       const message = chunk?.message;
       if (typeof message?.thinking === 'string' && message.thinking) {
         yield { type: 'reasoning', text: message.thinking };
@@ -283,7 +298,7 @@ export class OpenAIProvider implements LLMProvider {
       }
     }
     for (const toolCall of toolCalls.values()) yield { type: 'toolCall', toolCall };
-    yield { type: 'done' };
+    yield { type: 'done', reason: ollamaStopReason(doneReason, toolCalls.size > 0) };
   }
 
   async embed(texts: string[], model: string): Promise<number[][]> {
@@ -308,6 +323,39 @@ export class OpenAIProvider implements LLMProvider {
     }
     return json.data.map((entry: any) => entry.embedding as number[]);
   }
+}
+
+function openAIStopReason(reason: string | undefined, hasToolCalls: boolean): StreamStopReason {
+  if (hasToolCalls || reason === 'tool_calls' || reason === 'function_call') {
+    return 'tool-calls';
+  }
+  switch (reason) {
+    case 'length':
+    case 'max_tokens':
+      return 'length';
+    case 'content_filter':
+      return 'content-filter';
+    case 'stop':
+    case 'end_turn':
+      return 'stop';
+    case undefined:
+      return 'unknown';
+    default:
+      return 'unknown';
+  }
+}
+
+function ollamaStopReason(reason: string | undefined, hasToolCalls: boolean): StreamStopReason {
+  if (reason === 'length' || reason === 'max_tokens') {
+    return 'length';
+  }
+  if (hasToolCalls) {
+    return 'tool-calls';
+  }
+  if (reason === 'stop' || reason === undefined) {
+    return 'stop';
+  }
+  return 'unknown';
 }
 
 function isReasoningModel(model: string): boolean {

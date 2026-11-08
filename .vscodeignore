@@ -16,9 +16,7 @@ esbuild.mjs
 package-lock.json
 .gitignore
 
-# MCP/embedding runtime: only onnxruntime-node for the current platform is needed.
-# The transformers.js code is bundled into dist/extension.js.
-node_modules/@huggingface/**
+# Embedding runtime: the worker loads transformers.js/onnxruntime-node.
 node_modules/onnxruntime-web/**
 node_modules/onnxruntime-node/bin/napi-v3/linux/**
 node_modules/onnxruntime-node/bin/napi-v3/win32/**

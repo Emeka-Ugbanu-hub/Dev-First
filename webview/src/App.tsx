@@ -118,7 +118,7 @@ export default function App() {
   const sessionQueuedIds = useRef(new Set<string>());
   const pendingStreamDeltas = useRef(new Map<string, { text: string; reasoning: string }>());
   const streamFrame = useRef<number | null>(null);
-  const [enhanced, setEnhanced] = useState<{ text: string; nonce: number } | null>(null);
+  const [enhanced, setEnhanced] = useState<{ text: string; nonce: number; error?: string } | null>(null);
   const [prefill, setPrefill] = useState<{ text: string; nonce: number } | null>(null);
   const [dismissedRecovery, setDismissedRecovery] = useState<string | null>(null);
   const [runReview, setRunReview] = useState<{ runId: string; files: RunReviewFile[] } | null>(null);
@@ -289,7 +289,7 @@ export default function App() {
         return;
       }
       if (message.type === 'enhancedPrompt') {
-        setEnhanced({ text: message.text, nonce: Date.now() });
+        setEnhanced({ text: message.text, nonce: Date.now(), ...(message.error ? { error: message.error } : {}) });
         return;
       }
       if (message.type === 'openSettings') {
@@ -332,7 +332,7 @@ export default function App() {
     const previous = previousPhase.current;
     previousPhase.current = state.phase;
     const finished =
-      (previous === 'executing' || previous === 'planning') && (state.phase === 'idle' || state.phase === 'review');
+      (previous === 'executing' || previous === 'planning' || previous === 'answering') && (state.phase === 'idle' || state.phase === 'review');
     if (finished && state.soundOnFinish) {
       try {
         const context = new AudioContext();
@@ -361,6 +361,10 @@ export default function App() {
     }
     if (state.phase === 'executing') {
       setAnnouncement('Working');
+      return;
+    }
+    if (state.phase === 'answering') {
+      setAnnouncement('Answering');
       return;
     }
     if (state.plan?.status === 'draft') {
@@ -412,7 +416,7 @@ export default function App() {
         }
         return;
       }
-      if (event.key === 'Escape' && (state.phase === 'planning' || state.phase === 'executing')) {
+      if (event.key === 'Escape' && (state.phase === 'planning' || state.phase === 'answering' || state.phase === 'executing')) {
         post({ type: 'stop' });
       }
     };

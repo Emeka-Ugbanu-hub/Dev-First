@@ -59,7 +59,7 @@ Use a hosted provider or a local model through Ollama or LM Studio. Connect one 
 - **Scanner model:** code and risk scanning.
 - **Autocomplete model:** inline completions, with chat fallback when supported.
 
-Each role can have its own provider, model, and supported reasoning level, or inherit the main connection. Live model metadata is used when available, with cached information when a provider is temporarily unavailable. On compact/local models the executor starts with a core tool set; optional tools such as semantic search, web access, browser automation, MCP, and subagents are loaded with `load_tools` only when a step needs them.
+Each role can have its own provider, model, and supported reasoning level, or inherit the main connection. Live model metadata is used when available, with cached information when a provider is temporarily unavailable. On compact/local models the executor starts with a core tool set; optional tools such as web access, browser automation, MCP, and subagents are loaded with `load_tools` only when a step needs them. Semantic search runs through an isolated embed worker and combines vector, lexical, and symbol retrieval.
 
 Supported presets include OpenAI, Anthropic, Gemini, OpenRouter, Groq, DeepSeek, Ollama, LM Studio, and custom OpenAI-compatible endpoints. Local models can be used without an API key.
 
@@ -91,7 +91,7 @@ Useful commands include **Open Chat**, **New Session**, **Explain Selection**, *
 
 ## Settings
 
-Open the **gear icon** for the in-panel settings view: **Provider** (connection + task models), **Behavior** (safety, behavior, accuracy, verification, context, input), **Display** (chat, notifications), and **About**. Changes apply instantly with a brief "Saved" confirmation. The same keys are available in VS Code settings (linked from About), along with a few advanced keys that predate the panel and are intentionally not shown there (execution step limits, terminal timeout, low-level provider adapter, embeddings model, browser port, legacy reasoning effort).
+Open the **gear icon** for the in-panel settings view: **Provider** (connection + task models), **Behavior** (safety, behavior, accuracy, verification, context, input), **Display** (chat, notifications), and **About**. Changes apply instantly with a brief "Saved" confirmation. The same keys are available in VS Code settings (linked from About), along with a few advanced keys that predate the panel and are intentionally not shown there (execution step limits, terminal timeout, low-level provider adapter, browser port, legacy reasoning effort).
 
 ### Provider
 
@@ -123,10 +123,9 @@ Open the **gear icon** for the in-panel settings view: **Provider** (connection 
 | `devFirst.checkDiagnostics` | `true` | Feed language-server diagnostics for touched files back after edits |
 | `devFirst.parallelTools` | `true` | Run independent read-only tool calls in parallel |
 | `devFirst.memory` | `true` | Save and recall durable project facts across sessions |
-| `devFirst.semanticIndex` | `true` | Enable `semantic_search` with the bundled local embedding model; compact/local executors load it on demand |
+| `devFirst.semanticIndex` | `true` | Enable local `semantic_search`; the embedder runs in an isolated worker, never in the extension host |
 | `devFirst.semanticIndexMaxFiles` | `2000` | Maximum first-party files in the semantic index |
 | `devFirst.codebaseIndexMaxFiles` | `20000` | Maximum files in the model-free codebase locator |
-| `devFirst.embeddingsProvider` | `local` | `local` = bundled MiniLM (offline) · `api` = provider embeddings |
 
 ### Verification
 
@@ -144,7 +143,7 @@ Open the **gear icon** for the in-panel settings view: **Provider** (connection 
 | --- | --- | --- |
 | `devFirst.autoCompact` | `true` | Summarize the conversation when it approaches the context limit |
 | `devFirst.contextLimitTokens` | `128000` | Fallback context window used only when the model is not in the model catalog |
-| `devFirst.localContextCapTokens` | `32768` | Optional maximum context for local models; `0` disables the cap and the effective limit never exceeds the model or Modelfile context |
+| `devFirst.localContextCapTokens` | `0` | Optional maximum context for local models; `0` uses the model or Modelfile context without an extension-added cap |
 | `devFirst.contextProfile` | `auto` | `auto` derives the tier from the model window, or force `compact`, `standard`, `large` |
 | `devFirst.plannerThinking` | `auto` | Planner thinking policy: `auto` skips planner thinking on local models and uses bounded evidence-based effort routing elsewhere; `off` disables it everywhere; `on` honors the selected effort. Explicit run overrides win |
 | `devFirst.pasteFileLines` | `120` | Pasted text longer than this many lines is saved under `.dev-first/pastes` instead of filling the prompt |

@@ -5,7 +5,6 @@ import type { ContextProfileTier } from './agent/modelProfile';
 export type ProviderId = 'openai' | 'anthropic' | 'gemini';
 
 export type SandboxMode = 'off' | 'workspace-write';
-export type EmbeddingsProvider = 'local' | 'api';
 export type ReasoningEffortSetting = 'off' | 'low' | 'medium' | 'high' | (string & {});
 export type NotifySound = 'off' | 'chime' | 'beep';
 export type ContextProfileSetting = 'auto' | ContextProfileTier;
@@ -34,8 +33,6 @@ export interface DevFirstConfig {
   semanticIndex: boolean;
   semanticIndexMaxFiles: number;
   codebaseIndexMaxFiles: number;
-  embeddingsProvider: EmbeddingsProvider;
-  embeddingsModel: string;
   sandbox: SandboxMode;
   browserPort: number;
   browserAutoLaunch: boolean;
@@ -88,7 +85,7 @@ export function getConfig(): DevFirstConfig {
     provider: config.get<ProviderId>('provider', 'openai'),
     baseUrl: config.get<string>('baseUrl', ''),
     model: config.get<string>('model', 'gpt-4o'),
-    maxSteps: config.get<number>('maxSteps', 60),
+    maxSteps: config.get<number>('maxSteps', 0),
     terminalTimeout: config.get<number>('terminalTimeout', 120),
     headerTimeout: Math.max(0, config.get<number>('headerTimeout', 120)),
     streamIdleTimeout: Math.max(0, config.get<number>('streamIdleTimeout', 120)),
@@ -100,14 +97,12 @@ export function getConfig(): DevFirstConfig {
     adaptiveVerify: config.get<boolean>('adaptiveVerify', true),
     autoCompact: config.get<boolean>('autoCompact', true),
     contextLimitTokens: config.get<number>('contextLimitTokens', 128000),
-    localContextCapTokens: Math.max(0, config.get<number>('localContextCapTokens', 32768)),
+    localContextCapTokens: Math.max(0, config.get<number>('localContextCapTokens', 0)),
     contextProfile: config.get<ContextProfileSetting>('contextProfile', 'auto'),
     plannerThinking: normalizePlannerThinking(config.get<string>('plannerThinking', 'auto')),
     semanticIndex: config.get<boolean>('semanticIndex', true),
     semanticIndexMaxFiles: Math.max(100, config.get<number>('semanticIndexMaxFiles', 2000)),
     codebaseIndexMaxFiles: Math.max(100, config.get<number>('codebaseIndexMaxFiles', 20000)),
-    embeddingsProvider: config.get<EmbeddingsProvider>('embeddingsProvider', 'local'),
-    embeddingsModel: config.get<string>('embeddingsModel', 'text-embedding-3-small'),
     sandbox: config.get<SandboxMode>('sandbox', 'workspace-write'),
     browserPort: config.get<number>('browserPort', 9222),
     browserAutoLaunch: config.get<boolean>('browserAutoLaunch', true),

@@ -26,6 +26,7 @@ export function createProvider(config: DevFirstConfig, apiKey: string | undefine
         deepSeek: config.preset === 'deepseek',
         ollama: config.preset === 'ollama',
         ollamaReasoningViaV1: runtime.ollamaReasoningViaV1,
+        localContextCapTokens: config.localContextCapTokens,
         providerId: config.preset,
         timeouts,
       });

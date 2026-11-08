@@ -95,7 +95,8 @@ describe('contextProfileFor', () => {
   it('derives the tier from the context window', () => {
     expect(tierForWindow(8_000)).toBe('compact');
     expect(tierForWindow(32_000)).toBe('compact');
-    expect(tierForWindow(32_001)).toBe('standard');
+    expect(tierForWindow(32_768)).toBe('compact');
+    expect(tierForWindow(32_769)).toBe('standard');
     expect(tierForWindow(200_000)).toBe('standard');
     expect(tierForWindow(200_001)).toBe('large');
     expect(contextProfileFor(input(16_000)).tier).toBe('compact');

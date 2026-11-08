@@ -66,7 +66,7 @@ export function InputBox({
   queuedMessages: UiMessage[];
   queuedRecords?: QueuedPromptRecord[];
   recoveredQueueIds?: string[];
-  enhanced: { text: string; nonce: number } | null;
+  enhanced: { text: string; nonce: number; error?: string } | null;
   prefill: { text: string; nonce: number } | null;
   pasteFileLines: number;
   onImagesChange: (images: string[]) => void;
@@ -90,6 +90,7 @@ export function InputBox({
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [pastes, setPastes] = useState<PasteChip[]>([]);
   const [enhancing, setEnhancing] = useState(false);
+  const [enhanceError, setEnhanceError] = useState<string | null>(null);
   const [reasoningHint, setReasoningHint] = useState<string | null>(null);
   const [menuHidden, setMenuHidden] = useState(false);
   const undoRef = useRef<string | null>(null);
@@ -113,7 +114,7 @@ export function InputBox({
       textareaRef.current?.focus();
     }
   }, [prefill]);
-  const busy = phase === 'planning' || phase === 'executing';
+  const busy = phase === 'planning' || phase === 'answering' || phase === 'executing';
   const hasSendableContent = Boolean(text.trim() || images.length > 0);
   // Keep the composer editable while a run is active so follow-up prompts can queue.
   const disabled = !connected;
@@ -136,14 +137,31 @@ export function InputBox({
   }, [text]);
 
   useEffect(() => {
-    if (enhanced) {
-      undoRef.current = text;
-      setText(enhanced.text);
-      setEnhancing(false);
-      textareaRef.current?.focus();
+    if (!enhanced) {
+      return;
     }
+    setEnhancing(false);
+    if (enhanced.error) {
+      setEnhanceError(enhanced.error);
+      return;
+    }
+    undoRef.current = text;
+    setEnhanceError(null);
+    setText(enhanced.text);
+    textareaRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enhanced?.nonce]);
+
+  useEffect(() => {
+    if (!enhancing) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setEnhancing(false);
+      setEnhanceError('Prompt enhancement timed out. Your original prompt is unchanged.');
+    }, 45_000);
+    return () => window.clearTimeout(timer);
+  }, [enhancing]);
 
   useEffect(() => {
     setMenuHidden(false);
@@ -211,7 +229,9 @@ export function InputBox({
     : busy
       ? phase === 'planning'
         ? 'Planning… type to queue a message'
-        : 'Executing… type to steer the task'
+        : phase === 'answering'
+          ? 'Answering… type to queue a message'
+          : 'Executing… type to steer the task'
       : hasPlan
         ? 'Ask why, alternatives — or refine the plan…  (⏎ send · ⇧⏎ newline)'
         : 'Ask a question or describe what to build…  (⏎ send · ⇧⏎ newline)';
@@ -384,6 +404,11 @@ export function InputBox({
         return null;
       })()}
       <div className="input-box">
+        {enhanceError && (
+          <div className="input-hint input-enhance-error" role="alert">
+            <span className="codicon codicon-warning" /> {enhanceError}
+          </div>
+        )}
         <textarea
           ref={textareaRef}
           className="input-textarea"
@@ -506,10 +531,11 @@ export function InputBox({
             <ThinkingSelector levels={reasoningLevels} current={reasoningEffort} preset={modelPreset} model={modelId} />
             <button
               className="composer-button composer-icon composer-enhance"
-              title="Enhance prompt with AI"
               aria-label="Enhance prompt with AI"
-              disabled={disabled || enhancing || !text.trim()}
+              disabled={disabled || enhancing || busy || !text.trim()}
+              title={busy ? 'Wait for the current run to finish' : 'Enhance prompt with AI'}
               onClick={() => {
+                setEnhanceError(null);
                 setEnhancing(true);
                 onEnhance(expandPastes(text, pastes));
               }}
@@ -525,8 +551,8 @@ export function InputBox({
                 className="btn-send"
                 onClick={submit}
                 disabled={!hasSendableContent || !connected}
-                title={busy ? (phase === 'planning' ? 'Queue message' : 'Steer current task') : 'Send'}
-                aria-label={busy ? (phase === 'planning' ? 'Queue message' : 'Steer current task') : 'Send'}
+                title={busy ? (phase === 'executing' ? 'Steer current task' : 'Queue message') : 'Send'}
+                aria-label={busy ? (phase === 'executing' ? 'Steer current task' : 'Queue message') : 'Send'}
               >
                 <span className="codicon codicon-arrow-up" />
               </button>

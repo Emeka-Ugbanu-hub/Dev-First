@@ -28,7 +28,7 @@ const REASONING_EXTRA_MAX = 0.05;
 const RESERVE_RATIO_MAX = 0.3;
 
 export function tierForWindow(contextWindow: number): ContextProfileTier {
-  if (contextWindow <= 32_000) {
+  if (contextWindow <= 32_768) {
     return 'compact';
   }
   if (contextWindow <= 200_000) {

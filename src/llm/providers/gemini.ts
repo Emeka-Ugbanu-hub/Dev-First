@@ -1,4 +1,4 @@
-import { ChatMessage, ChatOptions, LLMProvider, StreamEvent, reasoningBudget } from '../types';
+import { ChatMessage, ChatOptions, LLMProvider, StreamEvent, StreamStopReason, reasoningBudget } from '../types';
 import { adaptiveEffort } from '../adaptive';
 import { formatHttpError, sseLines } from '../sse';
 import { parseJsonLoose } from '../../util/json';
@@ -81,11 +81,16 @@ export class GeminiProvider implements LLMProvider {
     }
 
     let callIndex = 0;
+    let finishReason: string | undefined;
+    let sawToolCall = false;
     for await (const line of sseLines(response)) {
       if (!line.startsWith('data:')) {
         continue;
       }
       const json = parseJsonLoose(line.slice(5).trim()) as any;
+      if (typeof json?.candidates?.[0]?.finishReason === 'string' && json.candidates[0].finishReason) {
+        finishReason = json.candidates[0].finishReason;
+      }
       const usage = json?.usageMetadata;
       if (usage && typeof usage === 'object') {
         const event: Extract<StreamEvent, { type: 'usage' }> = { type: 'usage' };
@@ -114,6 +119,7 @@ export class GeminiProvider implements LLMProvider {
           }
         }
         if (part.functionCall?.name) {
+          sawToolCall = true;
           yield {
             type: 'toolCall',
             toolCall: {
@@ -125,7 +131,7 @@ export class GeminiProvider implements LLMProvider {
         }
       }
     }
-    yield { type: 'done' };
+    yield { type: 'done', reason: geminiStopReason(finishReason, sawToolCall) };
   }
 
   async listModels(): Promise<string[]> {
@@ -238,6 +244,26 @@ function toGeminiContents(messages: ChatMessage[]): unknown[] {
     }
   }
   return out;
+}
+
+function geminiStopReason(reason: string | undefined, sawToolCall: boolean): StreamStopReason {
+  if (sawToolCall) {
+    return 'tool-calls';
+  }
+  switch (reason) {
+    case 'MAX_TOKENS':
+      return 'length';
+    case 'SAFETY':
+    case 'RECITATION':
+    case 'BLOCKLIST':
+    case 'PROHIBITED_CONTENT':
+    case 'SPII':
+      return 'content-filter';
+    case 'STOP':
+      return 'stop';
+    default:
+      return 'unknown';
+  }
 }
 
 function parseDataUrl(dataUrl: string): { mediaType: string; data: string } | undefined {

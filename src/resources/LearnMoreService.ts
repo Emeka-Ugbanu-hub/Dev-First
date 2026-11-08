@@ -1,4 +1,5 @@
 import { LLMProvider } from '../llm/types';
+import { chatWithRetry } from '../llm/retry';
 import { LearnMoreLink, Plan } from '../shared/protocol';
 import { parseJsonLoose } from '../util/json';
 import { planToText } from '../planner/planParser';
@@ -107,15 +108,18 @@ export async function fetchLearnMore(
   plan: Plan,
   request: string,
   signal: AbortSignal,
+  contextTokens?: number,
 ): Promise<{ chosen: LearnMoreLink[]; alternatives: LearnMoreLink[] }> {
   const prompt = buildLearnMorePrompt(plan, request);
   let raw = '';
-  for await (const event of provider.chat(
+  for await (const event of chatWithRetry(
+    provider,
     [
       { role: 'system', content: prompt.system },
       { role: 'user', content: prompt.user },
     ],
-    { model, maxTokens: 1200, temperature: 0.2, signal },
+    { model, maxTokens: 1200, temperature: 0.2, signal, ...(contextTokens ? { contextTokens } : {}) },
+    { attempts: 1, retryOnEmpty: false },
   )) {
     if (event.type === 'text') {
       raw += event.text;

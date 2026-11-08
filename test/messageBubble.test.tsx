@@ -90,6 +90,15 @@ describe('MessageBubble activity group', () => {
   });
 });
 
+describe('MessageBubble copy action', () => {
+  it('keeps the copy button in a normal action row instead of an overlay', () => {
+    const element = mount({ id: 'm1', role: 'assistant', text: 'Ready to start.' });
+    const actions = element.querySelector('.message-actions');
+    expect(actions).not.toBeNull();
+    expect(actions?.querySelector('.msg-copy')).not.toBeNull();
+  });
+});
+
 describe('MessageBubble completion plan snapshot', () => {
   it('renders the finished plan collapsed by default and expands to checked steps', () => {
     const element = mount({

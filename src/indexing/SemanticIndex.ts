@@ -8,7 +8,7 @@ const DEFAULT_MAX_FILES = 2000;
 const CHUNK_LINES = 60;
 const CHUNK_OVERLAP = 10;
 const EXCLUDED_SEGMENTS = /(^|\/)(__tests?__|tests?|specs?|fixtures?|mocks?|snapshots?|dist|build|coverage|node_modules)(\/|$)/i;
-const EXCLUDED_EXTENSIONS = /\.(?:test|spec)\.[^.]+$|\.(?:md|mdx|lock|json|ya?ml|toml)$/i;
+const EXCLUDED_EXTENSIONS = /\.(?:test|spec)\.[^.]+$|\.(?:md|mdx|lock|json|ya?ml|toml|css|scss|less|html?)$/i;
 
 interface Chunk {
   start: number;
@@ -59,6 +59,7 @@ export class SemanticIndex {
   private readonly pendingFiles = new Set<string>();
   private readonly maxFiles: number;
   private coverage = { scannedFiles: 0, truncated: false, skippedFiles: 0 };
+  private lastSaveAt = 0;
 
   constructor(private readonly options: SemanticIndexOptions) {
     this.maxFiles = Math.max(1, options.maxFiles ?? DEFAULT_MAX_FILES);
@@ -191,7 +192,10 @@ export class SemanticIndex {
       const rel = files[index];
       this.options.onProgress?.(`Indexing ${rel} (${index + 1}/${files.length})…`);
       try {
-        if (await this.updateFile(rel)) updated++;
+        if (await this.updateFile(rel)) {
+          updated++;
+          await this.maybeSave(updated);
+        }
       } catch (error) {
         this.options.onProgress?.(
           `Semantic indexing paused: ${error instanceof Error ? error.message : String(error)}`,
@@ -215,14 +219,26 @@ export class SemanticIndex {
     this.pendingFiles.clear();
     let updated = 0;
     let paused = false;
-    for (const rel of pending) {
+    for (let index = 0; index < pending.length; index++) {
+      const rel = pending[index];
       if (this.options.signal?.aborted) {
+        // Keep the unprocessed files queued so a later run can finish the
+        // incremental update instead of silently dropping them.
+        for (const remaining of pending.slice(index)) {
+          this.pendingFiles.add(remaining);
+        }
         paused = true;
         break;
       }
       try {
-        if (await this.updateFile(rel)) updated++;
+        if (await this.updateFile(rel)) {
+          updated++;
+          await this.maybeSave(updated);
+        }
       } catch (error) {
+        for (const remaining of pending.slice(index + 1)) {
+          this.pendingFiles.add(remaining);
+        }
         this.options.onProgress?.(
           `Semantic indexing paused: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -308,9 +324,24 @@ export class SemanticIndex {
     }
   }
 
+  /** Persist every ten changed files, and at least every 15 seconds during a
+   * long local embedding run so a worker restart does not lose all progress. */
+  private async maybeSave(updated: number): Promise<void> {
+    if (updated <= 0) {
+      return;
+    }
+    const now = Date.now();
+    if (updated % 10 !== 0 && now - this.lastSaveAt < 15_000) {
+      return;
+    }
+    await this.save();
+    this.lastSaveAt = now;
+  }
+
   private async save(): Promise<void> {
     await fs.mkdir(path.dirname(this.options.storageFile), { recursive: true });
     await fs.writeFile(this.options.storageFile, JSON.stringify(this.data));
+    this.lastSaveAt = Date.now();
   }
 }
 

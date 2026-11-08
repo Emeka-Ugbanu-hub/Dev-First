@@ -5,7 +5,7 @@ import { shouldDockPlan } from '../webview/src/lib/planDock';
 const draft: Plan = { version: 1, status: 'draft', what: 'Add the endpoint', steps: ['Add the handler'] };
 const approved: Plan = { ...draft, status: 'approved' };
 const completed: Plan = { ...approved, status: 'completed' };
-const PHASES: Phase[] = ['idle', 'planning', 'executing', 'review'];
+const PHASES: Phase[] = ['idle', 'planning', 'answering', 'executing', 'review'];
 
 describe('shouldDockPlan matrix', () => {
   it('never docks without a plan', () => {

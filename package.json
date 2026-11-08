@@ -2,7 +2,7 @@
   "name": "dev-first",
   "displayName": "Dev-First",
   "description": "Plan-first AI coding agent — every request becomes a plan you approve before a single line changes.",
-  "version": "0.1.21",
+  "version": "0.1.24",
   "publisher": "dev-first",
   "license": "SEE LICENSE IN LICENSE",
   "icon": "media/icon.png",
@@ -362,8 +362,8 @@
         },
         "devFirst.maxSteps": {
           "type": "number",
-          "default": 60,
-          "description": "Maximum tool steps per execution run."
+          "default": 0,
+          "description": "Maximum tool steps per execution run. 0 means unlimited; the run continues until it finishes, is cancelled, or fails."
         },
         "devFirst.terminalTimeout": {
           "type": "number",
@@ -444,9 +444,9 @@
         },
         "devFirst.localContextCapTokens": {
           "type": "number",
-          "default": 32768,
+          "default": 0,
           "minimum": 0,
-          "description": "Optional maximum context for local models. 0 disables the cap; the effective limit never exceeds the model or Modelfile context."
+          "description": "Optional maximum context for local models. 0 uses the context reported by the model or Modelfile without an extension-added cap."
         },
         "devFirst.contextProfile": {
           "type": "string",
@@ -468,7 +468,7 @@
         "devFirst.semanticIndex": {
           "type": "boolean",
           "default": true,
-          "description": "Enable semantic_search. Uses a bundled local embedding model by default — no API key needed, nothing leaves your machine."
+          "description": "Enable semantic_search using the bundled local embedder in an isolated worker. The embedder never runs in the extension host."
         },
         "devFirst.semanticIndexMaxFiles": {
           "type": "number",
@@ -481,24 +481,6 @@
           "default": 20000,
           "minimum": 100,
           "description": "Maximum files included in the model-free codebase locator. Metadata indexing is cheap; raise this for very large repositories."
-        },
-        "devFirst.embeddingsProvider": {
-          "type": "string",
-          "enum": [
-            "local",
-            "api"
-          ],
-          "enumDescriptions": [
-            "Bundled all-MiniLM-L6-v2 model, runs on CPU, offline.",
-            "Use the configured LLM provider's embeddings API (OpenAI-compatible or Gemini)."
-          ],
-          "default": "local",
-          "description": "Where embeddings for the semantic index come from."
-        },
-        "devFirst.embeddingsModel": {
-          "type": "string",
-          "default": "text-embedding-3-small",
-          "description": "Embeddings model used when embeddingsProvider is 'api'."
         },
         "devFirst.sandbox": {
           "type": "string",
@@ -679,7 +661,7 @@
           "default": "",
           "markdownDescription": "Optional model ID for approved execution/editing. Empty uses the editor preset's selected model."
         },
-                                "devFirst.architecture": {
+        "devFirst.architecture": {
           "type": "boolean",
           "default": true,
           "description": "Show the Architecture button that maps the codebase into domains, subsystems, and components."
@@ -708,12 +690,11 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.webview.json",
     "test": "vitest run",
     "smoke": "node scripts/smoke.cjs",
-    "smoke:embed": "node scripts/smoke-embed.cjs",
     "package": "npm run build && vsce package",
     "check": "npm run typecheck && npm run test && npm run build && npm run smoke"
   },
   "dependencies": {
-    "@huggingface/transformers": "^3.5.1",
+    "@huggingface/transformers": "^3.8.1",
     "@vscode/tree-sitter-wasm": "^0.3.1",
     "remark-breaks": "^4.0.0"
   },

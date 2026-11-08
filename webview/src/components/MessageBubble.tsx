@@ -30,6 +30,7 @@ function MessageBubbleComponent({
   onContinueInterrupted?: () => void;
 }) {
   const [interruptedDismissed, setInterruptedDismissed] = useState(false);
+  const [copied, setCopied] = useState(false);
   if (message.role === 'notice' && message.kind === 'error') {
     return (
       <div className="error-row">
@@ -178,16 +179,21 @@ function MessageBubbleComponent({
           <ActivityGroup activities={message.activities} mcpDisplay={mcpDisplay} />
         )}
         {message.text && !message.streaming && (
-          <button
-            className="msg-copy"
-            title="Copy message"
-            aria-label="Copy message"
-            onClick={() => {
-              void navigator.clipboard.writeText(message.text);
-            }}
-          >
-            <span className="codicon codicon-copy" />
-          </button>
+          <div className="message-actions">
+            <button
+              className="msg-copy"
+              title={copied ? 'Copied' : 'Copy message'}
+              aria-label={copied ? 'Copied' : 'Copy message'}
+              onClick={() => {
+                void navigator.clipboard.writeText(message.text).then(() => {
+                  setCopied(true);
+                  window.setTimeout(() => setCopied(false), 1500);
+                }).catch(() => undefined);
+              }}
+            >
+              <span className={`codicon codicon-${copied ? 'check' : 'copy'}`} />
+            </button>
+          </div>
         )}
       </div>
     </div>
@@ -494,6 +500,9 @@ function ActivityRow({
         {activity.detailKind === 'terminal' && activity.exitCode !== undefined && (
           <span className={`exit-badge ${activity.exitCode === 0 ? 'ok' : 'fail'}`}>exit {activity.exitCode}</span>
         )}
+        {activity.durationMs !== undefined && (
+          <span className="activity-duration">{formatActivityDuration(activity.durationMs)}</span>
+        )}
         <span className="activity-status">
           {activity.status === 'running' ? (
             <span className="spinner" />
@@ -517,6 +526,11 @@ function ActivityRow({
       </Collapsible>
     </div>
   );
+}
+
+function formatActivityDuration(durationMs: number): string {
+  if (durationMs < 1000) return `${durationMs}ms`;
+  return `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 1 : 0)}s`;
 }
 
 export function isLiveMessage(message: UiMessage): boolean {

@@ -14,6 +14,7 @@ function formatElapsed(ms: number): string {
 const PHASE_LABEL: Record<Phase, string> = {
   idle: 'ready',
   planning: 'planning',
+  answering: 'answering',
   executing: 'executing',
   review: 'review',
 };
@@ -39,7 +40,7 @@ export function Header({
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
-    const running = phase === 'planning' || phase === 'executing';
+    const running = phase === 'planning' || phase === 'answering' || phase === 'executing';
     setStartedAt((current) => (running ? current ?? Date.now() : null));
   }, [phase]);
 

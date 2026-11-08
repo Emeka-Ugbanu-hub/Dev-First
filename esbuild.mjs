@@ -16,6 +16,19 @@ const extensionCtx = await esbuild.context({
   logLevel: 'info',
 });
 
+const workerCtx = await esbuild.context({
+  entryPoints: ['src/indexing/embedWorker.ts'],
+  bundle: true,
+  format: 'cjs',
+  platform: 'node',
+  target: 'node20',
+  outfile: 'dist/embedWorker.js',
+  external: ['@huggingface/transformers', 'onnxruntime-node', 'onnxruntime-web', 'sharp'],
+  sourcemap: !production,
+  minify: production,
+  logLevel: 'info',
+});
+
 const panelCtx = await esbuild.context({
   entryPoints: ['webview/src/architecturePanel.ts'],
   bundle: true,
@@ -29,9 +42,9 @@ const panelCtx = await esbuild.context({
 });
 
 if (watch) {
-  await Promise.all([extensionCtx.watch(), panelCtx.watch()]);
+  await Promise.all([extensionCtx.watch(), workerCtx.watch(), panelCtx.watch()]);
   console.log('[esbuild] watching...');
 } else {
-  await Promise.all([extensionCtx.rebuild(), panelCtx.rebuild()]);
-  await Promise.all([extensionCtx.dispose(), panelCtx.dispose()]);
+  await Promise.all([extensionCtx.rebuild(), workerCtx.rebuild(), panelCtx.rebuild()]);
+  await Promise.all([extensionCtx.dispose(), workerCtx.dispose(), panelCtx.dispose()]);
 }

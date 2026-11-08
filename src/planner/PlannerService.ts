@@ -7,6 +7,7 @@ import {
   activityMeta,
   describeToolCall,
   plannerToolSet,
+  loadToolsTool,
   submitPlanTool,
   toolCallArgs,
   toolIcon,
@@ -18,7 +19,10 @@ import { PromptFamily, buildPlannerContext, buildPlannerSystemPrompt } from './p
 import { normalizeToolArguments } from '../util/toolArgs';
 import { errorMessage } from '../util/errors';
 import { chatWithRetry } from '../llm/retry';
+import { estimateRequestTokens } from '../llm/contextFit';
 import { mergeUsage } from '../llm/usage';
+import { projectToolResultForModel } from '../agent/toolResultProjection';
+import { createChildAbortController, StreamLoopGuard, streamLoopRecoveryPrompt } from '../llm/streamLoopGuard';
 import {
   PlanReadiness,
   checkPlanReadiness,
@@ -26,7 +30,7 @@ import {
   readinessFieldLabel,
 } from './planReadiness';
 
-const SPECIAL_TOOLS = new Set(['submit_plan', 'dismiss_plan', 'set_reasoning', 'compress_context', 'ask_user']);
+const SPECIAL_TOOLS = new Set(['submit_plan', 'dismiss_plan', 'set_reasoning', 'compress_context', 'ask_user', 'load_tools']);
 const KEEP_FULL_TOOL_RESULTS = 8;
 const STALE_TOOL_RESULT_CHARS = 400;
 const READINESS_LOOP_RECOVERY =
@@ -34,7 +38,9 @@ const READINESS_LOOP_RECOVERY =
 
 export interface PlannerCallbacks {
   onTextDelta(text: string): void;
+  onTextRewind?(characters: number): void;
   onReasoningDelta?(text: string): void;
+  onReasoningRewind?(characters: number): void;
   onStage?(text: string): void;
   onToolActivity(
     id: string,
@@ -57,13 +63,15 @@ export interface PlannerResult {
   dismissed?: boolean;
   text: string;
   exhausted: boolean;
-  stopped?: 'same-plan';
+  stopped?: 'same-plan' | 'stream-loop';
   stats?: PlannerStats;
 }
 
 export interface PlannerOptions {
   maxSteps: number;
   tools: ToolDef[];
+  /** Optional planner schemas kept out of the initial prompt and loaded on demand. */
+  lazyTools?: ToolDef[];
   rules?: string;
   family?: PromptFamily;
   reasoning?: ReasoningOptions;
@@ -115,12 +123,22 @@ export class PlannerService {
     signal: AbortSignal,
   ): Promise<PlannerResult> {
     const context = buildPlannerContext(currentPlan);
-    const turnTools = plannerToolSet(this.options.tools, { reasoningSwitch: this.options.reasoningSwitch })
+    let turnTools = plannerToolSet(this.options.tools, { reasoningSwitch: this.options.reasoningSwitch })
       .filter((tool) => !this.options.questionMode || (tool.name !== 'submit_plan' && tool.name !== 'dismiss_plan'));
+    const lazyToolsByName = new Map((this.options.lazyTools ?? []).map((tool) => [tool.name, tool]));
+    const lazyToolNames = [...lazyToolsByName.keys()];
+    if (lazyToolNames.length > 0 && !turnTools.some((tool) => tool.name === 'load_tools')) {
+      turnTools = [...turnTools, loadToolsTool(lazyToolNames)];
+    }
+    const initialTurnTools = [...turnTools];
+    const loadedToolNames = new Set<string>();
     const questionGuard = this.options.questionMode
       ? 'QUESTION MODE: answer the latest question in chat. You may use read-only tools to gather evidence, but never call submit_plan or dismiss_plan, never propose an execution plan, and never change files.'
       : undefined;
     const systemPrompt = [buildPlannerSystemPrompt(this.options.rules, this.options.family, this.options.planningMode), context, questionGuard]
+      .concat(lazyToolNames.length > 0
+        ? ['Optional tools are hidden to save prompt space. If evidence requires tools you do not see, call load_tools once with all currently needed tool names; they will be available on the next turn.']
+        : [])
       .filter(Boolean)
       .join('\n\n');
     let messages: ChatMessage[] = [
@@ -138,6 +156,7 @@ export class PlannerService {
     let previousToolFailed = false;
     let previousSignature = '';
     let repeatedSignatureCount = 0;
+    let streamLoopRecoveryUsed = false;
 
     for (let step = 0; this.options.maxSteps <= 0 || step < this.options.maxSteps; step++) {
       if (signal.aborted) {
@@ -152,8 +171,8 @@ export class PlannerService {
         ? 'PLANNING — waiting for first response…'
         : 'PLANNING — processing tool results…');
       this.stats.turns += 1;
-      this.stats.promptTokens += estimateTokens(messages);
-      const { text, toolCalls, reasoning, ttftMs } = await this.runTurn(messages, callbacks, signal, turnTools, true, {
+      this.stats.promptTokens += estimateRequestTokens(messages, { tools: turnTools });
+      const { text, toolCalls, reasoning, ttftMs, loopDetected } = await this.runTurn(messages, callbacks, signal, turnTools, true, {
         phase: 'planning',
         turn: step,
         previousToolNames,
@@ -161,6 +180,17 @@ export class PlannerService {
       });
       this.stats.ttftTotal += ttftMs;
       lastText = text;
+
+      if (loopDetected) {
+        if (streamLoopRecoveryUsed) {
+          return { text: lastText, exhausted: false, stopped: 'stream-loop' };
+        }
+        streamLoopRecoveryUsed = true;
+        if (text.trim()) messages.push({ role: 'assistant', content: text.trim() });
+        messages.push({ role: 'user', content: streamLoopRecoveryPrompt() });
+        callbacks.onNotice?.('Detected repeated model output and stopped that stream. Trying one recovery turn.');
+        continue;
+      }
 
       if (toolCalls.length === 0) {
         const parsed = parsePlanFromText(text, version);
@@ -335,6 +365,36 @@ export class PlannerService {
           });
           break;
         }
+        if (call.name === 'load_tools') {
+          callbacks.onToolActivity(call.id, describeToolCall(call), 'running', toolIcon(call.name));
+          const requested = Array.isArray(toolCallArgs(call).names)
+            ? (toolCallArgs(call).names as unknown[]).filter((name): name is string => typeof name === 'string')
+            : [];
+          const requestedNames = new Set(requested);
+          const loaded: string[] = [];
+          // Keep the schema order tied to the registry, not the order a model
+          // happened to list names in. Identical loaded tool sets then produce
+          // identical provider prefixes/cache keys across runs.
+          for (const [name, definition] of lazyToolsByName) {
+            if (!requestedNames.has(name)) continue;
+            if (!definition || turnTools.some((tool) => tool.name === name)) continue;
+            loadedToolNames.add(name);
+            loaded.push(name);
+          }
+          if (loaded.length > 0) {
+            turnTools = [
+              ...initialTurnTools,
+              ...[...lazyToolsByName].filter(([name]) => loadedToolNames.has(name)).map(([, definition]) => definition),
+            ];
+          }
+          const result = loaded.length > 0
+            ? `Loaded optional tools for the next turn: ${loaded.join(', ')}.`
+            : `No optional tools loaded. Available names: ${[...lazyToolsByName.keys()].join(', ') || 'none'}.`;
+          callbacks.onToolActivity(call.id, describeToolCall(call), 'done', toolIcon(call.name), activityMeta(call, result));
+          messages.push({ role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
+          turnProgress = loaded.length > 0;
+          continue;
+        }
         if (call.name === 'set_reasoning') {
           callbacks.onToolActivity(call.id, describeToolCall(call), 'running', toolIcon(call.name));
           const args = toolCallArgs(call);
@@ -349,7 +409,12 @@ export class PlannerService {
             toolIcon(call.name),
             activityMeta(call, result),
           );
-          messages.push({ role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
+          messages.push({
+            role: 'tool',
+            toolCallId: call.id,
+            toolName: call.name,
+            content: projectToolResultForModel(call.name, result),
+          });
           continue;
         }
         if (call.name === 'compress_context') {
@@ -483,7 +548,10 @@ export class PlannerService {
           role: 'tool',
           toolCallId: call.id,
           toolName: call.name,
-          content: genericResults.get(call.id) ?? 'Error: tool did not return a result.',
+          content: projectToolResultForModel(
+            call.name,
+            genericResults.get(call.id) ?? 'Error: tool did not return a result.',
+          ),
         });
       }
 
@@ -533,15 +601,18 @@ export class PlannerService {
     tools: ToolDef[],
     streamOutput = true,
     routeContext?: ReasoningRouteContext,
-  ): Promise<{ text: string; toolCalls: ToolCall[]; reasoning: string; ttftMs: number }> {
+  ): Promise<{ text: string; toolCalls: ToolCall[]; reasoning: string; ttftMs: number; loopDetected: boolean }> {
     let text = '';
     let reasoning = '';
     let usage: UsageTotals | undefined;
     const toolCalls: ToolCall[] = [];
     let retried = false;
+    let loopDetected = false;
+    const loopGuard = new StreamLoopGuard();
+    const turnAbort = createChildAbortController(signal);
     const startedAt = Date.now();
     let ttftMs = 0;
-    callbacks.onUsage?.(estimateTokens(messages));
+    callbacks.onUsage?.(estimateRequestTokens(messages, { tools }));
     try {
       for await (const event of chatWithRetry(
         this.provider,
@@ -549,7 +620,7 @@ export class PlannerService {
         {
           model: this.model,
           tools: tools.length > 0 ? tools : undefined,
-          signal,
+          signal: turnAbort.controller.signal,
           reasoning: this.options.resolveReasoning
             ? this.options.resolveReasoning(routeContext ?? { phase: 'planning', turn: 0 })
             : this.options.reasoning,
@@ -567,10 +638,28 @@ export class PlannerService {
           ttftMs = Date.now() - startedAt;
         }
         if (event.type === 'text') {
+          const detection = loopGuard.observe('text', event.text);
           text += event.text;
+          if (detection) {
+            if (streamOutput) callbacks.onTextDelta(event.text);
+            text = text.slice(0, Math.max(0, text.length - detection.repeatedChars));
+            if (streamOutput) callbacks.onTextRewind?.(detection.repeatedChars);
+            loopDetected = true;
+            turnAbort.controller.abort();
+            break;
+          }
           if (streamOutput) callbacks.onTextDelta(event.text);
         } else if (event.type === 'reasoning') {
+          const detection = loopGuard.observe('reasoning', event.text);
           reasoning += event.text;
+          if (detection) {
+            if (streamOutput) callbacks.onReasoningDelta?.(event.text);
+            reasoning = reasoning.slice(0, Math.max(0, reasoning.length - detection.repeatedChars));
+            if (streamOutput) callbacks.onReasoningRewind?.(detection.repeatedChars);
+            loopDetected = true;
+            turnAbort.controller.abort();
+            break;
+          }
           if (streamOutput) callbacks.onReasoningDelta?.(event.text);
         } else if (event.type === 'toolCall') {
           toolCalls.push(event.toolCall);
@@ -581,12 +670,15 @@ export class PlannerService {
       if (usage) {
         callbacks.onUsageExact?.(usage);
       }
+    } catch (error) {
+      if (!loopDetected) throw error;
     } finally {
+      turnAbort.dispose();
       if (retried) {
         callbacks.onStatus?.('retry', '', undefined, true);
       }
     }
-    return { text, toolCalls, reasoning, ttftMs };
+    return { text, toolCalls, reasoning, ttftMs, loopDetected };
   }
 
 }

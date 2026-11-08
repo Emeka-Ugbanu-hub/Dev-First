@@ -16,8 +16,10 @@ import {
 import { ChatViewProvider } from './webview/ChatViewProvider';
 import { getConfig, promptForApiKey, workspaceRoot } from './config';
 import { activeProvider } from './llm/activeProvider';
+import { chatWithRetry } from './llm/retry';
 import { PRESETS, findPreset } from './llm/presets';
 import { cleanupStaleTemps } from './util/atomicWrite';
+import { workspaceStoragePath } from './util/workspaceStorage';
 import { WorktreeManager } from './worktree/WorktreeManager';
 import { worktreeMergeConflictPrompt } from './worktree/prompts';
 import { ScanRunner } from './scan/scanner';
@@ -35,8 +37,12 @@ import {
 
 export function activate(context: vscode.ExtensionContext): void {
   const diffManager = DiffManager.getInstance();
-  void cleanupStaleTemps(workspaceRoot() ?? process.cwd(), 24 * 60 * 60 * 1000);
-  void cleanupStaleTemps(path.join(context.globalStorageUri.fsPath, 'file-snapshots'), 24 * 60 * 60 * 1000);
+  const projectRoot = workspaceRoot() ?? process.cwd();
+  void cleanupStaleTemps(projectRoot, 24 * 60 * 60 * 1000);
+  void cleanupStaleTemps(
+    workspaceStoragePath(context.globalStorageUri.fsPath, projectRoot, 'file-snapshots'),
+    24 * 60 * 60 * 1000,
+  );
   const codeLensProvider = new DiffCodeLensProvider(diffManager);
   context.subscriptions.push(
     vscode.languages.registerCodeLensProvider({ scheme: 'file' }, codeLensProvider),
@@ -101,11 +107,12 @@ export function activate(context: vscode.ExtensionContext): void {
       return undefined;
     }
     let text = '';
-    for await (const event of active.provider.chat([{ role: 'user', content: prompt }], {
+    for await (const event of chatWithRetry(active.provider, [{ role: 'user', content: prompt }], {
       model: active.model,
       maxTokens,
       temperature: 0.2,
-    })) {
+      contextTokens: getConfig().contextLimitTokens,
+    }, { attempts: 1, retryOnEmpty: false })) {
       if (event.type === 'text') {
         text += event.text;
       }
@@ -124,15 +131,17 @@ export function activate(context: vscode.ExtensionContext): void {
   let runHadError = false;
   session.setPhaseListener((phase) => {
     attention.setPhase(phase);
-    if (phase === 'planning' || phase === 'executing') {
+    if (phase === 'planning' || phase === 'answering' || phase === 'executing') {
       runHadError = false;
-    } else if (previousPhase === 'executing' && !runHadError) {
+    } else if ((previousPhase === 'executing' || previousPhase === 'answering' || previousPhase === 'planning') && !runHadError) {
       attention.complete();
     }
     previousPhase = phase;
     statusItem.text =
       phase === 'planning'
         ? '$(sync~spin) Dev-First: planning…'
+        : phase === 'answering'
+          ? '$(sync~spin) Dev-First: answering…'
         : phase === 'executing'
           ? '$(sync~spin) Dev-First: working…'
           : phase === 'review'
@@ -141,6 +150,8 @@ export function activate(context: vscode.ExtensionContext): void {
     provider.setDescription(
       phase === 'planning'
         ? 'Planning'
+        : phase === 'answering'
+          ? 'Answering'
         : phase === 'executing'
           ? 'Working'
           : phase === 'review'

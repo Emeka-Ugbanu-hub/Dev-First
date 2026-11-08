@@ -475,12 +475,15 @@ describe('planner local compaction', () => {
       maybeCompactPlanner: (
         messages: ChatMessage[],
         provider: LLMProvider,
+        context: unknown,
         model: string,
         local: boolean,
       ) => Promise<ChatMessage[]>;
+      mainModelContext: () => unknown;
     }).maybeCompactPlanner.bind(controller);
+    const context = (controller as unknown as { mainModelContext: () => unknown }).mainModelContext();
 
-    const result = await compact(messages, provider, 'local-test', true);
+    const result = await compact(messages, provider, context, 'local-test', true);
 
     expect(provider.calls).toHaveLength(0);
     expect(estimateTokens(result)).toBeLessThan(estimateTokens(messages));

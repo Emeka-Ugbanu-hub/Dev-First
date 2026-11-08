@@ -19,7 +19,7 @@ const FALLBACK_SUFFIX = ' Fallback: use only when no compound tool fits.';
 export const readFileTool: ToolDef = {
   name: 'read_file',
   description:
-    'Read a text file from the workspace. Returns numbered lines. For large files, read in ranges using start_line and end_line.' +
+    'Read numbered lines from a text file. For files over 500 lines, first use skim_file, then provide both start_line and end_line; each range is limited to 500 lines. Results include the full-file SHA-1 digest.' +
     FALLBACK_SUFFIX,
   parameters: {
     type: 'object',
@@ -29,6 +29,34 @@ export const readFileTool: ToolDef = {
       end_line: { type: 'number', description: '1-based last line to read (optional).' },
     },
     required: ['path'],
+  },
+};
+
+export const skimFileTool: ToolDef = {
+  name: 'skim_file',
+  description: 'Get a compact file outline with symbols/headings, line ranges, total lines, and a full-file SHA-1 digest. Use before reading large files.',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'Workspace-relative file path.' },
+    },
+    required: ['path'],
+  },
+};
+
+export const readOutputTool: ToolDef = {
+  name: 'read_output',
+  description: 'Retrieve a numbered line range from saved oversized tool or terminal output. Only reads .dev-first/tool-output files; request up to 500 lines. For a very long line, use start_column/end_column to retrieve it in character slices.',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'Saved output path shown in the tool result, under .dev-first/tool-output/.' },
+      start_line: { type: 'number', minimum: 1, description: 'First line to return, inclusive integer.' },
+      end_line: { type: 'number', minimum: 1, description: 'Last line to return, inclusive integer; at most 500 lines from start_line.' },
+      start_column: { type: 'number', minimum: 1, description: 'Optional 1-based first character for very long lines; provide with end_column.' },
+      end_column: { type: 'number', minimum: 1, description: 'Optional 1-based last character for very long lines; provide with start_column.' },
+    },
+    required: ['path', 'start_line', 'end_line'],
   },
 };
 
@@ -752,7 +780,9 @@ const PLANNER_TOOL_DESCRIPTIONS: Record<string, string> = {
   investigate_issue: 'Read-only investigation of a file and optional line.',
   bounded_investigation: 'Run bounded read-only investigation across the requested scope and return evidence.',
   verify_change: 'Check diagnostics for the listed files only. Planning mode never runs commands.',
-  read_file: 'Read a text file with numbered lines. Use start_line and end_line for large files or exact ranges.',
+  read_file: 'Read numbered lines; files over 500 lines require skim_file and an explicit range of at most 500 lines.',
+  skim_file: 'Show a file outline, line ranges, line count, and full-file digest before reading slices.',
+  read_output: 'Read a numbered range from saved oversized terminal/tool output.',
   list_files: 'List workspace files, optionally scoped by path and glob.',
   search_text: 'Search file contents for text or a regular expression and return file:line matches.',
   semantic_search: 'Search the codebase by meaning and return relevant files and line ranges.',
@@ -783,7 +813,9 @@ const COMPACT_EXECUTOR_DESCRIPTIONS: Record<string, string> = {
   find_symbol: 'Find symbols by name with file, line, kind, and container.',
   document_symbols: 'List a file symbol tree with line numbers.',
   find_references: 'Find references to a symbol in the workspace.',
-  read_file: 'Read numbered lines from a file; use start_line and end_line for large files.',
+  read_file: 'Read numbered lines; large files require skim_file and an explicit range of at most 500 lines.',
+  skim_file: 'Show file symbols/headings, line ranges, line count, and full-file digest.',
+  read_output: 'Read a numbered range from saved oversized command/tool output.',
   search_text: 'Search file contents and return file:line matches.',
   fix_in_file: 'Apply a targeted patch in one file and verify diagnostics.',
   apply_change_set: 'Apply a verified multi-file change set with diagnostics.',
@@ -845,6 +877,8 @@ export interface ToolRegistryOptions {
 export function readOnlyTools(options: ToolRegistryOptions = {}): ToolDef[] {
   const tools: ToolDef[] = [
     readFileTool,
+    skimFileTool,
+    readOutputTool,
     listFilesTool,
     searchTextTool,
     localHybridSearchTool,
@@ -919,7 +953,7 @@ export function executionTools(options: ToolRegistryOptions = {}): ToolDef[] {
 export function loadToolsTool(names: string[]): ToolDef {
   return {
     name: 'load_tools',
-    description: `Load optional tools that were hidden to save context. Available: ${names.join(', ')}. Load only the tools the current step needs; their schemas become available on the next turn.`,
+    description: `Load optional tools hidden to save context. Available: ${names.join(', ')}. Request all tools needed for the current task or step together; their schemas become available on the next turn and remain available. Loading them together avoids more schema changes and cache misses later.`,
     parameters: {
       type: 'object',
       properties: {
@@ -955,6 +989,10 @@ export function describeToolCall(call: ToolCall): string {
   switch (call.name) {
     case 'read_file':
       return `Read ${shortPath(args.path)}${args.start_line ? `:${args.start_line}` : ''}`;
+    case 'skim_file':
+      return `Outline ${shortPath(args.path)}`;
+    case 'read_output':
+      return `Read output ${shortPath(args.path)}:${args.start_line}-${args.end_line}`;
     case 'list_files':
       return `List ${shortPath(args.path) || 'workspace'}`;
     case 'search_text':
@@ -1055,6 +1093,7 @@ export interface ActivityMeta {
   detailKind?: 'terminal' | 'text';
   exitCode?: number;
   filePath?: string;
+  durationMs?: number;
 }
 
 export function activityMeta(call: ToolCall, result: string): ActivityMeta {
@@ -1075,6 +1114,10 @@ export function toolIcon(name: string): string {
   switch (name) {
     case 'read_file':
       return 'file';
+    case 'skim_file':
+      return 'list-tree';
+    case 'read_output':
+      return 'output';
     case 'list_files':
       return 'files';
     case 'search_text':

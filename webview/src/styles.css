@@ -2100,22 +2100,39 @@ body.vscode-light .hljs-meta {
   color: var(--vscode-gitDecoration-modifiedResourceForeground, #e2c08d);
 }
 
+.message-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  min-height: 24px;
+  margin-top: 2px;
+  padding-inline-end: 2px;
+}
+
 .msg-copy {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  opacity: 0;
-  padding: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  padding: 0;
+  border: 1px solid transparent;
   border-radius: 4px;
+  background: transparent;
+  opacity: 0;
   color: var(--vscode-descriptionForeground);
 }
 
-.assistant-bubble:hover .msg-copy {
+.assistant-bubble:hover .msg-copy,
+.assistant-bubble:focus-within .msg-copy {
   opacity: 1;
 }
 
-.msg-copy:hover {
+.msg-copy:hover,
+.msg-copy:focus-visible {
   background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+  border-color: var(--df-border);
   color: var(--vscode-foreground);
 }
 
@@ -2772,6 +2789,14 @@ body.vscode-light .hljs-meta {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.activity-duration {
+  margin-left: 6px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
 }
 
 .spinner {
@@ -4683,6 +4708,7 @@ body.vscode-light .hljs-meta {
 .composer-approval .codicon { font-size: 12px; }
 .composer-approval.active { color: var(--vscode-testing-iconPassed, #73c991); }
 .composer-enhance { display: inline-flex; }
+.input-enhance-error { color: var(--vscode-errorForeground); display: flex; align-items: center; gap: 5px; font-size: 11px; }
 .composer-model { gap: 5px; padding: 0 2px; max-width: 190px; }
 .composer-model-name { max-width: 105px; overflow: hidden; text-overflow: ellipsis; color: var(--vscode-foreground); }
 .composer-model-reasoning { color: var(--vscode-descriptionForeground); }

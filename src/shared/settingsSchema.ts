@@ -211,7 +211,7 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     tab: 'behavior',
     group: 'Accuracy',
     label: 'Semantic search',
-    description: 'Enable semantic_search using the bundled local embedding model.',
+    description: 'Enable semantic_search using the bundled local embedder in an isolated worker.',
     type: 'boolean',
   },
   {
@@ -229,15 +229,6 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     label: 'Codebase index file limit',
     description: 'Maximum files included in the model-free codebase locator.',
     type: 'number',
-  },
-  {
-    key: 'embeddingsProvider',
-    tab: 'behavior',
-    group: 'Accuracy',
-    label: 'Embeddings source',
-    description: 'Local bundled model (offline) or your provider’s embeddings API.',
-    type: 'enum',
-    options: ['local', 'api'],
   },
   {
     key: 'autoCompact',
@@ -262,7 +253,7 @@ export const SETTINGS_SCHEMA: SettingDef[] = [
     tab: 'behavior',
     group: 'Context',
     label: 'Local context cap',
-    description: 'Optional maximum context for local models. 0 disables it; the effective limit never exceeds the model or Modelfile context.',
+    description: 'Optional maximum context for local models. 0 uses the context reported by the model or Modelfile without an extension-added cap.',
     type: 'number',
     min: 0,
     max: 2_000_000,

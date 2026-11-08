@@ -125,7 +125,7 @@ export class FimCompletionProvider implements vscode.InlineCompletionItemProvide
       { ...config, provider: preset.provider, baseUrl: effectiveBaseUrl(preset, config.baseUrl) },
       apiKey,
     );
-    return fetchChatCompletion(provider, config.model, prefix, suffix, signal).catch(() => undefined);
+    return fetchChatCompletion(provider, config.model, prefix, suffix, signal, config.contextLimitTokens).catch(() => undefined);
   }
 
   private maybeNotify(presetLabel: string): void {

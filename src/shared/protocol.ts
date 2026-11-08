@@ -1,4 +1,4 @@
-export type Phase = 'idle' | 'planning' | 'executing' | 'review';
+export type Phase = 'idle' | 'planning' | 'answering' | 'executing' | 'review';
 export type PlanningMode = 'skip' | 'lite' | 'spec' | 'full';
 export type PlanningStateStatus = 'idle' | 'planning' | 'ready' | 'executing';
 
@@ -68,6 +68,7 @@ export interface ToolActivity {
   detailKind?: 'terminal' | 'text';
   exitCode?: number;
   filePath?: string;
+  durationMs?: number;
 }
 
 export interface TodoItem {
@@ -173,6 +174,40 @@ export interface DurableTaskState {
   nextSteps: number[];
   blockers: string[];
   lastHeartbeatAt: number;
+}
+
+export interface LastAnswerState {
+  messageId: string;
+  question: string;
+  text: string;
+  examinedFiles: string[];
+  /** Optional semantic coverage checklist for a detailed answer; simple answers omit it. */
+  coverageItems?: string[];
+  status: 'complete' | 'truncated' | 'interrupted';
+  updatedAt: number;
+}
+
+export type ContinuationKind = 'answer' | 'task' | 'plan';
+export type ContinuationStatus = 'active' | 'truncated' | 'interrupted' | 'paused' | 'complete';
+
+/** Small durable pointer used to resolve "continue" without another guess. */
+export interface ContinuationState {
+  kind: ContinuationKind;
+  targetId: string;
+  status: ContinuationStatus;
+  updatedAt: number;
+}
+
+/** Deterministic, bounded session memory injected ahead of retrieved history. */
+export interface SessionMemoryCard {
+  goal?: string;
+  decisions: string[];
+  touchedFiles: string[];
+  blockers: string[];
+  completedStep?: string;
+  nextStep?: string;
+  answerTail?: string;
+  updatedAt: number;
 }
 
 export interface TaskRouteEvent {

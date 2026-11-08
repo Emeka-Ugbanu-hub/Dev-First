@@ -99,6 +99,19 @@ describe('OpenAIProvider', () => {
     expect(request.body.tools[0].function.name).toBe('read_file');
   });
 
+  it('reports a length finish reason so the caller can continue the answer', async () => {
+    mock = await startMockServer((_req, res) => {
+      sse(res, [
+        'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}\n\n',
+        'data: [DONE]\n\n',
+      ]);
+    });
+    const provider = new OpenAIProvider({ apiKey: 'k', baseUrl: `${mock.url}/v1` });
+    const events = await collect(provider.chat([{ role: 'user', content: 'hi' }], { model: 'm' }));
+
+    expect(events.at(-1)).toEqual({ type: 'done', reason: 'length' });
+  });
+
   it('serializes assistant tool calls and tool results', async () => {
     mock = await startMockServer((_req, res) => {
       sse(res, ['data: {"choices":[{"delta":{"content":"ok"}}]}\n\n', 'data: [DONE]\n\n']);
@@ -127,6 +140,59 @@ describe('OpenAIProvider', () => {
 });
 
 describe('Ollama reasoning metadata requests', () => {
+  it('clamps local context even when the caller omits or overstates it', async () => {
+    mock = await startMockServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end('{"message":{"content":"ok"},"done":true}\n');
+    });
+    const provider = new OpenAIProvider({
+      apiKey: 'not-needed',
+      baseUrl: `${mock.url}/v1`,
+      ollama: true,
+      localContextCapTokens: 24000,
+    });
+    await collect(provider.chat([{ role: 'user', content: 'hi' }], { model: 'qwen3:4b' }));
+    await collect(provider.chat([{ role: 'user', content: 'hi' }], { model: 'qwen3:4b', contextTokens: 999999 }));
+
+    expect(mock.requests[0].body.options.num_ctx).toBe(24000);
+    expect(mock.requests[1].body.options.num_ctx).toBe(24000);
+  });
+
+  it('leaves num_ctx to Ollama when no local cap is configured', async () => {
+    mock = await startMockServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end('{"message":{"content":"ok"},"done":true}\n');
+    });
+    const provider = new OpenAIProvider({
+      apiKey: 'not-needed',
+      baseUrl: `${mock.url}/v1`,
+      ollama: true,
+      localContextCapTokens: 0,
+    });
+    await collect(provider.chat([{ role: 'user', content: 'hi' }], {
+      model: 'qwen3:4b',
+      contextTokens: 4_096,
+    }));
+
+    expect(mock.requests[0].body.options?.num_ctx).toBeUndefined();
+  });
+
+  it('reports Ollama done_reason length without sending a num_predict cap', async () => {
+    mock = await startMockServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+      res.end('{"message":{"content":"partial"},"done":true,"done_reason":"length"}\n');
+    });
+    const provider = new OpenAIProvider({ apiKey: 'not-needed', baseUrl: `${mock.url}/v1`, ollama: true });
+    const events = await collect(provider.chat([{ role: 'user', content: 'hi' }], {
+      model: 'qwen3:4b',
+      contextTokens: 4_096,
+    }));
+
+    expect(events.at(-1)).toEqual({ type: 'done', reason: 'length' });
+    expect(mock.requests[0].body.options.num_ctx).toBe(4_096);
+    expect(mock.requests[0].body.options.num_predict).toBeUndefined();
+  });
+
   it('uses the native chat API so the advertised thinking level is honored', async () => {
     mock = await startMockServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'application/x-ndjson' });

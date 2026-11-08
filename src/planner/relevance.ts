@@ -1,5 +1,5 @@
 import type { ChatMessage } from '../llm/types';
-import type { PendingDecisionRecord } from '../shared/protocol';
+import type { PendingDecisionRecord, SessionMemoryCard } from '../shared/protocol';
 import type { SessionContextEntry } from '../session/SessionStore';
 import { estimateTokens } from '../agent/compaction';
 import { messageHash } from '../session/contextIndex';
@@ -43,6 +43,7 @@ export interface PinnedPlannerContext {
   diagnosticsSummary?: string;
   ledger?: string;
   taskState?: { state: string; completedSteps: number[]; nextSteps: number[]; blockers: string[] };
+  memoryCard?: SessionMemoryCard;
 }
 
 export const RETRIEVED_CONTEXT_HEADER =
@@ -300,6 +301,18 @@ export function pinnedContextMessage(pinned: PinnedPlannerContext): ChatMessage 
     }
     lines.push('Do not redo completed steps. Continue with the next required step.');
   }
+  if (pinned.memoryCard) {
+    const card = pinned.memoryCard;
+    lines.push('Session memory:');
+    if (card.goal) lines.push(`Goal: ${card.goal}`);
+    if (card.decisions.length > 0) lines.push(`Decisions: ${card.decisions.join('; ')}`);
+    if (card.touchedFiles.length > 0) lines.push(`Touched files: ${card.touchedFiles.join(', ')}`);
+    if (card.completedStep) lines.push(`Last completed step: ${card.completedStep}`);
+    if (card.nextStep) lines.push(`Next step: ${card.nextStep}`);
+    if (card.blockers.length > 0) lines.push(`Open blockers: ${card.blockers.join('; ')}`);
+    if (card.answerTail) lines.push(`Latest answer tail: ${card.answerTail}`);
+  }
+  lines.push('Never repeat pinned context, ledger, checkpoint, or projection text in the answer.');
   return { role: 'system', content: `[Pinned context — always included]\n${lines.join('\n')}` };
 }
 

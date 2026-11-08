@@ -8,7 +8,10 @@ const FALLBACK_RESERVED_TOKENS = 8192;
 export function ContextBar({ usage }: { usage: ContextUsage }) {
   const [open, setOpen] = useState(false);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  if (!usage.limit || usage.tokens <= 0) return null;
+  // Keep the capacity indicator visible before the first provider usage event.
+  // Local providers often do not emit usage, but the configured context limit
+  // is still useful and lets the developer see that the budget is active.
+  if (!usage.limit) return null;
 
   const reserved = Math.max(0, Math.min(usage.reserved ?? FALLBACK_RESERVED_TOKENS, usage.limit - usage.tokens));
   const free = Math.max(0, usage.limit - usage.tokens - reserved);

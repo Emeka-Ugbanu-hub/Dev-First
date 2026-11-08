@@ -1,4 +1,5 @@
 import { ChatMessage, LLMProvider } from '../llm/types';
+import { chatWithRetry } from '../llm/retry';
 
 export const COMPLETION_SYSTEM_PROMPT =
   'You are a code completion engine. Output ONLY the code that belongs at the cursor — no explanations, no markdown fences, at most 3 short lines. If you are not confident, output nothing at all.';
@@ -32,15 +33,17 @@ export async function fetchChatCompletion(
   prefix: string,
   suffix: string,
   signal: AbortSignal,
+  contextTokens = 4096,
 ): Promise<string | undefined> {
   const messages = buildCompletionMessages(prefix, suffix);
   let text = '';
-  for await (const event of provider.chat(messages, {
+  for await (const event of chatWithRetry(provider, messages, {
     model,
     maxTokens: 128,
     temperature: 0.2,
     signal,
-  })) {
+    contextTokens,
+  }, { attempts: 1, retryOnEmpty: false })) {
     if (event.type === 'text') {
       text += event.text;
     }

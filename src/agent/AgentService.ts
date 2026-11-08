@@ -12,6 +12,8 @@ import { ToolBox, type ToolExecutionContext } from './ToolBox';
 import type { VerifyCheckKind } from './verificationPolicy';
 import type { FinishGateResult } from './finishGate';
 import { parseCompoundResult } from './compoundResult';
+import { projectToolResultForModel } from './toolResultProjection';
+import { estimateRequestTokens } from '../llm/contextFit';
 import { PromptFamily, buildExecutorSpec, buildExecutorSystemPrompt } from '../planner/prompts';
 import { chatWithRetry } from '../llm/retry';
 import {
@@ -22,6 +24,7 @@ import {
 } from './doomloop';
 import { MistakeTracker } from './mistakes';
 import { ConvergenceGuard, ConvergenceState } from './convergence';
+import { createChildAbortController, StreamLoopGuard, streamLoopRecoveryPrompt } from '../llm/streamLoopGuard';
 import { isContextOverflowError } from '../llm/errors';
 import { normalizeToolArguments } from '../util/toolArgs';
 import {
@@ -65,7 +68,9 @@ function normalizeLoopText(text: string): string {
 
 export interface AgentCallbacks {
   onTextDelta(text: string): void;
+  onTextRewind?(characters: number): void;
   onReasoningDelta?(text: string): void;
+  onReasoningRewind?(characters: number): void;
   onToolActivity(
     id: string,
     label: string,
@@ -227,8 +232,10 @@ export class AgentService {
     const readCallPaths = new Map<string, string>();
     const readMessageIndex = new Map<string, number>();
     const availableTools = [...this.options.tools];
+    const initialTools = [...availableTools];
     const toolsByName = new Map(availableTools.map((tool) => [tool.name, tool]));
     const lazyToolsByName = new Map((this.options.lazyTools ?? []).map((tool) => [tool.name, tool]));
+    const loadedToolNames = new Set<string>();
     const contextLimit = this.options.contextLimitTokens || DEFAULT_CONTEXT_LIMIT;
     const profile = this.options.contextProfile;
     let latestUsage: UsageTotals | undefined;
@@ -243,6 +250,7 @@ export class AgentService {
     let previousToolNames: string[] = [];
     let previousToolFailed = false;
     let finishRejected = false;
+    let streamLoopRecoveryUsed = false;
     let finishNudged = false;
     let lastProgressAt = Date.now();
     let toolCallIndex = 0;
@@ -267,7 +275,7 @@ export class AgentService {
     if ((this.options.lazyTools?.length ?? 0) > 0) {
       messages.push({
         role: 'system',
-        content: 'Optional tools are hidden to save context. If this step needs web access, a browser, MCP, semantic search, background processes, or a subagent, call load_tools with the needed names first.',
+        content: 'Optional tools are hidden to save context. If this step needs web access, a browser, MCP, semantic search, background processes, or a subagent, call load_tools once with all needed names first. Their schemas remain available on later turns.',
       });
     }
 
@@ -298,7 +306,7 @@ export class AgentService {
       this.doomLoop.noteProgress({ fingerprint, description });
     };
 
-    for (let step = 0; step < this.options.maxSteps; step++) {
+    for (let step = 0; this.options.maxSteps <= 0 || step < this.options.maxSteps; step++) {
       this.runStats.turns += 1;
       if (shouldPrune(estimateTokens(messages), contextLimit, profile)) {
         messages = pruneMessages(messages);
@@ -329,17 +337,21 @@ export class AgentService {
         callbacks.progressSnapshot?.().completedStepCount ?? completedTodoSteps,
         contextLimit,
       );
-      this.runStats.promptTokens += estimateTokens(projectedMessages);
-      callbacks.onUsage?.(estimateTokens(projectedMessages));
+      const estimatedPromptTokens = estimateRequestTokens(projectedMessages, { tools: availableTools });
+      this.runStats.promptTokens += estimatedPromptTokens;
+      callbacks.onUsage?.(estimatedPromptTokens);
 
       let text = '';
       let reasoning = '';
       const toolCalls: ToolCall[] = [];
       let streamed = false;
       let turnUsage: UsageTotals | undefined;
+      let streamLoopDetected = false;
 
       for (let attempt = 0; attempt < 2 && !streamed; attempt++) {
         let retried = false;
+        const loopGuard = new StreamLoopGuard();
+        const turnAbort = createChildAbortController(signal);
         try {
           for await (const event of chatWithRetry(
             this.provider,
@@ -347,7 +359,7 @@ export class AgentService {
             {
               model: this.model,
               tools: [...availableTools],
-              signal,
+              signal: turnAbort.controller.signal,
               reasoning: this.options.resolveReasoning
                 ? this.options.resolveReasoning({
                     phase: 'execution',
@@ -370,10 +382,28 @@ export class AgentService {
               this.firstResponseAt = Date.now();
             }
             if (event.type === 'text') {
+              const detection = loopGuard.observe('text', event.text);
               text += event.text;
+              if (detection) {
+                callbacks.onTextDelta(event.text);
+                text = text.slice(0, Math.max(0, text.length - detection.repeatedChars));
+                callbacks.onTextRewind?.(detection.repeatedChars);
+                streamLoopDetected = true;
+                turnAbort.controller.abort();
+                break;
+              }
               callbacks.onTextDelta(event.text);
             } else if (event.type === 'reasoning') {
+              const detection = loopGuard.observe('reasoning', event.text);
               reasoning += event.text;
+              if (detection) {
+                callbacks.onReasoningDelta?.(event.text);
+                reasoning = reasoning.slice(0, Math.max(0, reasoning.length - detection.repeatedChars));
+                callbacks.onReasoningRewind?.(detection.repeatedChars);
+                streamLoopDetected = true;
+                turnAbort.controller.abort();
+                break;
+              }
               callbacks.onReasoningDelta?.(event.text);
             } else if (event.type === 'toolCall') {
               toolCalls.push(event.toolCall);
@@ -392,6 +422,10 @@ export class AgentService {
         } catch (error) {
           if (retried) {
             callbacks.onStatus?.('retry', '', undefined, true);
+          }
+          if (streamLoopDetected) {
+            streamed = true;
+            break;
           }
           if (attempt === 0 && isContextOverflowError(error)) {
             callbacks.onNotice?.('Context limit reached — compacting and retrying…');
@@ -414,7 +448,22 @@ export class AgentService {
             return this.closedConvergenceResult('TRUNCATED', 'the model stream ended after partial output');
           }
           throw error;
+        } finally {
+          turnAbort.dispose();
         }
+      }
+
+      if (streamLoopDetected) {
+        if (streamLoopRecoveryUsed) {
+          const reason = 'the current model turn repeated streamed content after one recovery attempt';
+          callbacks.onNotice?.('Stopped after repeated output returned following recovery. Completed work is preserved.');
+          return this.closedConvergenceResult('FIXED_POINT', reason);
+        }
+        streamLoopRecoveryUsed = true;
+        if (text.trim()) messages.push({ role: 'assistant', content: text.trim() });
+        messages.push({ role: 'user', content: streamLoopRecoveryPrompt() });
+        callbacks.onNotice?.('Detected repeated streamed output and stopped that turn. Trying one recovery turn.');
+        continue;
       }
 
       if (toolCalls.length === 0) {
@@ -628,14 +677,23 @@ export class AgentService {
           const requested = Array.isArray(toolCallArgs(call).names)
             ? (toolCallArgs(call).names as unknown[]).filter((name): name is string => typeof name === 'string')
             : [];
+          const requestedNames = new Set(requested);
           const loaded: string[] = [];
-          for (const name of requested) {
-            if (toolsByName.has(name)) continue;
-            const definition = lazyToolsByName.get(name);
-            if (!definition) continue;
+          // Preserve catalog order instead of model-supplied argument order.
+          // The same available tool set therefore has a stable schema prefix.
+          for (const [name, definition] of lazyToolsByName) {
+            if (!requestedNames.has(name) || toolsByName.has(name)) continue;
             toolsByName.set(name, definition);
-            availableTools.push(definition);
+            loadedToolNames.add(name);
             loaded.push(name);
+          }
+          if (loaded.length > 0) {
+            availableTools.splice(
+              0,
+              availableTools.length,
+              ...initialTools,
+              ...[...lazyToolsByName].filter(([name]) => loadedToolNames.has(name)).map(([, definition]) => definition),
+            );
           }
           result = loaded.length > 0
             ? `Loaded tools: ${loaded.join(', ')}. They are available from the next model turn.`
@@ -763,7 +821,12 @@ export class AgentService {
       for (const call of normalizedCalls) {
         const result = results.get(call.id) ?? 'Error: tool did not run.';
         if (result.startsWith('Error:') || result.startsWith('Error in')) previousToolFailed = true;
-        messages.push({ role: 'tool', toolCallId: call.id, toolName: call.name, content: result });
+        messages.push({
+          role: 'tool',
+          toolCallId: call.id,
+          toolName: call.name,
+          content: projectToolResultForModel(call.name, result),
+        });
 
         if (result.startsWith('Error:') || result.startsWith('Error in')) {
           recentToolFailures.push(`${call.name}: ${toolFailureSummary(result)}`);
@@ -910,10 +973,16 @@ export class AgentService {
     }
 
     return {
-      reachedLimit: true,
+      reachedLimit: this.options.maxSteps > 0,
       incomplete: {
-        issues: [`reached the ${this.options.maxSteps}-step limit`],
-        compact: `Run ended incomplete — the step limit (${this.options.maxSteps}) was reached. Completed work is preserved. Review the changes, then send a message to continue.`,
+        issues: [
+          this.options.maxSteps > 0
+            ? `reached the ${this.options.maxSteps}-step limit`
+            : 'execution ended without reporting completion',
+        ],
+        compact: this.options.maxSteps > 0
+          ? `Run ended incomplete — the step limit (${this.options.maxSteps}) was reached. Completed work is preserved. Review the changes, then send a message to continue.`
+          : 'Run ended without reporting completion. Completed work is preserved.',
       },
     };
   }

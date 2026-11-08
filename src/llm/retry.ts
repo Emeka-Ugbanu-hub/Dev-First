@@ -1,5 +1,6 @@
 import { ChatMessage, ChatOptions, LLMProvider, StreamEvent } from './types';
 import { isRetryableError } from './errors';
+import { fitRequestToContext } from './contextFit';
 
 export interface RetryOptions {
   attempts?: number;
@@ -19,12 +20,13 @@ export async function* chatWithRetry(
 ): AsyncGenerator<StreamEvent> {
   const attempts = retry.attempts ?? 3;
   const baseDelay = retry.baseDelayMs ?? 500;
+  const requestMessages = fitRequestToContext(messages, options);
 
   for (let attempt = 0; ; attempt++) {
     let forwarded = false;
     let sawContent = false;
     try {
-      for await (const event of provider.chat(messages, options)) {
+      for await (const event of provider.chat(requestMessages, options)) {
         forwarded = true;
         if (event.type === 'text' || event.type === 'toolCall' || event.type === 'reasoning') {
           sawContent = true;

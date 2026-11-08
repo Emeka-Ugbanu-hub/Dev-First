@@ -58,6 +58,14 @@ export interface UsageTotals {
   cached: number;
 }
 
+export type StreamStopReason =
+  | 'stop'
+  | 'length'
+  | 'tool-calls'
+  | 'content-filter'
+  | 'error'
+  | 'unknown';
+
 export type StreamEvent =
   | { type: 'text'; text: string }
   | { type: 'reasoning'; text: string }
@@ -69,7 +77,7 @@ export type StreamEvent =
       reasoningTokens?: number;
       cachedTokens?: number;
     }
-  | { type: 'done' };
+  | { type: 'done'; reason?: StreamStopReason };
 
 export function reasoningBudget(effort: ReasoningEffort | undefined, fallback = 4096): number {
   switch (effort) {

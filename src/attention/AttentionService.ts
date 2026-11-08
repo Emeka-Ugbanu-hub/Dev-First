@@ -54,7 +54,7 @@ export class AttentionService {
   }
 
   setPhase(phase: Phase): void {
-    if (getConfig().keepAwake && (phase === 'planning' || phase === 'executing')) {
+    if (getConfig().keepAwake && (phase === 'planning' || phase === 'answering' || phase === 'executing')) {
       this.startKeepAwake();
     } else {
       this.stopKeepAwake();

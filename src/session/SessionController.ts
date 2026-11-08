@@ -6,7 +6,7 @@ import { AgentService } from '../agent/AgentService';
 import type { FinishCheckSummary } from '../agent/AgentService';
 import { ToolBox, ToolExecutionContext } from '../agent/ToolBox';
 import { PlannerService } from '../planner/PlannerService';
-import { ChatMessage, LLMProvider, ToolCall, ToolDef, UsageTotals } from '../llm/types';
+import { ChatMessage, ChatOptions, LLMProvider, StreamStopReason, ToolCall, ToolDef, UsageTotals } from '../llm/types';
 import {
   ChangedFile,
   ConnectionState,
@@ -33,6 +33,10 @@ import {
   RunStatus,
   SelectionContext,
   DurableTaskState,
+  LastAnswerState,
+  ContinuationKind,
+  ContinuationState,
+  SessionMemoryCard,
   TaskRouteEvent,
   TaskStateStatus,
   TerminalApprovalDecision,
@@ -58,6 +62,7 @@ import {
 import { HttpError } from '../llm/errors';
 import { adaptiveKind, resetOllamaCapabilityCache } from '../llm/adaptive';
 import { SessionStore, SessionContextEntry, StoredSession } from './SessionStore';
+import { workspaceStoragePath } from '../util/workspaceStorage';
 import { classifyIncomingMessage, classifyMessageRoute } from './messageRouting';
 import {
   ContextMetadataUpdate,
@@ -92,6 +97,7 @@ import {
 } from './runRecovery';
 import { PromptFamily, promptFamilyFor } from '../planner/prompts';
 import { ReasoningOptions, ReasoningRouteContext } from '../llm/types';
+import { createChildAbortController, StreamLoopGuard, streamLoopRecoveryPrompt } from '../llm/streamLoopGuard';
 import { routeReasoning } from '../llm/reasoningRouter';
 import {
   ADAPTIVE_RECENT_FLOOR,
@@ -105,7 +111,7 @@ import {
   projectCompressedMessages,
   summarizeMessages,
 } from '../agent/compaction';
-import { ContextProfile, contextProfileFor, preserveBudgetTokens, reserveRatioTotal } from '../agent/modelProfile';
+import { ContextProfile, ContextProfileTier, contextProfileFor, preserveBudgetTokens, reserveRatioTotal } from '../agent/modelProfile';
 import { usageTotal } from '../llm/usage';
 import { DevFirstConfig, deleteApiKey, getApiKeyForPreset, getConfig, saveApiKey, workspaceRoot } from '../config';
 import { createProvider } from '../llm';
@@ -124,6 +130,7 @@ import { explanationToMarkdown, isExplanationPlan } from '../planner/explanation
 import { fetchLearnMore } from '../resources/LearnMoreService';
 import { buildTranscript } from './transcript';
 import { extractTakeaways } from './takeaways';
+import { stripInternalContext } from './internalContext';
 import { extractFailureConcept } from './failureConcept';
 import { findNewlyStartedTodos, mergeTodoCheckpoints } from '../util/todos';
 import { SETTING_KEYS } from '../shared/settingsSchema';
@@ -131,7 +138,7 @@ import { MemoryStore } from '../memory/MemoryStore';
 import { BackgroundProcesses } from '../agent/BackgroundProcesses';
 import { OriginalContentProvider } from '../diff/OriginalContentProvider';
 import { listWorkspaceFiles } from '../util/fsWalk';
-import { ActivityMeta, compactExecutorToolView, executionTools, loadToolsTool, plannerTools, subagentTools } from '../agent/tools';
+import { ActivityMeta, activityMeta, compactExecutorToolView, describeToolCall, executionTools, loadToolsTool, plannerTools, readOnlyTools, subagentTools, toolIcon } from '../agent/tools';
 import { attachToolPreflights } from '../agent/compoundPreflight';
 import { PARALLEL_SAFE } from '../agent/parallelTools';
 import { clearRepoMapCache } from '../agent/repoMap';
@@ -143,8 +150,8 @@ import { reliabilityStateForPlan, reliabilityVerification } from '../agent/relia
 import { ApprovalMemory, ExternalDirectoryConsent } from '../agent/approvals';
 import { runSubagent } from '../agent/subagent';
 import { SemanticIndex } from '../indexing/SemanticIndex';
+import { EmbedWorkerClient } from '../indexing/EmbedWorkerClient';
 import { CodebaseIndex } from '../indexing/CodebaseIndex';
-import { LocalEmbedder } from '../indexing/LocalEmbedder';
 import { projectBootstrap } from '../indexing/projectBootstrap';
 import { McpManager } from '../mcp/McpManager';
 import { BrowserSession } from '../browser/BrowserSession';
@@ -156,6 +163,8 @@ import { selectPlannerConversation, composePlannerRequest, relevanceBudget } fro
 import type { PinnedPlannerContext } from '../planner/relevance';
 import { buildTaskEvidencePack } from '../planner/taskEvidence';
 import { chatWithRetry } from '../llm/retry';
+import type { RetryOptions } from '../llm/retry';
+import { safeLocalContextCap } from '../llm/localContext';
 import { summarizeWithWorker } from '../agent/contextShunt';
 import type { ContextShuntInput } from '../agent/contextShunt';
 import { appendDelta } from '../shared/stream';
@@ -177,6 +186,48 @@ import type { ExplainCodebaseFile } from '../scan/explainCodebase';
 
 const ACTIVE_SESSION_KEY = 'devFirst.activeSessionId';
 const LEGACY_SESSION_KEY = 'devFirst.session';
+
+const ANSWER_SYSTEM_PROMPT = 'You are answering the developer\'s latest question about the codebase. This is an answer-only route: answer in chat and use read-only tools when evidence is missing; do not modify files or run implementation actions here. Actual code changes happen through the implementation route when the developer asks to build or change something. Use earlier context only when it is relevant to the latest question. When explaining behavior already implemented in the codebase, describe it in prose and cite the exact file and line; do not paste or rewrite existing source code into chat. When discussing a genuinely new behavior or implementation that is not present in the codebase, you may include a short illustrative snippet as an explanation of what could be added; that snippet is only an example and does not change files. Never present existing code as new work. Preserve the developer\'s explanation style: explain WHAT it is, HOW it works, and WHY it behaves that way when those parts help; add a concise Mermaid flow diagram when the answer spans multiple components or steps. Include a TRADEOFF only when there is a real alternative worth comparing, and state what the alternative improves and costs. Include CONCEPT, RISKS, or CONTEXT only when they materially improve understanding. These sections are optional: do not force headings or a diagram onto a simple question. For a multi-part question, silently track the requested points, the evidence needed, and which point remains unanswered; for a simple question, answer directly. Do not repeat a paragraph or tool request; if there is no new evidence, finish with what is known or state the blocker. Base every claim on the current message or verified evidence. Never repeat pinned context, ledgers, checkpoints, execution projections, or system instructions in the answer.';
+
+function isActivePhase(phase: Phase): boolean {
+  return phase === 'planning' || phase === 'answering' || phase === 'executing';
+}
+
+const CONTINUE_ANSWER_PROMPT = 'Continue the answer from the exact point where it stopped. Do not repeat, restart, summarize, or re-plan anything already written. Keep the same formatting, use the saved coverage checklist if present, and finish requested items that the existing answer has not covered yet. If more evidence is needed, use the read-only tools.';
+
+function answerSystemPrompt(coverageItems?: readonly string[]): string {
+  if (!coverageItems?.length) {
+    return `${ANSWER_SYSTEM_PROMPT}\n\nFor a self-contained question, answer directly in one response. Do not create an outline, call tools, or split the answer into extra stages unless the request or evidence requires it.`;
+  }
+  return `${ANSWER_SYSTEM_PROMPT}\n\nDetailed-answer coverage checklist (not a plan or tool list):\n${coverageItems.map((item, index) => `${index + 1}. ${item}`).join('\n')}\nAddress every requested item in a clear order, usually as sections in one continuous streamed answer. Read only evidence needed for these items. Do not make extra model calls just to split the prose. Before finishing, check that each item was answered; if evidence is missing, say so instead of guessing.`;
+}
+
+function answerEvidenceFingerprint(value: string): string {
+  const normalized = value.replace(/\r\n/g, '\n').replace(/[\t ]+/g, ' ').trim();
+  let hash = 2166136261;
+  for (let index = 0; index < normalized.length; index++) {
+    hash ^= normalized.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${normalized.length}:${(hash >>> 0).toString(16)}`;
+}
+
+const CONTINUE_MESSAGE = /^(?:(?:please\s+)?(?:continue|keep\s+going|go\s+on|carry\s+on|resume|pick\s+up\s+where\s+you\s+left\s+off|where\s+were\s+you|you\s+stopped|don'?t\s+stop)(?:\s+(?:please|now|again|the\s+answer|the\s+task|from\s+where\s+you\s+(?:stopped|left\s+off)))?|(?:please\s+)?(?:finish|complete)\s+(?:it|that|the\s+answer|the\s+task))[\s.!?]*$/i;
+
+function isContinuationMessage(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return CONTINUE_MESSAGE.test(normalized);
+}
+
+interface ModelContextInfo {
+  catalog: CatalogModel | undefined;
+  registry: ModelInfo | undefined;
+  limit: number;
+  reserved: number;
+  profile: ContextProfile;
+  supportsReasoning: boolean;
+  local: boolean;
+}
 
 function newSessionId(): string {
   return `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
@@ -370,8 +421,8 @@ export class SessionController {
   private readonly checkpoints: CheckpointManager;
   private readonly fileSnapshots: FileSnapshotStore;
   private semanticIndex: SemanticIndex | undefined;
+  private embedWorker: EmbedWorkerClient | undefined;
   private readonly codebaseIndex: CodebaseIndex;
-  private localEmbedder: LocalEmbedder | undefined;
   private browser: BrowserSession | undefined;
   private selection: SelectionContext | null = null;
   private connectionError: string | undefined;
@@ -435,6 +486,9 @@ export class SessionController {
     lastHeartbeatAt: Date.now(),
   };
   private routeLog: TaskRouteEvent[] = [];
+  private lastAnswer: LastAnswerState | undefined;
+  private continuation: ContinuationState | undefined;
+  private sessionMemoryCard: SessionMemoryCard = { decisions: [], touchedFiles: [], blockers: [], updatedAt: Date.now() };
   private recoveryRun: RunRecord | undefined;
   private recoveryDrift = false;
   private stepHashChain: Promise<void> = Promise.resolve();
@@ -452,15 +506,22 @@ export class SessionController {
   private knowledgeRefresh: Promise<void> | null = null;
   private rulesBaseCache: { projectRules: string | undefined; memory: string } | null = null;
   private toolRegistryCache: { planner: ToolDef[]; executor: ToolDef[]; lazyExecutor: ToolDef[] } | null = null;
+  private toolRegistryCacheKey: string | null = null;
   private plannerToolCache: ToolDef[] | null = null;
+  private plannerToolCacheTier: string | null = null;
   private questionToolCache: ToolDef[] | null = null;
+  private scannerToolbox: { key: string; toolbox: ToolBox } | undefined;
   private preparedProvider: { key: string; provider: LLMProvider } | undefined;
+  private enhanceAbort: AbortController | undefined;
+  private enhanceRequestId = 0;
   private lastWarmupAt = 0;
   private warmupInFlight = false;
   private warmupPromise: Promise<void> | null = null;
   private taskWatchdog?: ReturnType<typeof setInterval>;
   private taskWatchdogLastActivity = 0;
   private taskWatchdogTriggered = false;
+  private answerWatchdog?: ReturnType<typeof setInterval>;
+  private answerWatchdogLastActivity = 0;
 
   private beginTaskWatchdog(): void {
     this.endTaskWatchdog();
@@ -478,6 +539,7 @@ export class SessionController {
       }
       this.taskWatchdogTriggered = true;
       this.taskState = { ...this.taskState, state: 'stalled', lastHeartbeatAt: Date.now(), blockers: ['No provider or tool activity within the recovery window.'] };
+      this.setContinuation('task', this.taskState.taskId, 'paused');
       void this.persistNow();
       this.addNotice('Task stopped after prolonged inactivity. Completed work was preserved; you can ask a new question or continue.');
       this.abortController.abort();
@@ -499,19 +561,50 @@ export class SessionController {
     }
   }
 
+  private beginAnswerWatchdog(controller: AbortController): void {
+    this.endAnswerWatchdog();
+    this.answerWatchdogLastActivity = Date.now();
+    const inactivityWindowMs = 120_000;
+    this.answerWatchdog = setInterval(() => {
+      if (Date.now() - this.answerWatchdogLastActivity < inactivityWindowMs) {
+        return;
+      }
+      this.setStage('ANSWER — timed out; stopping…');
+      controller.abort();
+      this.addNotice('Answer stopped after prolonged inactivity. Ask “continue” to resume it.');
+      this.endAnswerWatchdog();
+    }, 5_000);
+  }
+
+  private touchAnswerWatchdog(): void {
+    if (this.answerWatchdog) {
+      this.answerWatchdogLastActivity = Date.now();
+    }
+  }
+
+  private endAnswerWatchdog(): void {
+    if (this.answerWatchdog) {
+      clearInterval(this.answerWatchdog);
+      this.answerWatchdog = undefined;
+    }
+  }
+
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly post: (message: HostMessage) => void,
     private readonly diffManager: DiffManager,
   ) {
+    const projectRoot = workspaceRoot() ?? process.cwd();
+    const projectStorage = (...segments: string[]): string =>
+      workspaceStoragePath(context.globalStorageUri.fsPath, projectRoot, ...segments);
     this.checkpoints = new CheckpointManager(
-      workspaceRoot() ?? process.cwd(),
-      path.join(context.globalStorageUri.fsPath, 'checkpoints'),
+      projectRoot,
+      projectStorage('checkpoints'),
     );
-    this.fileSnapshots = new FileSnapshotStore(path.join(context.globalStorageUri.fsPath, 'file-snapshots'));
+    this.fileSnapshots = new FileSnapshotStore(projectStorage('file-snapshots'));
     this.codebaseIndex = new CodebaseIndex({
-      root: workspaceRoot() ?? process.cwd(),
-      storageFile: path.join(context.globalStorageUri.fsPath, 'codebase-index.json'),
+      root: projectRoot,
+      storageFile: projectStorage('codebase-index.json'),
       maxFiles: getConfig().codebaseIndexMaxFiles,
       onProgress: (message) => {
         // Background indexing must never create an empty assistant row. Only
@@ -521,12 +614,12 @@ export class SessionController {
     });
     this.registry = new ModelRegistry(path.join(context.globalStorageUri.fsPath, 'models-cache.json'));
     this.connections = new ConnectionsStore(context.globalState);
-    this.memory = new MemoryStore(workspaceRoot() ?? process.cwd(), context.globalStorageUri.fsPath);
-    this.background = new BackgroundProcesses(workspaceRoot() ?? process.cwd());
+    this.memory = new MemoryStore(projectRoot, context.globalStorageUri.fsPath);
+    this.background = new BackgroundProcesses(projectRoot);
     this.background.onChange(() => this.refreshRunProcesses());
-    this.store = new SessionStore(path.join(context.globalStorageUri.fsPath, 'sessions'));
-    this.runJournal = new RunJournalStore(path.join(context.globalStorageUri.fsPath, 'runs'));
-    this.eventLedger = new EventLedger(path.join(context.globalStorageUri.fsPath, 'event-ledger'), this.sessionId);
+    this.store = new SessionStore(projectStorage('sessions'));
+    this.runJournal = new RunJournalStore(projectStorage('runs'));
+    this.eventLedger = new EventLedger(projectStorage('event-ledger'), this.sessionId);
     // Gate inbound messages on session restore so a late restore can never
     // overwrite a message the developer already sent after activation.
     this.sessionReady = this.initializeSession().catch(() => undefined);
@@ -756,6 +849,9 @@ export class SessionController {
     this.planVersion = stored.planVersion ?? 0;
     this.approvalMemory.clear();
     this.externalDirectories.clear();
+    this.scannerToolbox = undefined;
+    this.lastAnswer = stored.lastAnswer;
+    this.continuation = stored.continuation;
     this.lastRequest = stored.lastRequest ?? '';
     this.contextTokens = stored.contextTokens ?? 0;
     this.lastExactUsage = undefined;
@@ -792,6 +888,7 @@ export class SessionController {
       blockers: [],
       lastHeartbeatAt: Date.now(),
     };
+    this.sessionMemoryCard = stored.memoryCard ?? this.buildSessionMemoryCard();
     this.routeLog = Array.isArray(stored.routeLog) ? stored.routeLog.slice(-100) : [];
     this.currentRun = undefined;
     this.sessionPending = normalizeStoredPending(stored.pending);
@@ -816,7 +913,9 @@ export class SessionController {
     if (!plan) {
       return null;
     }
-    if (plan.status === 'draft' || this.phase === 'executing') {
+    // Drafts still need approval. Approved plans are kept so an interrupted
+    // run can be resumed after a restart instead of being silently dropped.
+    if (plan.status === 'draft' || plan.status === 'approved' || this.phase === 'executing') {
       return plan;
     }
     return null;
@@ -838,6 +937,9 @@ export class SessionController {
       contextTokens: this.contextTokens,
       queued: this.queuedRecords(),
       taskState: this.taskState,
+      lastAnswer: this.lastAnswer,
+      ...(this.continuation ? { continuation: this.continuation } : {}),
+      memoryCard: this.buildSessionMemoryCard(),
       routeLog: this.routeLog.slice(-100),
       ...(this.sessionPending ? { pending: this.sessionPending } : {}),
     };
@@ -855,7 +957,7 @@ export class SessionController {
     if (id === this.sessionId) {
       return;
     }
-    if (this.phase === 'planning' || this.phase === 'executing') {
+    if (isActivePhase(this.phase)) {
       this.addNotice('Stop the current task before switching sessions.');
       return;
     }
@@ -916,6 +1018,9 @@ export class SessionController {
     this.planningState = { status: 'idle', planVersion: 0, updatedAt: Date.now() };
     this.todos = [];
     this.planVersion = 0;
+    this.lastAnswer = undefined;
+    this.continuation = undefined;
+    this.sessionMemoryCard = { decisions: [], touchedFiles: [], blockers: [], updatedAt: Date.now() };
     this.lastRequest = '';
     this.lastUserMessageId = undefined;
     this.lastCheckpointId = undefined;
@@ -989,6 +1094,7 @@ export class SessionController {
     }
     await this.migrateActiveConnection();
     this.post({ type: 'connection', connection: this.buildConnectionState() });
+    void this.primeActiveProvider();
   }
 
   private async migrateActiveConnection(): Promise<void> {
@@ -1078,6 +1184,8 @@ export class SessionController {
       preset: preset.id,
       updatedAt: readLiveModelsUpdatedAt(this.context.globalState, preset.id),
     });
+    this.preparedProvider = undefined;
+    await this.primeActiveProvider();
     this.post({ type: 'connection', connection: this.buildConnectionState() });
     this.pushState();
   }
@@ -1193,6 +1301,8 @@ export class SessionController {
       .update('model', trimmed, vscode.ConfigurationTarget.Global);
     await this.migrateActiveConnection();
     this.connectionError = undefined;
+    this.preparedProvider = undefined;
+    await this.primeActiveProvider();
     this.post({ type: 'connection', connection: this.buildConnectionState() });
     this.pushState();
   }
@@ -1225,6 +1335,8 @@ export class SessionController {
     await settings.update('model', model, vscode.ConfigurationTarget.Global);
     this.keyPresent = Boolean(await getApiKeyForPreset(this.context, preset));
     this.connectionError = undefined;
+    this.preparedProvider = undefined;
+    await this.primeActiveProvider();
     this.removeConnectionNotice();
     this.post({ type: 'connection', connection: this.buildConnectionState() });
     this.pushState();
@@ -1237,6 +1349,7 @@ export class SessionController {
       .update('model', '', vscode.ConfigurationTarget.Global);
     this.keyPresent = false;
     this.connectionError = undefined;
+    this.preparedProvider = undefined;
     this.post({ type: 'connection', connection: this.buildConnectionState() });
     this.pushState();
   }
@@ -1265,6 +1378,8 @@ export class SessionController {
     }
     this.keyPresent = Boolean(apiKey);
     this.connectionError = undefined;
+    this.preparedProvider = undefined;
+    await this.primeActiveProvider();
     this.removeConnectionNotice();
     this.post({ type: 'connection', connection: this.buildConnectionState() });
     this.pushState();
@@ -1523,6 +1638,7 @@ export class SessionController {
   stop(): void {
     this.cancelPendingApprovals();
     this.cancelPendingQuestion();
+    this.endAnswerWatchdog();
     this.abortController?.abort();
     if (this.currentRun && (this.currentRun.status === 'executing' || this.currentRun.status === 'waiting')) {
       this.currentRun.pending = undefined;
@@ -1728,7 +1844,7 @@ export class SessionController {
   }
 
   private async compactNow(): Promise<void> {
-    if (this.phase === 'planning' || this.phase === 'executing') {
+    if (isActivePhase(this.phase)) {
       this.addNotice('Cannot compact while a task is running.');
       return;
     }
@@ -1771,7 +1887,12 @@ export class SessionController {
     }
   }
 
-  private async compressContext(focus?: string): Promise<string> {
+  private async compressContext(
+    focus?: string,
+    context: ModelContextInfo = this.mainModelContext(),
+    activeProvider?: LLMProvider,
+    activeModel?: string,
+  ): Promise<string> {
     if (this.compressionsThisTurn >= 1) {
       return 'Error: compress_context can be called at most once per turn.';
     }
@@ -1779,22 +1900,21 @@ export class SessionController {
     const active = this.compressionBlocks.filter((block) => block.active);
     const last = active.length > 0 ? active[active.length - 1] : undefined;
     const startIndex = last ? last.endIndex : 0;
-    const profile = this.buildContextProfile();
-    const preserve = preserveBudgetTokens(profile, this.effectiveContextLimit(), this.profileSupportsReasoning());
+    const preserve = preserveBudgetTokens(context.profile, context.limit, context.supportsReasoning);
     const recentStart = chooseRecentStart(this.conversation, preserve, ADAPTIVE_RECENT_FLOOR);
     const endIndex = Math.min(recentStart, this.conversation.length);
     const foldable = endIndex - startIndex;
     if (foldable < MIN_COMPRESS_MESSAGES) {
       return `Error: only ${foldable} earlier message${foldable === 1 ? '' : 's'} can be folded; at least ${MIN_COMPRESS_MESSAGES} are needed. Finish more of the earlier work first.`;
     }
-    const provider = await this.buildProvider();
+    const provider = activeProvider ?? await this.buildProvider();
     if (!provider) {
       return 'Error: no provider is available for context compression.';
     }
     try {
       const summary = await summarizeMessages(
         provider,
-        getConfig().model,
+        activeModel ?? getConfig().model,
         this.conversation.slice(startIndex, endIndex),
         this.abortController?.signal ?? new AbortController().signal,
         focus,
@@ -1831,14 +1951,23 @@ export class SessionController {
     }
   }
 
-  private async preparePlannerConversation(provider: LLMProvider, model = getConfig().model, local = false): Promise<ChatMessage[]> {
+  private async preparePlannerConversation(
+    provider: LLMProvider,
+    context: ModelContextInfo,
+    model = getConfig().model,
+    local = false,
+  ): Promise<ChatMessage[]> {
     const pendingDecisionIds = this.sessionPending ? [this.sessionPending.id] : this.currentRun?.pending ? [this.currentRun.pending.id] : [];
-    const bootstrap = await projectBootstrap(workspaceRoot() ?? process.cwd());
-    const codebaseEvidence = await this.codebaseEvidenceForRequest(
-      this.lastRequest ?? '',
-      this.buildContextProfile().tier === 'compact' ? 4 : 6,
-    );
-    const evidence = [buildTaskEvidencePack(this.context.globalState, this.lastRequest ?? '', 3600, workspaceRoot()), codebaseEvidence]
+    const root = workspaceRoot() ?? process.cwd();
+    const taskEvidence = buildTaskEvidencePack(this.context.globalState, this.lastRequest ?? '', 3600, root);
+    const [bootstrap, codebaseEvidence] = await Promise.all([
+      projectBootstrap(root),
+      this.codebaseEvidenceForRequest(
+        this.lastRequest ?? '',
+        context.profile.tier === 'compact' ? 4 : 6,
+      ),
+    ]);
+    const evidence = [taskEvidence, codebaseEvidence]
       .filter((entry): entry is string => Boolean(entry))
       .join('\n\n') || undefined;
     const fingerprint = sha1Of(JSON.stringify({
@@ -1850,8 +1979,8 @@ export class SessionController {
       pendingDecisionIds,
       planVersion: this.planVersion,
       completedRunBoundary: this.completedRunBoundary,
-      profile: this.buildContextProfile().tier,
-      contextLimit: this.effectiveContextLimit(),
+      profile: context.profile.tier,
+      contextLimit: context.limit,
       diagnosticsSummary: this.diagnosticsSummary,
       changedFiles: this.currentRun?.changedFiles,
       evidence,
@@ -1867,26 +1996,31 @@ export class SessionController {
       archived: this.archivedConversation,
       archivedContextIndex: this.archivedContextIndex,
       pendingDecisionIds,
-      budget: relevanceBudget(this.buildContextProfile().tier),
+      budget: relevanceBudget(context.profile.tier),
       pinned: this.buildPinnedContext(),
       completedRunBoundary: this.completedRunBoundary,
       evidence,
       bootstrap,
     });
     this.completedRunBoundary = false;
-    const messages = await this.maybeCompactPlanner(request.messages, provider, model, local);
+    const messages = await this.maybeCompactPlanner(request.messages, provider, context, model, local);
     this.plannerConversationCache = { fingerprint, messages };
     return messages.map((message) => ({ ...message }));
   }
 
-  private async maybeCompactPlanner(messages: ChatMessage[], provider: LLMProvider, model = getConfig().model, local = false): Promise<ChatMessage[]> {
+  private async maybeCompactPlanner(
+    messages: ChatMessage[],
+    provider: LLMProvider,
+    context: ModelContextInfo,
+    model = getConfig().model,
+    local = false,
+  ): Promise<ChatMessage[]> {
     if (!getConfig().autoCompact) {
       return messages;
     }
-    const profile = this.buildContextProfile();
-    const check = checkCompaction(messages, this.effectiveContextLimit(), {
-      profile,
-      reasoning: this.profileSupportsReasoning(),
+    const check = checkCompaction(messages, context.limit, {
+      profile: context.profile,
+      reasoning: context.supportsReasoning,
     });
     if (!check.needed || check.recentStart <= 2) {
       return messages;
@@ -1900,7 +2034,7 @@ export class SessionController {
     // Trim-first: planning usually only needs the pinned head plus the recent
     // window, so drop the stale middle without paying for a summarize call.
     const trimmed = [...messages.slice(0, 2), ...messages.slice(check.recentStart)];
-    const threshold = check.threshold ?? this.effectiveContextLimit() * 0.6;
+    const threshold = check.threshold ?? context.limit * 0.6;
     if (estimateTokens(trimmed) <= threshold) {
       return trimmed;
     }
@@ -1908,7 +2042,7 @@ export class SessionController {
     // planner on the same model and delays the first useful response. The
     // deterministic checkpoint keeps the important head and recent request
     // without another model round trip.
-    if (local || this.buildContextProfile().tier === 'compact') {
+    if (local || context.profile.tier === 'compact') {
       return buildDeterministicCheckpoint(messages, check.recentStart);
     }
     try {
@@ -1935,7 +2069,9 @@ export class SessionController {
       : this.lastRequest;
     const pending = this.sessionPending ?? this.currentRun?.pending;
     const changedFiles = (this.currentRun?.changedFiles ?? []).map((file) => file.path);
-    const ledger = this.eventLedger.condensed(1800);
+    const includeLedger = Boolean(this.currentRun || (this.plan && this.plan.status !== 'completed'));
+    const ledger = includeLedger ? this.eventLedger.condensed(1800) : undefined;
+    const card = this.currentMemoryCard();
     return {
       latestUserMessage: latestText,
       ...(this.plan
@@ -1957,9 +2093,73 @@ export class SessionController {
         nextSteps: this.taskState.nextSteps,
         blockers: this.taskState.blockers,
       },
+      ...(this.memoryCardIsRelevant(latestText) ? { memoryCard: card } : {}),
       ...(ledger ? { ledger } : {}),
       ...(this.diagnosticsSummary ? { diagnosticsSummary: this.diagnosticsSummary } : {}),
     };
+  }
+
+  /** Keep direct answers focused: carry the durable card only when the new
+   * question is connected to the active work. Unrelated questions get the
+   * normal conversation/evidence projection without old task baggage. */
+  private buildQuestionPinnedContext(question: string): PinnedPlannerContext | undefined {
+    if (!this.memoryCardIsRelevant(question)) {
+      return undefined;
+    }
+    return {
+      latestUserMessage: question,
+      changedFiles: [],
+      memoryCard: this.currentMemoryCard(),
+    };
+  }
+
+  /** Merge the persisted card with current state so a restored session keeps
+   * files and answer context that cannot be reconstructed from live fields. */
+  private currentMemoryCard(): SessionMemoryCard {
+    const fresh = this.buildSessionMemoryCard();
+    const stored = this.sessionMemoryCard;
+    if (!stored) {
+      return fresh;
+    }
+    // A completed task's files and answer tail are history, not memory for an
+    // unrelated new request. Only fall back to them while work is unfinished.
+    const canFallback = Boolean(this.continuation && this.continuation.status !== 'complete');
+    return {
+      goal: fresh.goal || stored.goal,
+      decisions: fresh.decisions.length > 0 ? fresh.decisions : stored.decisions,
+      touchedFiles: fresh.touchedFiles.length > 0
+        ? fresh.touchedFiles
+        : canFallback ? stored.touchedFiles : [],
+      blockers: fresh.blockers.length > 0 ? fresh.blockers : stored.blockers,
+      completedStep: fresh.completedStep ?? stored.completedStep,
+      nextStep: fresh.nextStep ?? stored.nextStep,
+      answerTail: fresh.answerTail ?? (canFallback ? stored.answerTail : undefined),
+      updatedAt: Math.max(fresh.updatedAt, stored.updatedAt),
+    };
+  }
+
+  private memoryCardIsRelevant(text?: string): boolean {
+    if (isActivePhase(this.phase)) return true;
+    if (this.currentRun && this.currentRun.status !== 'completed') return true;
+    if (this.plan && this.plan.status !== 'completed') return true;
+    if (['planning', 'awaiting_approval', 'executing', 'verifying', 'stalled'].includes(this.taskState.state)) {
+      return true;
+    }
+    if (this.continuation && this.continuation.status !== 'complete') return true;
+    if (!text) return false;
+    const card = this.currentMemoryCard();
+    const memoryText = [
+      card.goal,
+      ...card.decisions,
+      ...card.touchedFiles,
+      ...card.blockers,
+      card.completedStep,
+      card.nextStep,
+      card.answerTail,
+    ].filter(Boolean).join(' ').toLowerCase();
+    if (!memoryText.trim()) return false;
+    const terms = text.toLowerCase().match(/[a-z0-9_./-]{3,}/g) ?? [];
+    return terms.some((term) => memoryText.includes(term));
   }
 
   /** Prepare a summary while idle. It never runs for compact profiles and
@@ -2019,7 +2219,7 @@ export class SessionController {
   }
 
   private async editMessage(id: string, text: string, restoreWorkspace: boolean): Promise<void> {
-    if (this.phase === 'planning' || this.phase === 'executing') {
+    if (isActivePhase(this.phase)) {
       this.addNotice('Cannot edit messages while a task is running.');
       return;
     }
@@ -2078,6 +2278,7 @@ export class SessionController {
       return;
     }
     this.disposed = true;
+    this.embedWorker?.stop();
     this.stop();
     clearTimeout(this.persistTimer);
     void this.store.save(this.snapshotSession(), this.contextIndex).catch(() => undefined);
@@ -2116,7 +2317,7 @@ export class SessionController {
   }
 
   async explainCodebase(): Promise<void> {
-    if (this.phase === 'planning' || this.phase === 'executing') {
+    if (isActivePhase(this.phase)) {
       this.addNotice('Wait for the current task to finish before asking for an explanation.');
       return;
     }
@@ -2139,9 +2340,8 @@ export class SessionController {
     }
     const prompt = buildExplainCodebasePrompt(topic.trim(), files);
     try {
-      let text = '';
       let retried = false;
-      for await (const event of chatWithRetry(
+      const text = await this.collectTextWithContinuation(
         provider,
         [
           { role: 'system', content: prompt.system },
@@ -2149,9 +2349,9 @@ export class SessionController {
         ],
         {
           model: getConfig().model,
-          maxTokens: 2500,
           temperature: 0.2,
           signal: new AbortController().signal,
+          contextTokens: this.effectiveContextLimit(),
         },
         {
           retryOnEmpty: true,
@@ -2160,11 +2360,7 @@ export class SessionController {
             this.setStatus('retry', `Retrying attempt ${attempt}…`);
           },
         },
-      )) {
-        if (event.type === 'text') {
-          text += event.text;
-        }
-      }
+      );
       if (retried) {
         this.setStatus('retry', '', undefined, true);
       }
@@ -2279,7 +2475,7 @@ export class SessionController {
   private async runReview(
     build: (files: ReviewFileDiff[]) => { system: string; user: string },
   ): Promise<void> {
-    if (this.phase === 'planning' || this.phase === 'executing') {
+    if (isActivePhase(this.phase)) {
       this.addNotice('Wait for the current task to finish before running a review.');
       return;
     }
@@ -2296,15 +2492,14 @@ export class SessionController {
     }
     const prompt = build(files);
     try {
-      let text = '';
       let retried = false;
-      for await (const event of chatWithRetry(
+      const text = await this.collectTextWithContinuation(
         provider,
         [
           { role: 'system', content: prompt.system },
           { role: 'user', content: prompt.user },
         ],
-        { model: getConfig().model, maxTokens: 1500, temperature: 0.2, signal: new AbortController().signal },
+        { model: getConfig().model, temperature: 0.2, signal: new AbortController().signal, contextTokens: this.effectiveContextLimit() },
         {
           retryOnEmpty: true,
           onRetry: (attempt) => {
@@ -2312,11 +2507,7 @@ export class SessionController {
             this.setStatus('retry', `Retrying attempt ${attempt}…`);
           },
         },
-      )) {
-        if (event.type === 'text') {
-          text += event.text;
-        }
-      }
+      );
       if (retried) {
         this.setStatus('retry', '', undefined, true);
       }
@@ -2353,27 +2544,40 @@ export class SessionController {
     const index = this.getSemanticIndex();
     if (!index) {
       void vscode.window.showInformationMessage(
-        'Dev-First: enable devFirst.semanticIndex and use an embeddings-capable provider first.',
+        'Dev-First: enable devFirst.semanticIndex first.',
       );
       return;
     }
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: 'Dev-First: building semantic index…' },
-      async () => {
-        await index.ensureIndexed();
-      },
-    );
-    const stats = index.stats();
-    void vscode.window.showInformationMessage(
-      `Dev-First: index ready — ${stats.files} files, ${stats.chunks} chunks.`,
-    );
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Dev-First: building semantic index…' },
+        async () => {
+          await index.ensureIndexed();
+        },
+      );
+      const stats = index.stats();
+      void vscode.window.showInformationMessage(
+        `Dev-First: index ready — ${stats.files} files, ${stats.chunks} chunks.`,
+      );
+    } catch (error) {
+      void vscode.window.showWarningMessage(
+        `Dev-First: semantic index unavailable — ${errorMessage(error)}. Lexical search remains available.`,
+      );
+    }
   }
 
   async clearSemanticIndex(): Promise<void> {
     const index = this.getSemanticIndex();
     index?.clear();
     await fs
-      .rm(path.join(this.context.globalStorageUri.fsPath, 'semantic-index.json'), { force: true })
+      .rm(
+        workspaceStoragePath(
+          this.context.globalStorageUri.fsPath,
+          workspaceRoot() ?? process.cwd(),
+          'semantic-index.json',
+        ),
+        { force: true },
+      )
       .catch(() => undefined);
     void vscode.window.showInformationMessage('Dev-First: semantic index cleared.');
   }
@@ -2389,6 +2593,7 @@ export class SessionController {
   async reloadMcp(): Promise<void> {
     this.mcp.dispose();
     this.toolRegistryCache = null;
+    this.toolRegistryCacheKey = null;
     await this.mcp.ensureLoaded(workspaceRoot());
   }
 
@@ -2405,7 +2610,29 @@ export class SessionController {
   }
 
   readOnlyToolExecutor(): ((call: ToolCall) => Promise<string>) | undefined {
-    return (call) => this.executePlannerTool(call);
+    return (call) => this.executePlannerToolOn(this.scannerReadOnlyToolbox(), call);
+  }
+
+  private scannerToolboxKey(): string {
+    const config = getConfig();
+    return [
+      workspaceRoot() ?? process.cwd(),
+      config.preset,
+      config.model,
+      config.baseUrl,
+      config.semanticIndex ? 'semantic' : 'lexical',
+      config.memory ? 'memory' : 'no-memory',
+    ].join('|');
+  }
+
+  /** Reuse the read-only toolbox for one scanner run instead of rebuilding all
+   * tool handlers and their caches for every file/search call. */
+  private scannerReadOnlyToolbox(): ToolBox {
+    const key = this.scannerToolboxKey();
+    if (!this.scannerToolbox || this.scannerToolbox.key !== key) {
+      this.scannerToolbox = { key, toolbox: this.buildToolbox(false, 'full') };
+    }
+    return this.scannerToolbox.toolbox;
   }
 
   private async handleSend(
@@ -2435,31 +2662,91 @@ export class SessionController {
       this.setStage('Thinking…');
     }
     const materialized = await this.savePastesToFiles(text, pastes, root);
+    const activePhase = isActivePhase(this.phase);
     const fastAcknowledgement = !this.plan
-      && this.phase !== 'planning'
-      && this.phase !== 'executing'
+      && !activePhase
       && /^(?:ok|okay|thanks|thank you|got it|cool|nice|great|sounds good)[.!]?$/i.test(materialized.trim());
     let route = fastAcknowledgement
       ? 'acknowledgement'
       : classifyIncomingMessage(
         materialized,
         this.taskState,
-        this.phase === 'planning' || this.phase === 'executing',
+        activePhase,
       );
     let routeResponse: string | undefined = fastAcknowledgement ? 'Got it.' : undefined;
     let provisionalMode: PlanningMode | undefined;
+    let answerCoverage: string[] | undefined;
     const messageId = submittedMessage.id;
     const stateBefore = this.taskState.state;
+    const continuationTarget = this.resolveContinuationTarget(materialized);
+    if (continuationTarget && continuationTarget.kind !== 'answer') {
+      // A resumable task/plan must beat the generic route probe. This prevents
+      // an unfinished run from being mistaken for a brand-new task.
+      route = 'continue-task';
+    }
+    // An answer already owns the provider and stream. Queue a new message
+    // immediately instead of launching a second classifier/provider request
+    // against the same session; it will be routed after the answer settles.
+    if (this.phase === 'answering') {
+      this.queuedMessages.push({
+        id: submittedMessage.id,
+        text: materialized,
+        selection,
+        quote,
+        images: cappedImages,
+        pastes,
+        createdAt: Date.now(),
+      });
+      submittedMessage.queued = true;
+      submittedMessage.pastes = pastes;
+      this.post({ type: 'addMessage', message: submittedMessage });
+      this.recordRoute(messageId, 'follow-up', stateBefore);
+      this.persist();
+      return;
+    }
     // Preflight every non-trivial message before planner preparation. The
     // model decides the semantic route; the local result is only a failure
     // fallback. Exact idle acknowledgements skip the extra model call.
     const provider = fastAcknowledgement ? undefined : await this.buildProvider();
-    if (provider) {
+    const idleOrReview = this.phase === 'idle' || this.phase === 'review';
+    if (provider && idleOrReview && continuationTarget?.kind === 'answer' && this.shouldResumeLastAnswer(materialized)) {
+      const resumeState = this.answerStateForContinuation(continuationTarget);
+      const outcome = await this.answerQuestionDirectly(
+        provider,
+        materialized,
+        submittedMessage,
+        cappedImages,
+        selection,
+        quote,
+        resumeState,
+      );
+      this.recordRoute(messageId, 'continue-task', stateBefore);
+      if (!outcome.answered) {
+        this.addNotice(outcome.notice ?? 'The model returned no continuation. Try asking for the next section directly.');
+      }
+      return;
+    }
+    if (provider && !continuationTarget) {
       const config = getConfig();
-      const decision = await classifyMessageRoute(provider, config.model, materialized, this.taskState, this.plan);
+      const decision = await classifyMessageRoute(
+        provider,
+        config.model,
+        materialized,
+        this.taskState,
+        this.plan,
+        undefined,
+        this.effectiveContextLimit(),
+        {
+          ...(this.continuation ? { continuationKind: this.continuation.kind, continuationStatus: this.continuation.status } : {}),
+          ...(this.lastAnswer ? { lastAnswerStatus: this.lastAnswer.status, lastAnswerQuestion: this.lastAnswer.question } : {}),
+        },
+      );
       if (decision) {
         route = decision.route;
         routeResponse = decision.response;
+        answerCoverage = decision.route === 'question' || decision.route === 'answer'
+          ? decision.answerCoverage
+          : undefined;
         if (decision.mode && (decision.route === 'new-task' || decision.route === 'refine-plan')) {
           provisionalMode = decision.mode;
         }
@@ -2469,6 +2756,18 @@ export class SessionController {
     }
     if (route === 'smalltalk' || route === 'acknowledgement') {
       const response = routeResponse || (route === 'acknowledgement' ? 'Got it.' : 'How can I help?');
+      if (ownsRouteStage) {
+        this.appendStreamingText(response);
+        this.endStreaming();
+      } else {
+        this.addAssistantMessage(response);
+      }
+      this.recordRoute(messageId, route, stateBefore);
+      return;
+    }
+    if (route === 'needs-clarification') {
+      const response = routeResponse
+        || 'I need one clarification before I can plan this safely: what should change, and where should it happen?';
       if (ownsRouteStage) {
         this.appendStreamingText(response);
         this.endStreaming();
@@ -2492,35 +2791,59 @@ export class SessionController {
     if (route === 'cancel-plan') {
       route = 'continue-task';
     }
-    if ((route === 'question' || route === 'answer') && provider && this.phase !== 'planning' && this.phase !== 'executing') {
+    if ((route === 'question' || route === 'answer') && provider && idleOrReview) {
       if (!root) {
         this.addNotice('Open a folder before asking a codebase question.');
         this.recordRoute(messageId, route, stateBefore);
         return;
       }
-      const answered = await this.answerQuestionDirectly(
+      const outcome = await this.answerQuestionDirectly(
         provider,
         materialized,
         submittedMessage,
         cappedImages,
         selection,
         quote,
+        undefined,
+        answerCoverage,
       );
       this.recordRoute(messageId, route, stateBefore);
-      if (!answered) {
-        this.addNotice('The question could not be answered. Try a more specific file, symbol, or topic.');
+      if (!outcome.answered) {
+        this.addNotice(outcome.notice ?? 'The model returned no answer. Try naming a specific file, symbol, or topic.');
       }
       return;
     }
     if (route === 'answer' || route === 'refine-plan') {
       // These are handled by the normal planner conversation when idle. While
       // execution is active, preserve them as follow-ups for the next turn.
-      route = this.phase === 'planning' || this.phase === 'executing' ? 'follow-up' : route;
+      route = isActivePhase(this.phase) ? 'follow-up' : route;
     }
     if (route === 'continue-task') {
-      route = this.phase === 'planning' || this.phase === 'executing' ? 'follow-up' : 'new-task';
+      const resumablePlan = this.plan;
+      if (isActivePhase(this.phase)) {
+        route = 'follow-up';
+      } else if (this.recoveryRun && resumablePlan && resumablePlan.status !== 'completed') {
+        this.recordRoute(messageId, 'continue-task', stateBefore);
+        await this.resumeRun(this.recoveryRun.id);
+        return;
+      } else if (resumablePlan?.status === 'approved') {
+        const resumeProvider = provider ?? await this.buildProvider();
+        if (!resumeProvider) {
+          this.addNotice('Cannot continue the approved plan because no model provider is available. Reconnect the model, then send “continue” again.');
+          this.recordRoute(messageId, 'continue-task', stateBefore);
+          return;
+        }
+        this.lastRequest = this.taskState.taskSummary || resumablePlan.title || materialized;
+        this.recordRoute(messageId, 'continue-task', stateBefore);
+        await this.startExecution(resumablePlan, resumeProvider, true);
+        return;
+      } else if (resumablePlan?.status === 'draft') {
+        route = 'refine-plan';
+      } else {
+        route = 'new-task';
+      }
     }
-    if (this.phase === 'planning' || this.phase === 'executing') {
+    if (isActivePhase(this.phase)) {
       this.queuedMessages.push({
         id: submittedMessage.id,
         text: materialized,
@@ -2579,6 +2902,7 @@ export class SessionController {
       blockers: [],
       lastHeartbeatAt: Date.now(),
     };
+    this.setContinuation('task', this.taskState.taskId, 'active');
     this.setPhase('planning');
     this.recordRoute(userMessage.id, route, stateBefore);
     this.beginTaskWatchdog();
@@ -2611,10 +2935,9 @@ export class SessionController {
       })();
       const preparationPromise = Promise.all([
         this.buildRules(root, text),
-        this.buildPlannerToolRegistry(),
         this.registry.load(),
       ]);
-      const [provider, llmText, [rules, plannerTools], plannerSelection] = await Promise.all([
+      const [provider, llmText, [rules], plannerSelection] = await Promise.all([
         providerPromise,
         requestContextPromise,
         preparationPromise,
@@ -2633,18 +2956,32 @@ export class SessionController {
       const plannerProvider = plannerSelection.provider;
       const plannerModel = plannerSelection.model;
       const preset = plannerSelection.preset;
-      const registryInfo = this.registry.lookup(preset.provider, plannerModel);
-      const catalogInfo = modelInfo(preset.id, plannerModel);
+      const plannerContext = this.modelContextInfo(preset.id, plannerModel, preset.provider);
+      const registryInfo = plannerContext.registry;
+      const catalogInfo = plannerContext.catalog;
       const family = promptFamilyFor(preset.provider, plannerModel);
 
       const plannerReasoningSupported =
-        Boolean(catalogInfo?.reasoning) || (registryInfo?.supportsReasoning ?? false) ||
+        plannerContext.supportsReasoning ||
         (this.selectedModelMetadata(preset.id, plannerModel, preset.provider).reasoningLevels?.length ?? 0) > 0;
+      const plannerCatalog = await this.buildPlannerToolRegistry(plannerContext.profile.tier);
+      const initialPlannerNames = new Set([
+        'inspect_file_context', 'bounded_investigation', 'verify_change',
+        'local_hybrid_search', 'find_and_read', 'find_symbol', 'document_symbols',
+        'read_file', 'skim_file', 'read_output', 'search_text', 'list_files', 'run_terminal_command',
+      ]);
+      const initialPlannerTools = plannerCatalog.filter((tool) => initialPlannerNames.has(tool.name));
+      const lazyPlannerTools = plannerCatalog.filter((tool) => !initialPlannerNames.has(tool.name));
+      const plannerTools = [
+        ...initialPlannerTools,
+        ...(lazyPlannerTools.length > 0 ? [loadToolsTool(lazyPlannerTools.map((tool) => tool.name))] : []),
+      ];
       const planningToolbox = this.buildToolbox(false, 'marker');
       this.activePlannerToolbox = planningToolbox;
       const planner = new PlannerService(plannerProvider, plannerModel, {
         maxSteps: this.plannerStepLimit(config, preset),
         tools: plannerTools,
+        lazyTools: lazyPlannerTools,
         rules,
         family,
         reasoning: this.plannerReasoningOptions(plannerReasoningSupported, preset.id, {
@@ -2655,7 +2992,7 @@ export class SessionController {
         }, plannerModel),
         resolveReasoning: (context) => this.plannerReasoningOptions(plannerReasoningSupported, preset.id, context, plannerModel),
         reasoningSwitch: this.reasoningSwitchEnabled(),
-        contextLimitTokens: this.effectiveContextLimit(),
+        contextLimitTokens: plannerContext.limit,
         workspaceRoot: root,
         questionMode,
         planningMode: this.plan?.status === 'draft' ? (this.plan.planningMode ?? provisionalMode) : provisionalMode,
@@ -2664,7 +3001,12 @@ export class SessionController {
       this.abortController = new AbortController();
       // Warmup is best-effort; never hold the first planner token behind it.
       void this.settleWarmup();
-      const plannerConversationPromise = this.preparePlannerConversation(plannerProvider, plannerModel, plannerSelection.preset.local);
+      const plannerConversationPromise = this.preparePlannerConversation(
+        plannerProvider,
+        plannerContext,
+        plannerModel,
+        preset.local,
+      );
       await plannerConversationPromise;
       this.setStage('PLANNING — processing code context…');
 
@@ -2675,14 +3017,19 @@ export class SessionController {
         this.planVersion + 1,
         {
           onTextDelta: (delta) => { this.touchTaskWatchdog(); this.appendStreamingText(delta); },
+          onTextRewind: (characters) => this.rewindStreamingText(characters),
           onReasoningDelta: (delta) => { this.touchTaskWatchdog(); this.appendStreamingReasoning(delta); },
+          onReasoningRewind: (characters) => this.rewindStreamingReasoning(characters),
           onStage: (stage) => { this.touchTaskWatchdog(); this.setStage(stage); },
           onToolActivity: (id, label, status, icon, meta) => { this.touchTaskWatchdog(); this.upsertActivity(id, label, status, icon, meta); },
-          executeTool: (call) => this.executePlannerToolOn(planningToolbox, call),
+          executeTool: (call) => this.executePlannerToolOn(planningToolbox, call, () => ({
+            usedTokens: this.contextTokens,
+            limitTokens: plannerContext.limit,
+          })),
           setReasoning: (level) => this.setRunReasoning(level),
           compressContext: async (focus) => {
             planningToolbox.resetReadCache();
-            return this.compressContext(focus);
+            return this.compressContext(focus, plannerContext, plannerProvider, plannerModel);
           },
           onNotice: (notice) => this.addNotice(notice),
           onStatus: (id, text, tone, done) => { this.touchTaskWatchdog(); this.setStatus(id, text, tone, done); },
@@ -2709,6 +3056,7 @@ export class SessionController {
         } else {
           this.planVersion += 1;
           this.plan = result.plan;
+          this.setContinuation('plan', `plan:${this.plan.version}`, 'paused');
           this.recordContextMetadata(planContextMetadata(result.plan));
           await this.savePlanFile(this.plan, this.lastRequest);
           this.post({ type: 'plan', plan: this.plan });
@@ -2736,6 +3084,8 @@ export class SessionController {
         }
         if (result.stopped === 'same-plan') {
           this.addNotice('The planner could not fill in the plan details. Try rephrasing or splitting the request.');
+        } else if (result.stopped === 'stream-loop') {
+          this.addNotice('Planning stopped after repeated streamed output. The distinct partial response is preserved.');
         } else if (result.exhausted) {
           this.addNotice('The planner stopped before producing a ready plan. Try rephrasing or splitting the request.');
         } else if (!result.text.trim()) {
@@ -2858,6 +3208,7 @@ export class SessionController {
         this.plan,
         this.lastRequest,
         new AbortController().signal,
+        this.effectiveContextLimit(),
       );
       this.post({ type: 'learnMoreResult', ...result });
     } catch (error) {
@@ -3039,20 +3390,13 @@ export class SessionController {
   private async startExecution(plan: Plan, provider: LLMProvider, approve: boolean): Promise<void> {
     const config = getConfig();
     const root = workspaceRoot() ?? process.cwd();
-    if (this.knowledgeRefresh) {
-      await this.knowledgeRefresh.catch(() => undefined);
-    }
+    // Knowledge mining is advisory. Never hold approved execution behind a
+    // scanner/convention refresh; it can continue in the background while the
+    // editor starts applying the approved plan.
     this.setStage('IMPLEMENTING — loading tools…');
     const rulesPromise = this.buildRules(root, this.lastRequest);
-    const registryPromise = this.buildToolRegistry();
     const registryLoadPromise = this.registry.load();
-    const editorSelectionPromise = this.resolveRoleSelection('editor', provider);
-    const [rules, registry, editorSelection] = await Promise.all([
-      rulesPromise,
-      registryPromise,
-      editorSelectionPromise,
-    ]);
-    await registryLoadPromise;
+    const editorSelection = await this.resolveRoleSelection('editor', provider);
     if (!editorSelection) {
       this.addError('The configured editor model is unavailable; execution stayed stopped and no files were changed.');
       return;
@@ -3060,9 +3404,15 @@ export class SessionController {
     const executionProvider = editorSelection.provider;
     const executionModel = editorSelection.model;
     const preset = editorSelection.preset;
+    const editorContext = this.modelContextInfo(preset.id, executionModel, preset.provider);
+    const [rules, registry] = await Promise.all([
+      rulesPromise,
+      this.buildToolRegistry(editorContext),
+    ]);
+    await registryLoadPromise;
     this.activeReasoningModel = { presetId: preset.id, model: executionModel };
-    const registryInfo = this.registry.lookup(preset.provider, executionModel);
-    const catalogInfo = modelInfo(preset.id, executionModel);
+    const registryInfo = editorContext.registry;
+    const catalogInfo = editorContext.catalog;
     const family = promptFamilyFor(preset.provider, executionModel);
     const executorReasoningSupported =
       Boolean(catalogInfo?.reasoning) || (registryInfo?.supportsReasoning ?? false) ||
@@ -3072,8 +3422,8 @@ export class SessionController {
       ? executorReasoning.effort ?? (executorReasoning.enabled ? 'on' : 'off')
       : undefined;
     const contextProfile = contextProfileFor({
-      contextWindow: this.effectiveContextLimit(),
-      maxOutput: this.reservedOutputTokens(),
+      contextWindow: editorContext.limit,
+      maxOutput: editorContext.reserved,
       supportsTools: registryInfo?.supportsTools ?? true,
       supportsReasoning: executorReasoningSupported,
       override: config.contextProfile,
@@ -3163,7 +3513,7 @@ export class SessionController {
       rules,
       family,
       autoCompact: config.autoCompact,
-      contextLimitTokens: this.effectiveContextLimit(),
+      contextLimitTokens: editorContext.limit,
       parallelTools: config.parallelTools,
       reasoning: executorReasoning,
       resolveReasoning: (context) => this.executionReasoningOptions(executorReasoningSupported, preset.id, context, executionModel),
@@ -3191,13 +3541,15 @@ export class SessionController {
     try {
       const result = await agent.run(plan, this.lastRequest, this.abortController.signal, {
         onTextDelta: (delta) => { this.touchTaskWatchdog(); this.appendStreamingText(delta); },
+        onTextRewind: (characters) => this.rewindStreamingText(characters),
         onReasoningDelta: (delta) => { this.touchTaskWatchdog(); this.appendStreamingReasoning(delta); },
+        onReasoningRewind: (characters) => this.rewindStreamingReasoning(characters),
         onToolActivity: (id, label, status, icon, meta) => { this.touchTaskWatchdog(); this.upsertActivity(id, label, status, icon, meta); },
         requestTerminalApproval: (command, cwd) => this.requestApproval(command, cwd),
         requestExternalDirectoryApproval: (directory) => this.requestExternalAccess(directory),
         askUser: (request) => this.requestUserAnswer(request),
         setReasoning: (level) => this.setRunReasoning(level),
-        compressContext: (focus) => this.compressContext(focus),
+        compressContext: (focus) => this.compressContext(focus, editorContext, executionProvider, executionModel),
         onNotice: (notice) => this.addNotice(notice),
         onStatus: (id, text, tone, done) => { this.touchTaskWatchdog(); this.setStatus(id, text, tone, done); },
         onUsage: (tokens) => { this.touchTaskWatchdog(); this.reportUsage(tokens); },
@@ -3223,7 +3575,7 @@ export class SessionController {
         const runId = this.diffManager.getCurrentRunId();
         this.addCompletionMessage(summaryText, planSnapshot, runId, runId ? this.diffManager.runFiles(runId) : [], !runStopped);
       }
-      if (result.reachedLimit) {
+      if (result.reachedLimit && config.maxSteps > 0) {
         this.addNotice(
           `Run ended incomplete — reached the step limit (${config.maxSteps}). Completed work is preserved. Review the changes, then send a message to continue.`,
         );
@@ -3323,13 +3675,18 @@ export class SessionController {
   }
 
   private invalidateDerivedCaches(): void {
+    this.preparedProvider = undefined;
+    void this.primeActiveProvider();
     // Model names and Ollama Modelfiles can keep the same identifier while
     // changing capabilities. Force the next capability lookup to refresh.
     resetOllamaCapabilityCache();
     this.rulesBaseCache = null;
     this.toolRegistryCache = null;
+    this.toolRegistryCacheKey = null;
     this.plannerToolCache = null;
+    this.plannerToolCacheTier = null;
     this.questionToolCache = null;
+    this.scannerToolbox = undefined;
     this.plannerConversationCache = null;
   }
 
@@ -3576,6 +3933,22 @@ export class SessionController {
     this.post({ type: 'reasoningDelta', id: message.id, text: delta });
   }
 
+  private rewindStreamingText(characters: number): void {
+    if (!this.streamingMessageId || characters <= 0) return;
+    const message = this.uiMessages.find((item) => item.id === this.streamingMessageId);
+    if (!message?.text) return;
+    message.text = message.text.slice(0, Math.max(0, message.text.length - characters));
+    this.post({ type: 'addMessage', message: { ...message } });
+  }
+
+  private rewindStreamingReasoning(characters: number): void {
+    if (!this.streamingMessageId || characters <= 0) return;
+    const message = this.uiMessages.find((item) => item.id === this.streamingMessageId);
+    if (!message?.reasoning) return;
+    message.reasoning = message.reasoning.slice(0, Math.max(0, message.reasoning.length - characters));
+    this.post({ type: 'addMessage', message: { ...message } });
+  }
+
   private async revertToCheckpoint(checkpointId: string): Promise<void> {
     const files = this.diffManager.getChangeSummaries().map((change) => ({
       path: change.path,
@@ -3600,13 +3973,16 @@ export class SessionController {
     this.post({ type: 'redoState', canRedo: false });
   }
 
-  private async buildToolRegistry(): Promise<{ planner: ToolDef[]; executor: ToolDef[]; lazyExecutor: ToolDef[] }> {
-    if (this.toolRegistryCache) {
+  private async buildToolRegistry(
+    context: ModelContextInfo,
+  ): Promise<{ planner: ToolDef[]; executor: ToolDef[]; lazyExecutor: ToolDef[] }> {
+    const cacheKey = `${context.profile.tier}:${context.local ? 'local' : 'remote'}`;
+    if (this.toolRegistryCache && this.toolRegistryCacheKey === cacheKey) {
       this.registerToolPreflights(this.toolRegistryCache.executor);
       this.registerToolPreflights(this.toolRegistryCache.lazyExecutor);
       return this.toolRegistryCache;
     }
-    const planner = await this.buildPlannerToolRegistry();
+    const planner = await this.buildPlannerToolRegistry(context.profile.tier);
     const root = workspaceRoot();
     const skills = await listSkills(root);
     const skillNames = skills.map((skill) => skill.name);
@@ -3618,15 +3994,15 @@ export class SessionController {
     const allExecutor = attachToolPreflights(
       executionTools({ skills: skillNames, semanticSearch, memory, mcpTools, reasoningSwitch, task: true }),
     );
-    const config = getConfig();
-    const compact = this.buildContextProfile().tier === 'compact' || Boolean((findPreset(config.preset) ?? PRESETS[0]).local);
+    const compact = context.profile.tier === 'compact' || context.local;
     const coreNames = new Set([
       'inspect_file_context', 'investigate_issue', 'bounded_investigation',
       'local_hybrid_search', 'find_and_read', 'find_symbol', 'document_symbols',
-      'find_references', 'read_file', 'search_text',
+      'find_references', 'read_file', 'skim_file', 'read_output', 'search_text',
       'fix_in_file', 'apply_change_set', 'fix_diagnostic',
       'run_terminal_command', 'todo_write', 'finish',
     ]);
+    if (semanticSearch) coreNames.add('semantic_search');
     const executor = compact
       ? allExecutor.filter((tool) => coreNames.has(tool.name)).map(compactExecutorToolView)
       : allExecutor;
@@ -3641,6 +4017,7 @@ export class SessionController {
       executor,
       lazyExecutor,
     };
+    this.toolRegistryCacheKey = cacheKey;
     this.registerToolPreflights(allExecutor);
     return this.toolRegistryCache;
   }
@@ -3649,48 +4026,53 @@ export class SessionController {
    * Build only the tools needed while deciding whether a request is a
    * question or a change. Executor/MCP tools stay lazy until execution.
    */
-  private async buildPlannerToolRegistry(): Promise<ToolDef[]> {
-    if (this.toolRegistryCache) return this.toolRegistryCache.planner;
-    if (this.plannerToolCache) return this.plannerToolCache;
+  private async buildPlannerToolRegistry(
+    _tier: ContextProfileTier = this.mainModelContext().profile.tier,
+  ): Promise<ToolDef[]> {
+    if (this.plannerToolCache && this.plannerToolCacheTier === _tier) {
+      return this.plannerToolCache;
+    }
     const root = workspaceRoot();
     const skills = await listSkills(root);
     const config = getConfig();
-    this.plannerToolCache = plannerTools({
+    const tools = plannerTools({
       skills: skills.map((skill) => skill.name),
       semanticSearch: config.semanticIndex,
       memory: config.memory,
     });
-    if (this.buildContextProfile().tier === 'compact') {
-      const compactNames = new Set([
-        'inspect_file_context', 'investigate_issue', 'bounded_investigation',
-        'verify_change', 'local_hybrid_search', 'find_and_read', 'read_file',
-        'list_files', 'search_text', 'find_symbol', 'document_symbols',
-        'find_references', 'go_to_definition', 'run_terminal_command',
-      ]);
-      this.plannerToolCache = this.plannerToolCache.filter((tool) => compactNames.has(tool.name));
-    }
-    return this.plannerToolCache;
+    // Keep the full safe catalog available for load_tools. The initial
+    // per-request schema set is selected at the planner call site; compact
+    // models therefore retain access to navigation, web, memory, and skills
+    // without paying their schema cost on every planner turn.
+    this.plannerToolCache = tools;
+    this.plannerToolCacheTier = _tier;
+    return tools;
   }
 
   private async buildQuestionToolRegistry(): Promise<ToolDef[]> {
     if (this.questionToolCache) return this.questionToolCache;
-    const compact = this.buildContextProfile().tier === 'compact';
-    const readOnly = new Set(compact
-      ? [
-        'local_hybrid_search', 'find_and_read', 'read_file', 'list_files', 'search_text',
-        'find_symbol', 'document_symbols', 'find_references', 'inspect_file_context',
-        'web_search',
-      ]
-      : [
-        'local_hybrid_search', 'find_and_read', 'read_file', 'list_files', 'search_text',
-        'semantic_search', 'find_symbol', 'document_symbols', 'find_references',
-        'go_to_definition', 'hover', 'go_to_implementation', 'incoming_calls',
-        'outgoing_calls', 'inspect_file_context', 'investigate_issue', 'bounded_investigation',
-        'web_fetch', 'web_search',
-      ]);
-    this.questionToolCache = (await this.buildPlannerToolRegistry())
-      .filter((tool) => readOnly.has(tool.name));
+    const config = getConfig();
+    // Keep the full read-only catalog available for progressive expansion, but
+    // do not send it on the first answer turn. The small-model path starts with
+    // index/search/navigation primitives and widens only when evidence needs it.
+    this.questionToolCache = readOnlyTools({
+      semanticSearch: config.semanticIndex,
+      memory: config.memory,
+    }).filter((tool) => !['list_processes', 'ask_user', 'use_skill'].includes(tool.name));
     return this.questionToolCache;
+  }
+
+  private questionToolsForTurn(all: ToolDef[], question: string, turn: number): ToolDef[] {
+    const core = new Set(['local_hybrid_search', 'find_and_read', 'read_file', 'skim_file', 'read_output', 'find_symbol', 'document_symbols']);
+    const navigation = new Set(['search_text', 'list_files', 'find_references', 'go_to_definition', 'go_to_implementation', 'incoming_calls', 'outgoing_calls', 'hover', 'inspect_file_context', 'memory_recall']);
+    const semantic = new Set(['semantic_search']);
+    const web = new Set(['web_fetch', 'web_search']);
+    const external = /\b(?:web|internet|online|documentation|docs|official|latest|current|api reference|changelog)\b/i.test(question);
+    const allowed = new Set<string>(core);
+    if (turn >= 1) navigation.forEach((name) => allowed.add(name));
+    if (turn >= 2 || external) semantic.forEach((name) => allowed.add(name));
+    if (external) web.forEach((name) => allowed.add(name));
+    return all.filter((tool) => allowed.has(tool.name));
   }
 
   private registerToolPreflights(executor: ToolDef[]): void {
@@ -3708,37 +4090,25 @@ export class SessionController {
       return undefined;
     }
     if (!this.semanticIndex) {
-      const embed =
-        config.embeddingsProvider === 'api'
-          ? async (texts: string[]) => {
-              const provider = await this.buildProvider();
-              if (!provider) {
-                throw new Error('No LLM provider configured for embeddings.');
-              }
-              return provider.embed(texts, getConfig().embeddingsModel);
-            }
-          : (texts: string[]) => this.getLocalEmbedder().embed(texts);
+      const workerPath = path.join(this.context.extensionUri.fsPath, 'dist', 'embedWorker.js');
+      const modelRoot = path.join(this.context.extensionUri.fsPath, 'resources', 'models');
+      this.embedWorker = new EmbedWorkerClient(workerPath, modelRoot);
+      const worker = this.embedWorker;
       this.semanticIndex = new SemanticIndex({
         root: workspaceRoot() ?? process.cwd(),
-        storageFile: path.join(this.context.globalStorageUri.fsPath, 'semantic-index.json'),
-        embed,
+        storageFile: workspaceStoragePath(
+          this.context.globalStorageUri.fsPath,
+          workspaceRoot() ?? process.cwd(),
+          'semantic-index.json',
+        ),
+        embed: (texts) => worker.embed(texts),
         maxFiles: config.semanticIndexMaxFiles,
         onProgress: (message) => {
           if (this.streamingMessageId && this.phase !== 'idle') this.setStage(message);
         },
       });
-      if (this.buildContextProfile().tier !== 'compact') {
-        this.semanticIndex.startBackgroundIndex();
-      }
     }
     return this.semanticIndex;
-  }
-
-  private getLocalEmbedder(): LocalEmbedder {
-    if (!this.localEmbedder) {
-      this.localEmbedder = new LocalEmbedder(this.context.extensionUri.fsPath);
-    }
-    return this.localEmbedder;
   }
 
   private getBrowser(): BrowserSession | undefined {
@@ -3758,8 +4128,13 @@ export class SessionController {
   }
 
   private async buildProvider(): Promise<LLMProvider | undefined> {
+    const key = this.providerCacheKey(getConfig());
+    if (this.preparedProvider?.key === key) {
+      return this.preparedProvider.provider;
+    }
     const active = await activeProvider(this.context);
     if (active) {
+      this.preparedProvider = { key, provider: active.provider };
       return active.provider;
     }
     const config = getConfig();
@@ -3768,6 +4143,14 @@ export class SessionController {
     this.post({ type: 'connection', connection: this.buildConnectionState() });
     this.connectionNoticeId = this.addNotice(connectionNotice(preset), 'openSettings').id;
     return undefined;
+  }
+
+  /** Resolve the active chat provider once so switches can reuse it immediately. */
+  private async primeActiveProvider(): Promise<void> {
+    const active = await activeProvider(this.context).catch(() => undefined);
+    if (active) {
+      this.preparedProvider = { key: this.providerCacheKey(getConfig()), provider: active.provider };
+    }
   }
 
   /** Resolve an optional role without changing the active connection. Empty
@@ -3810,7 +4193,7 @@ export class SessionController {
     if (this.disposed || this.warmupInFlight) {
       return this.warmupPromise ?? Promise.resolve();
     }
-    if (this.phase === 'planning' || this.phase === 'executing') {
+    if (isActivePhase(this.phase)) {
       return Promise.resolve();
     }
     const config = getConfig();
@@ -3840,7 +4223,7 @@ export class SessionController {
             prompt: 'a',
             stream: false,
             keep_alive: '10m',
-            options: { num_predict: 1 },
+            options: { num_predict: 1, num_ctx: this.effectiveContextLimit() },
           }),
           signal: AbortSignal.timeout(120_000),
         });
@@ -3862,6 +4245,7 @@ export class SessionController {
   private invalidateActiveCaches(): void {
     this.activePlannerToolbox?.resetReadCache();
     this.activeExecutorToolbox?.resetReadCache();
+    this.scannerToolbox?.toolbox.resetReadCache();
     clearRepoMapCache();
   }
 
@@ -3982,8 +4366,9 @@ export class SessionController {
     const subagentProvider = editSelection?.provider ?? provider;
     const subagentModel = editSelection?.model ?? config.model;
     const family = promptFamilyFor(editSelection?.preset.provider ?? config.provider, subagentModel);
-    const profile = this.buildContextProfile();
-    const local = Boolean((findPreset(config.preset) ?? PRESETS[0]).local);
+    const subagentContext = editSelection
+      ? this.modelContextInfo(editSelection.preset.id, subagentModel, editSelection.preset.provider)
+      : this.mainModelContext();
     this.subagentDepth += 1;
     try {
       return await runSubagent(request, {
@@ -3991,14 +4376,14 @@ export class SessionController {
         model: subagentModel,
         toolbox: this.buildToolbox(false),
         tools: subagentTools({
-          semanticSearch: Boolean(this.getSemanticIndex()) && profile.tier !== 'compact',
+          semanticSearch: Boolean(this.getSemanticIndex()) && subagentContext.profile.tier !== 'compact',
         }),
         rules,
         family,
         signal: signal ?? this.abortController?.signal ?? new AbortController().signal,
-        contextLimitTokens: this.effectiveContextLimit(),
-        contextProfile: profile,
-        deterministicContext: local,
+        contextLimitTokens: subagentContext.limit,
+        contextProfile: subagentContext.profile,
+        deterministicContext: subagentContext.local,
       });
     } finally {
       this.subagentDepth -= 1;
@@ -4042,98 +4427,249 @@ export class SessionController {
     images: string[],
     selection?: SelectionContext,
     quote?: string,
-  ): Promise<boolean> {
-    this.lastRequest = text;
-    let userText = text;
-    if (selection) userText += formatSelectionAttachment(selection);
-    const editor = this.editorContext();
-    if (editor) userText += editor;
-    this.appendUserConversation(submittedMessage, userText, images);
-    this.setStage('ANSWER — locating relevant files…');
-    const codebaseEvidence = await this.codebaseEvidenceForRequest(text, 8) ?? '';
+    resume?: LastAnswerState,
+    answerCoverage?: string[],
+  ): Promise<{ answered: boolean; notice?: string }> {
+    const question = resume?.question ?? text;
+    const coverageItems = [...new Set((resume?.coverageItems ?? answerCoverage ?? [])
+      .map((item) => item.replace(/\s+/g, ' ').trim())
+      .filter(Boolean))].slice(0, 6).map((item) => item.slice(0, 160));
+    const answerContext = this.mainModelContext();
+    this.lastRequest = question;
+    this.setPhase('answering');
+    const controller = new AbortController();
+    const previousController = this.abortController;
+    this.abortController = controller;
+    if (!resume) {
+      let userText = text;
+      if (selection) userText += formatSelectionAttachment(selection);
+      const editor = this.editorContext();
+      if (editor) userText += editor;
+      this.appendUserConversation(submittedMessage, userText, images);
+    }
+    this.setStage(resume
+      ? 'ANSWER — continuing…'
+      : coverageItems.length
+        ? `ANSWER — covering ${coverageItems.length} requested points…`
+        : 'ANSWER — locating relevant files…');
+    const root = workspaceRoot() ?? process.cwd();
+    const taskEvidence = buildTaskEvidencePack(this.context.globalState, question, 3000, root);
+    const evidenceLimit = answerContext.profile.tier === 'compact' ? 4 : answerContext.profile.tier === 'large' ? 8 : 6;
+    const [codebaseEvidence, bootstrap] = await Promise.all([
+      this.codebaseEvidenceForRequest(question, evidenceLimit),
+      projectBootstrap(root),
+    ]);
+    const requestConversation: ChatMessage[] = resume
+      ? [{ role: 'user', content: question }]
+      : this.conversation;
     const request = composePlannerRequest({
-      conversation: this.conversation,
-      contextIndex: this.contextIndex,
-      archived: this.archivedConversation,
-      archivedContextIndex: this.archivedContextIndex,
-      budget: { maxOlder: 3, maxTokens: 1200 },
-      evidence: buildTaskEvidencePack(this.context.globalState, text, 3000, workspaceRoot()),
-      bootstrap: await projectBootstrap(workspaceRoot() ?? process.cwd()),
+      conversation: requestConversation,
+      contextIndex: resume ? [] : this.contextIndex,
+      archived: resume ? [] : this.archivedConversation,
+      archivedContextIndex: resume ? [] : this.archivedContextIndex,
+      budget: relevanceBudget(answerContext.profile.tier),
+      evidence: taskEvidence,
+      bootstrap,
+      pinned: this.buildQuestionPinnedContext(question),
     });
     if (codebaseEvidence) {
       request.messages.push({ role: 'system', content: codebaseEvidence });
     }
-    const readOnlyNames = new Set([
-      'local_hybrid_search', 'find_and_read', 'read_file', 'list_files', 'search_text',
-      'find_symbol', 'document_symbols', 'find_references', 'go_to_definition',
-      'inspect_file_context', 'investigate_issue', 'bounded_investigation',
-      'web_fetch', 'web_search',
-    ]);
-    const tools = (await this.buildQuestionToolRegistry())
-      .filter((tool) => readOnlyNames.has(tool.name));
+    const allQuestionTools = await this.buildQuestionToolRegistry();
+    const readOnlyNames = new Set(allQuestionTools.map((tool) => tool.name));
     const questionToolbox = this.buildToolbox(false, 'marker');
     this.activePlannerToolbox = questionToolbox;
-    const controller = new AbortController();
-    const previousController = this.abortController;
-    this.abortController = controller;
-    this.ensureStreamingMessage();
-    this.setStage('ANSWER — selecting relevant context…');
-    const messages: ChatMessage[] = [
-      {
-        role: 'system',
-        content: 'You are answering the developer\'s latest question about the codebase. Answer directly in chat. Use only the read-only tools provided when evidence is missing. Never create a plan, edit files, run commands, or discuss implementation approval. Use earlier context only when it is relevant to the latest question. Preserve the developer\'s explanation style: explain WHAT it is, HOW it works, and WHY it behaves that way when those parts help; add a concise Mermaid flow diagram when the answer spans multiple components or steps. Include a TRADEOFF only when there is a real alternative worth comparing, and state what the alternative improves and costs. Include CONCEPT, RISKS, or CONTEXT only when they materially improve understanding. These sections are optional: do not force headings or a diagram onto a simple question. Base every claim on the current message or verified evidence.',
-      },
-      ...request.messages,
-    ];
-    let answer = '';
-    try {
-      // One initial read pass plus one bounded refinement keeps small local
-      // models from wandering through the repository while still allowing a
-      // first tool result to guide one targeted follow-up.
-      const answerProfile = this.buildContextProfile();
-      const maxReadRounds = answerProfile.tier === 'compact' ? 2 : 3;
-      const answerTokens = answerProfile.tier === 'compact' ? 1400 : 2000;
-      for (let turn = 0; turn < maxReadRounds; turn++) {
-        this.setStage(turn === 0 ? 'ANSWER — waiting for response…' : 'ANSWER — processing read results…');
-        let textDelta = '';
-        let reasoning = '';
-        const calls: ToolCall[] = [];
-        for await (const event of chatWithRetry(provider, messages, {
-          model: getConfig().model,
-          tools: tools.length > 0 ? tools : undefined,
-          maxTokens: answerTokens,
-          temperature: 0.2,
-          reasoning: { enabled: false },
-          // Respect the model/Modelfile-derived context window. Do not impose
-          // a hidden 4k cap on question requests; larger local models need
-          // their full window for tool schemas and codebase evidence.
-          contextTokens: this.effectiveContextLimit(),
-          signal: controller.signal,
-        }, { attempts: 1, retryOnEmpty: false })) {
-          if (event.type === 'text') {
-            textDelta += event.text;
-            this.appendStreamingText(event.text);
-          } else if (event.type === 'reasoning') {
-            reasoning += event.text;
-          } else if (event.type === 'toolCall' && readOnlyNames.has(event.toolCall.name)) {
-            calls.push(event.toolCall);
+    const placeholderId = this.streamingMessageId;
+    let resumeText = resume?.text ?? '';
+    if (resume) {
+      const existing = this.uiMessages.find(
+        (message) => message.id === resume!.messageId && message.role === 'assistant',
+      );
+      if (existing) {
+        if (placeholderId && placeholderId !== existing.id) {
+          const placeholder = this.uiMessages.find((message) => message.id === placeholderId);
+          if (placeholder && !placeholder.text.trim()) {
+            this.uiMessages = this.uiMessages.filter((message) => message.id !== placeholderId);
+            this.post({ type: 'removeMessage', id: placeholderId });
           }
         }
-        answer += textDelta;
-        if (calls.length === 0) {
-          const result = answer.trim();
-          if (!result) return false;
-          this.appendConversation({ id: this.streamingMessageId ?? undefined, role: 'assistant', content: result });
-          this.endStreaming();
-          return true;
+        resumeText = existing.text || resume.text;
+        this.streamingMessageId = existing.id;
+        existing.streaming = true;
+        existing.interrupted = false;
+        existing.stage = 'ANSWER — continuing…';
+        this.post({ type: 'addMessage', message: existing });
+      } else {
+        resume = undefined;
+      }
+    }
+    if (!resume) {
+      this.ensureStreamingMessage();
+    }
+    const streamingId = this.streamingMessageId ?? '';
+    this.beginAnswerWatchdog(controller);
+    this.setContinuation('answer', streamingId || `answer:${Date.now()}`, 'active');
+    this.lastAnswer = {
+      messageId: streamingId,
+      question,
+      text: resumeText,
+      examinedFiles: [...(resume?.examinedFiles ?? [])],
+      ...(coverageItems.length ? { coverageItems } : {}),
+      status: 'truncated',
+      updatedAt: Date.now(),
+    };
+    const examinedFiles = new Set(resume?.examinedFiles ?? []);
+    const rememberFile = (call: ToolCall): void => {
+      try {
+        const args = JSON.parse(call.arguments) as Record<string, unknown>;
+        const path = typeof args.path === 'string' ? args.path : typeof args.file === 'string' ? args.file : undefined;
+        if (path && path !== '.' && path !== './') examinedFiles.add(path);
+      } catch {
+        // Tool arguments may be partial while streaming; only the final calls matter.
+      }
+    };
+    const finish = (result: string, truncated: boolean): { answered: boolean; notice?: string } => {
+      const trimmed = result.trim();
+      const files = [...examinedFiles];
+      if (trimmed) {
+        this.upsertAssistantConversation(streamingId || undefined, trimmed);
+        this.lastAnswer = {
+          messageId: streamingId,
+          question,
+          text: trimmed,
+          examinedFiles: files,
+          ...(coverageItems.length ? { coverageItems } : {}),
+          status: truncated ? 'truncated' : 'complete',
+          updatedAt: Date.now(),
+        };
+        this.setContinuation('answer', streamingId || `answer:${Date.now()}`, truncated ? 'truncated' : 'complete');
+        this.endStreaming();
+        this.endAnswerWatchdog();
+        this.setPhase('idle');
+        return { answered: true };
+      }
+      this.lastAnswer = {
+        messageId: streamingId,
+        question,
+        text: '',
+        examinedFiles: files,
+        ...(coverageItems.length ? { coverageItems } : {}),
+        status: 'truncated',
+        updatedAt: Date.now(),
+      };
+      this.setContinuation('answer', streamingId || `answer:${Date.now()}`, 'truncated');
+      this.endStreaming();
+      this.endAnswerWatchdog();
+      this.setPhase('idle');
+      const preview = files.slice(0, 5);
+      const evidence = preview.length > 0
+        ? ` Files read: ${preview.join(', ')}${files.length > preview.length ? ` and ${files.length - preview.length} more` : ''}.`
+        : '';
+      return {
+        answered: false,
+        notice: `The model did not produce a final answer.${evidence} Try naming a specific file, symbol, or topic.`,
+      };
+    };
+    try {
+      const baseMessages: ChatMessage[] = [
+        { role: 'system', content: answerSystemPrompt(coverageItems) },
+        ...request.messages,
+      ];
+      const messages: ChatMessage[] = [...baseMessages];
+      const seededResume = Boolean(resume && resumeText.trim());
+      if (seededResume) {
+        messages.push({
+          role: 'assistant',
+          content: this.compactAnswerForContinuation(resumeText, answerContext.limit, baseMessages),
+        });
+        messages.push({ role: 'user', content: CONTINUE_ANSWER_PROMPT });
+      }
+      const continuationBase = (): ChatMessage[] => seededResume
+        ? [...baseMessages, ...messages.slice(baseMessages.length + 2)]
+        : messages;
+      let answer = resumeText;
+      const seenEvidence = new Set<string>();
+      let lastToolBatchSignature = '';
+      let repeatedToolBatchCount = 0;
+      let forceFinal = false;
+      let roundsWithoutNewEvidence = 0;
+      for (let turn = 0; ; turn++) {
+        this.setStage(turn === 0 ? 'ANSWER — waiting for response…' : 'ANSWER — processing read results…');
+        const turnTools = this.questionToolsForTurn(allQuestionTools, question, turn);
+        const turnResult = await this.streamAnswerTurn(
+          provider,
+          messages,
+          {
+            tools: turnTools,
+            signal: controller.signal,
+            reasoning: this.answerReasoningOptions(turn),
+            contextLimit: answerContext.limit,
+          },
+          (delta) => { this.touchAnswerWatchdog(); this.appendStreamingText(delta); },
+          (delta) => { this.touchAnswerWatchdog(); this.appendStreamingReasoning(delta); },
+        );
+        answer += turnResult.text;
+        if (turnResult.loopDetected) {
+          return finish(answer, true);
         }
-        messages.push({ role: 'assistant', content: textDelta, toolCalls: calls, ...(reasoning ? { reasoning } : {}) });
+        const calls = turnResult.calls.filter((call) => readOnlyNames.has(call.name));
+        if (calls.length === 0) {
+          let truncated = turnResult.stopReason === 'length' || turnResult.stopReason === 'content-filter';
+          if (turnResult.stopReason === 'length') {
+            const continued = await this.continueAnswerText(
+              provider,
+              continuationBase(),
+              answer,
+              controller.signal,
+              answerContext.limit,
+              (delta) => { this.touchAnswerWatchdog(); this.appendStreamingText(delta); },
+              this.answerReasoningOptions(turn),
+              (delta) => { this.touchAnswerWatchdog(); this.appendStreamingReasoning(delta); },
+            );
+            answer = continued.text;
+            truncated = continued.truncated;
+          }
+          return finish(answer, truncated);
+        }
+        calls.forEach(rememberFile);
+        messages.push({
+          role: 'assistant',
+          content: turnResult.text,
+          toolCalls: calls,
+          ...(turnResult.reasoning ? { reasoning: turnResult.reasoning } : {}),
+        });
         const readOne = async (call: ToolCall): Promise<string> => {
+          this.touchAnswerWatchdog();
           this.setStage(`ANSWER — reading ${call.name}…`);
-          return this.executePlannerToolOn(questionToolbox, call, () => ({
-            usedTokens: estimateTokens(messages),
-            limitTokens: this.effectiveContextLimit(),
-          }));
+          const label = describeToolCall(call);
+          const icon = toolIcon(call.name);
+          const startedAt = Date.now();
+          this.upsertActivity(call.id, label, 'running', icon);
+          this.eventLedger.append('tool', { tool: call.name, status: 'started', callId: call.id, label });
+          try {
+            const result = await this.executePlannerToolOn(questionToolbox, call, () => ({
+              usedTokens: estimateTokens(messages),
+              limitTokens: answerContext.limit,
+            }));
+            this.touchAnswerWatchdog();
+            const durationMs = Date.now() - startedAt;
+            const failed = /^Error:/i.test(result.trim());
+            this.upsertActivity(call.id, label, failed ? 'error' : 'done', icon, { ...activityMeta(call, result), durationMs });
+            this.eventLedger.append('tool', {
+              tool: call.name,
+              status: failed ? 'failed' : 'succeeded',
+              callId: call.id,
+              label,
+              durationMs,
+            });
+            return result;
+          } catch (error) {
+            const durationMs = Date.now() - startedAt;
+            const result = `Error: ${errorMessage(error)}`;
+            this.upsertActivity(call.id, label, 'error', icon, { ...activityMeta(call, result), durationMs });
+            this.eventLedger.append('tool', { tool: call.name, status: 'failed', callId: call.id, label, durationMs, error: errorMessage(error) });
+            return result;
+          }
         };
         const questionResults = new Map<string, string>();
         const concurrentCalls = calls.filter((call) => PARALLEL_SAFE.has(call.name));
@@ -4151,21 +4687,545 @@ export class SessionController {
             content: questionResults.get(call.id) ?? 'Error: tool did not return a result.',
           });
         }
+        const signature = calls.map((call) => `${call.name}:${call.arguments}`).join('|');
+        if (signature === lastToolBatchSignature) {
+          repeatedToolBatchCount += 1;
+        } else {
+          lastToolBatchSignature = signature;
+          repeatedToolBatchCount = 1;
+        }
+        let foundNovelEvidence = false;
+        for (const call of calls) {
+          const result = questionResults.get(call.id) ?? '';
+          if (!result.trim()) continue;
+          const fingerprint = `${call.name}:${answerEvidenceFingerprint(result)}`;
+          if (!seenEvidence.has(fingerprint)) {
+            seenEvidence.add(fingerprint);
+            foundNovelEvidence = true;
+          }
+        }
+        roundsWithoutNewEvidence = foundNovelEvidence ? 0 : roundsWithoutNewEvidence + 1;
+        if (repeatedToolBatchCount >= 3 || roundsWithoutNewEvidence >= 3) {
+          forceFinal = true;
+          break;
+        }
       }
-      this.endStreaming();
-      return Boolean(answer.trim());
+      if (forceFinal) {
+        this.setStage('ANSWER — preparing final answer…');
+        messages.push({
+          role: 'user',
+          content: 'Tool use is complete. Answer the developer\'s original question now, directly and completely. Do not call any tools. Use only the evidence already gathered above. If a requested detail is absent, write NOT_FOUND instead of guessing. Preserve any required response format.',
+        });
+        const finalTurn = await this.streamAnswerTurn(
+          provider,
+          messages,
+          {
+            signal: controller.signal,
+            reasoning: this.answerReasoningOptions(0),
+            contextLimit: answerContext.limit,
+          },
+          (delta) => { this.touchAnswerWatchdog(); this.appendStreamingText(delta); },
+          (delta) => { this.touchAnswerWatchdog(); this.appendStreamingReasoning(delta); },
+        );
+        answer += finalTurn.text;
+        if (finalTurn.loopDetected) {
+          return finish(answer, true);
+        }
+        let truncated = finalTurn.stopReason === 'length' || finalTurn.stopReason === 'content-filter';
+        if (finalTurn.stopReason === 'length') {
+          const continued = await this.continueAnswerText(
+            provider,
+            continuationBase(),
+            answer,
+            controller.signal,
+            answerContext.limit,
+            (delta) => { this.touchAnswerWatchdog(); this.appendStreamingText(delta); },
+            this.answerReasoningOptions(0),
+            (delta) => { this.touchAnswerWatchdog(); this.appendStreamingReasoning(delta); },
+          );
+          answer = continued.text;
+          truncated = continued.truncated;
+        }
+        return finish(answer, truncated);
+      }
+      return finish(answer, false);
     } catch (error) {
       if (!(error instanceof Error && error.name === 'AbortError')) {
         this.addError(`Question failed: ${errorMessage(error)}`);
       }
+      this.markStreamingInterrupted();
       this.endStreaming();
-      return false;
+      return { answered: false };
     } finally {
+      this.endAnswerWatchdog();
+      if (this.phase === 'answering') {
+        this.setPhase('idle');
+      }
       this.abortController = previousController;
       if (this.activePlannerToolbox === questionToolbox) {
         this.activePlannerToolbox = undefined;
       }
+      if (this.phase === 'idle') {
+        this.processNextQueued();
+      }
     }
+  }
+
+  private buildSessionMemoryCard(): SessionMemoryCard {
+    const completed = this.currentRun?.completedSteps ?? this.taskState.completedSteps;
+    const next = this.taskState.nextSteps;
+    const steps = this.plan?.steps ?? [];
+    const answerIsUnfinished = Boolean(
+      this.continuation?.kind === 'answer' && this.continuation.status !== 'complete',
+    );
+    const touched = new Set<string>([
+      ...(this.currentRun?.changedFiles ?? []).map((file) => file.path),
+      ...(answerIsUnfinished ? this.lastAnswer?.examinedFiles ?? [] : []),
+    ]);
+    const decisions: string[] = [];
+    if (this.plan?.status === 'approved') {
+      decisions.push(`Approved plan: ${(this.plan.title ?? 'untitled plan').slice(0, 160)}`);
+    }
+    if (this.plan?.verification?.length) {
+      decisions.push(`Verification: ${this.plan.verification.slice(0, 2).join('; ')}`);
+    }
+    return {
+      goal: (this.taskState.taskSummary || this.lastRequest || this.lastAnswer?.question)?.slice(0, 500),
+      decisions: decisions.slice(0, 4),
+      touchedFiles: [...touched].filter(Boolean).slice(-16),
+      blockers: [...this.taskState.blockers].slice(-4),
+      completedStep: completed.length > 0 && steps[completed[completed.length - 1]]
+        ? steps[completed[completed.length - 1]].slice(0, 300)
+        : undefined,
+      nextStep: next.length > 0 && steps[next[0]] ? steps[next[0]].slice(0, 300) : undefined,
+      answerTail: answerIsUnfinished && this.lastAnswer?.text
+        ? this.lastAnswer.text.slice(-1200)
+        : undefined,
+      updatedAt: Date.now(),
+    };
+  }
+
+  private setContinuation(kind: ContinuationKind, targetId: string, status: ContinuationState['status']): void {
+    this.continuation = { kind, targetId, status, updatedAt: Date.now() };
+    this.sessionMemoryCard = this.buildSessionMemoryCard();
+  }
+
+  private resolveContinuationTarget(text: string): ContinuationState | undefined {
+    if (!isContinuationMessage(text)) return undefined;
+    const taskIsActive = this.phase === 'planning' || this.phase === 'executing'
+      || this.taskState.state === 'planning' || this.taskState.state === 'executing';
+    const taskIsRecoverable = Boolean(
+      this.recoveryRun
+      // An approved plan is resumable even when its next-step list is empty:
+      // the executor may have been stopped before it could record progress.
+      || (this.plan && this.plan.status === 'approved')
+      || (this.continuation?.kind === 'task' && ['active', 'paused', 'interrupted'].includes(this.continuation.status)),
+    );
+    if (taskIsActive || taskIsRecoverable) {
+      return {
+        kind: 'task',
+        targetId: this.taskState.taskId || this.recoveryRun?.id || 'current-task',
+        status: taskIsActive ? 'active' : 'paused',
+        updatedAt: Date.now(),
+      };
+    }
+    // The current "continue" message is already in the transcript. The answer
+    // being continued must be the assistant turn immediately before it, not a
+    // stale answer from an earlier request.
+    let latestUserIndex = -1;
+    for (let index = this.uiMessages.length - 1; index >= 0; index--) {
+      if (this.uiMessages[index].role === 'user') {
+        latestUserIndex = index;
+        break;
+      }
+    }
+    const assistantPool = latestUserIndex >= 0
+      ? this.uiMessages.slice(0, latestUserIndex)
+      : this.uiMessages;
+    const latestAssistant = [...assistantPool]
+      .reverse()
+      .find((message) => message.role === 'assistant' && message.id !== this.streamingMessageId);
+    // Never resume a message that has been removed or replaced by an edit.
+    const lastAnswerMessage = this.lastAnswer
+      ? this.uiMessages.find((message) => message.id === this.lastAnswer!.messageId && message.role === 'assistant')
+      : undefined;
+    const continuationMessage = this.continuation?.kind === 'answer'
+      ? this.uiMessages.find((message) => message.id === this.continuation!.targetId && message.role === 'assistant')
+      : undefined;
+    const continuationIsLatest = Boolean(continuationMessage && latestAssistant?.id === continuationMessage.id);
+    const lastAnswerIsLatest = Boolean(lastAnswerMessage && latestAssistant?.id === lastAnswerMessage.id);
+    const continuationIsNewer = Boolean(
+      continuationMessage
+      && (!this.lastAnswer || this.continuation!.updatedAt >= this.lastAnswer.updatedAt),
+    );
+    if (continuationIsLatest && continuationIsNewer) {
+      return {
+        kind: 'answer',
+        targetId: continuationMessage!.id,
+        status: this.continuation!.status,
+        updatedAt: this.continuation!.updatedAt,
+      };
+    }
+    if (lastAnswerIsLatest && this.lastAnswer) {
+      return {
+        kind: 'answer',
+        targetId: lastAnswerMessage!.id,
+        status: this.lastAnswer.status,
+        updatedAt: this.lastAnswer.updatedAt,
+      };
+    }
+    // The persisted continuation pointer can outlive the answer record after a
+    // restart. Recover the unfinished answer from the message it points to.
+    if (continuationIsLatest && this.continuation?.kind === 'answer') {
+      return {
+        kind: 'answer',
+        targetId: continuationMessage!.id,
+        status: this.continuation.status,
+        updatedAt: this.continuation.updatedAt,
+      };
+    }
+    if (this.plan?.status === 'draft') {
+      return { kind: 'plan', targetId: `plan:${this.plan.version}`, status: 'paused', updatedAt: Date.now() };
+    }
+    return undefined;
+  }
+
+  private shouldResumeLastAnswer(text: string): boolean {
+    const target = this.resolveContinuationTarget(text);
+    return target?.kind === 'answer' && (this.phase === 'idle' || this.phase === 'review');
+  }
+
+  private answerStateForContinuation(target: ContinuationState): LastAnswerState | undefined {
+    if (target.kind !== 'answer') {
+      return undefined;
+    }
+    if (this.lastAnswer?.messageId === target.targetId) {
+      return this.lastAnswer;
+    }
+    const message = this.uiMessages.find(
+      (candidate) => candidate.id === target.targetId && candidate.role === 'assistant',
+    );
+    if (!message) {
+      return undefined;
+    }
+    const lastUser = [...this.conversation].reverse().find((candidate) => candidate.role === 'user');
+    return {
+      messageId: message.id,
+      question: this.lastAnswer?.question ?? this.lastRequest ?? lastUser?.content ?? '',
+      text: message.text,
+      examinedFiles: [],
+      status: target.status === 'complete' ? 'complete' : 'truncated',
+      updatedAt: target.updatedAt,
+    };
+  }
+
+  private answerReasoningOptions(turn: number): ReasoningOptions | undefined {
+    const config = getConfig();
+    const preset = findPreset(config.preset) ?? PRESETS[0];
+    const modelId = config.model;
+    const supported = this.profileSupportsReasoning();
+    return this.executionReasoningOptions(supported, preset.id, {
+      phase: 'execution',
+      turn,
+      previousToolNames: [],
+      previousToolFailed: false,
+    }, modelId);
+  }
+
+  private async streamAnswerTurn(
+    provider: LLMProvider,
+    messages: ChatMessage[],
+    options: {
+      tools?: ToolDef[];
+      signal: AbortSignal;
+      reasoning?: ReasoningOptions;
+      contextLimit?: number;
+    },
+    onText: (delta: string) => void,
+    onReasoning?: (delta: string) => void,
+  ): Promise<{ text: string; reasoning: string; calls: ToolCall[]; stopReason?: StreamStopReason; loopDetected?: boolean }> {
+    const toolSchemaTokens = options.tools?.length
+      ? Math.ceil(JSON.stringify(options.tools).length / 4)
+      : 0;
+    const contextLimit = options.contextLimit ?? this.effectiveContextLimit();
+    let retainedText = '';
+    let retainedReasoning = '';
+    let requestMessages = messages;
+    // Start the header with a deterministic estimate so it is useful even
+    // when a local provider does not return a usage event.
+    this.lastExactUsage = undefined;
+    this.reportUsage(estimateTokens(messages) + toolSchemaTokens);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let text = '';
+      let reasoning = '';
+      const calls: ToolCall[] = [];
+      let stopReason: StreamStopReason | undefined;
+      let loopDetected = false;
+      const loopGuard = new StreamLoopGuard();
+      const turnAbort = createChildAbortController(options.signal);
+      try {
+        for await (const event of chatWithRetry(provider, requestMessages, {
+          model: getConfig().model,
+          ...(options.tools?.length ? { tools: options.tools } : {}),
+          temperature: 0.2,
+          ...(options.reasoning ? { reasoning: options.reasoning } : {}),
+          // Respect the model/Modelfile-derived context window. No output cap is
+          // sent: generation ends only at the model's natural stop or its context.
+          contextTokens: contextLimit,
+          signal: turnAbort.controller.signal,
+        }, { attempts: 1, retryOnEmpty: false })) {
+          if (event.type === 'text') {
+            const detection = loopGuard.observe('text', event.text);
+            text += event.text;
+            onText(event.text);
+            if (detection) {
+              text = text.slice(0, Math.max(0, text.length - detection.repeatedChars));
+              this.rewindStreamingText(detection.repeatedChars);
+              loopDetected = true;
+              turnAbort.controller.abort();
+              break;
+            }
+          } else if (event.type === 'reasoning') {
+            const detection = loopGuard.observe('reasoning', event.text);
+            reasoning += event.text;
+            onReasoning?.(event.text);
+            if (detection) {
+              reasoning = reasoning.slice(0, Math.max(0, reasoning.length - detection.repeatedChars));
+              this.rewindStreamingReasoning(detection.repeatedChars);
+              loopDetected = true;
+              turnAbort.controller.abort();
+              break;
+            }
+          } else if (event.type === 'toolCall') {
+            calls.push(event.toolCall);
+          } else if (event.type === 'usage') {
+            this.reportExactUsage({
+              input: event.inputTokens ?? 0,
+              output: event.outputTokens ?? 0,
+              reasoning: event.reasoningTokens ?? 0,
+              cached: event.cachedTokens ?? 0,
+            });
+          } else if (event.type === 'done') {
+            stopReason = event.reason;
+          }
+        }
+      } catch (error) {
+        if (!loopDetected) throw error;
+      } finally {
+        turnAbort.dispose();
+      }
+
+      retainedText += text;
+      if (!loopDetected) {
+        retainedReasoning += reasoning;
+        return { text: retainedText, reasoning: retainedReasoning, calls, stopReason };
+      }
+      if (attempt === 1) {
+        this.addNotice('Stopped after repeated streamed output returned following one recovery attempt. The distinct response text is preserved.');
+        return { text: retainedText, reasoning: retainedReasoning, calls: [], stopReason: 'stop', loopDetected: true };
+      }
+
+      if (text.trim()) requestMessages = [...requestMessages, { role: 'assistant', content: text.trim() }];
+      requestMessages = [...requestMessages, { role: 'user', content: streamLoopRecoveryPrompt() }];
+      this.addNotice('Detected repeated streamed output and stopped that turn. Trying one recovery turn.');
+    }
+    return { text: retainedText, reasoning: retainedReasoning, calls: [], loopDetected: true };
+  }
+
+
+  private async collectTextWithContinuation(
+    provider: LLMProvider,
+    messages: ChatMessage[],
+    options: ChatOptions,
+    retry: RetryOptions = {},
+    onText?: (delta: string) => void,
+  ): Promise<string> {
+    const base = messages;
+    let text = '';
+    let stopReason: StreamStopReason | undefined;
+    let stagnant = 0;
+    let loopRecoveryUsed = false;
+    for (;;) {
+      let turnText = '';
+      let turnLoopDetected = false;
+      const loopGuard = new StreamLoopGuard();
+      const turnAbort = options.signal ? createChildAbortController(options.signal) : undefined;
+      const turnOptions = turnAbort ? { ...options, signal: turnAbort.controller.signal } : options;
+      // A missing done event in a later turn must not inherit the previous
+      // turn's "length" status, which would loop forever.
+      stopReason = undefined;
+      try {
+        for await (const event of chatWithRetry(provider, messages, turnOptions, retry)) {
+          if (event.type === 'text') {
+            const detection = loopGuard.observe('text', event.text);
+            turnText += event.text;
+            text += event.text;
+            onText?.(event.text);
+            if (detection) {
+              turnText = turnText.slice(0, Math.max(0, turnText.length - detection.repeatedChars));
+              text = text.slice(0, Math.max(0, text.length - detection.repeatedChars));
+              turnLoopDetected = true;
+              turnAbort?.controller.abort();
+              break;
+            }
+          } else if (event.type === 'done') {
+            stopReason = event.reason;
+          }
+        }
+      } catch (error) {
+        if (!turnLoopDetected) throw error;
+      } finally {
+        turnAbort?.dispose();
+      }
+      if (turnLoopDetected) {
+        if (loopRecoveryUsed) {
+          this.addNotice('Stopped after repeated output returned following one recovery attempt.');
+          return `${text.trim()}\n\n[Stopped because repeated output continued after one recovery attempt. This response may be incomplete.]`.trim();
+        }
+        loopRecoveryUsed = true;
+        messages = [
+          ...messages,
+          ...(turnText.trim() ? [{ role: 'assistant' as const, content: turnText.trim() }] : []),
+          { role: 'user', content: streamLoopRecoveryPrompt() },
+        ];
+        this.addNotice('Detected repeated output and stopped that stream. Trying one recovery turn.');
+        continue;
+      }
+      if (stopReason !== 'length') {
+        return text;
+      }
+      if (!turnText.trim()) {
+        stagnant += 1;
+        if (stagnant >= 2) {
+          return text;
+        }
+      } else {
+        stagnant = 0;
+      }
+      messages = this.answerContinuationMessages(base, text, options.contextTokens ?? this.effectiveContextLimit());
+    }
+  }
+
+  private async continueAnswerText(
+    provider: LLMProvider,
+    baseMessages: ChatMessage[],
+    answerSoFar: string,
+    signal: AbortSignal,
+    contextLimit: number,
+    onText: (delta: string) => void,
+    reasoning?: ReasoningOptions,
+    onReasoning?: (delta: string) => void,
+  ): Promise<{ text: string; truncated: boolean }> {
+    let text = answerSoFar;
+    let stagnant = 0;
+    for (;;) {
+      const messages = this.answerContinuationMessages(baseMessages, text, contextLimit);
+      const turn = await this.streamAnswerTurn(
+        provider,
+        messages,
+        { signal, reasoning, contextLimit },
+        onText,
+        onReasoning,
+      );
+      text += turn.text;
+      if (turn.loopDetected) {
+        return { text, truncated: true };
+      }
+      if (turn.stopReason !== 'length') {
+        return { text, truncated: turn.stopReason === 'content-filter' };
+      }
+      if (!turn.text.trim()) {
+        stagnant += 1;
+        if (stagnant >= 2) {
+          return { text, truncated: true };
+        }
+      } else {
+        stagnant = 0;
+      }
+    }
+  }
+
+  private answerContinuationMessages(
+    base: ChatMessage[],
+    answerSoFar: string,
+    contextLimit: number,
+  ): ChatMessage[] {
+    return [
+      ...base,
+      {
+        role: 'assistant',
+        content: this.compactAnswerForContinuation(answerSoFar, contextLimit, base),
+      },
+      { role: 'user', content: CONTINUE_ANSWER_PROMPT },
+    ];
+  }
+
+  private compactAnswerForContinuation(answer: string, limitTokens: number, base: ChatMessage[]): string {
+    const effectiveLimit = limitTokens > 0 ? limitTokens : this.effectiveContextLimit();
+    // Match the shared request guard: leave room for the model's next chunk.
+    const budget = Math.max(256, Math.floor(effectiveLimit * 0.72));
+    const continuationPromptTokens = estimateTokens([{ role: 'user', content: CONTINUE_ANSWER_PROMPT }]);
+    const baseTokens = estimateTokens(base);
+    const available = Math.max(
+      96,
+      budget - baseTokens - continuationPromptTokens - 64,
+    );
+    const seedTokens = (seed: string): number =>
+      estimateTokens([{ role: 'assistant', content: seed }]);
+    if (seedTokens(answer) <= available) {
+      return answer;
+    }
+
+    const outline = this.answerOutline(answer);
+    let tailChars = Math.max(256, Math.min(8000, available * 3));
+    let headChars = Math.max(96, Math.min(1600, available));
+    let seed = '';
+    for (let attempt = 0; attempt < 6; attempt++) {
+      seed = [
+        '[The answer is longer than the remaining context. Continue it without repeating anything.]',
+        'Sections already written:',
+        outline || '(no headings)',
+        'Opening:',
+        answer.slice(0, headChars),
+        '...',
+        'Most recent text (continue immediately after this):',
+        answer.slice(-tailChars),
+      ].join('\n');
+      if (seedTokens(seed) <= available) {
+        return seed;
+      }
+      tailChars = Math.max(128, Math.floor(tailChars * 0.6));
+      headChars = Math.max(64, Math.floor(headChars * 0.6));
+    }
+
+    // Last resort: keep only the newest text, which is what the continuation
+    // must follow, and stay strictly inside the available budget.
+    const fallbackChars = Math.max(96, Math.min(1200, available * 2));
+    return `[Continue the answer from the end of this text without repeating.]\n${answer.slice(-fallbackChars)}`;
+  }
+
+  private answerOutline(answer: string): string {
+    const lines = answer.split('\n').filter((line) =>
+      /^\s{0,3}#{1,6}\s+/.test(line) || /^\s*\*\*[^*]+\*\*\s*$/.test(line),
+    );
+    return [...new Set(lines)].slice(-80).join('\n');
+  }
+
+  private upsertAssistantConversation(id: string | undefined, content: string): void {
+    const text = stripInternalContext(content);
+    if (id) {
+      const index = this.conversation.findIndex(
+        (message) => message.id === id && message.role === 'assistant',
+      );
+      if (index >= 0) {
+        const message: ChatMessage = { ...this.conversation[index], content: text };
+        this.conversation[index] = message;
+        this.contextIndex[index] = buildContextEntry(message, index);
+        this.plannerConversationCache = null;
+        return;
+      }
+    }
+    this.appendConversation({ ...(id ? { id } : {}), role: 'assistant', content: text });
   }
 
   private requestApproval(command: string, cwd: string): Promise<TerminalApprovalDecision> {
@@ -4268,7 +5328,7 @@ export class SessionController {
   }
 
   private async explainChange(filePath: string): Promise<void> {
-    if (this.phase === 'planning' || this.phase === 'executing') {
+    if (isActivePhase(this.phase)) {
       this.addNotice('Wait for the current task to finish before asking for an explanation.');
       return;
     }
@@ -4366,13 +5426,27 @@ export class SessionController {
     if (!trimmed) {
       return;
     }
+    const requestId = ++this.enhanceRequestId;
+    this.enhanceAbort?.abort();
+    const controller = new AbortController();
+    this.enhanceAbort = controller;
+    const timeout = setTimeout(() => controller.abort(), 45_000);
     const provider = await this.buildProvider();
-    if (!provider) {
-      return;
-    }
     try {
+      if (requestId !== this.enhanceRequestId) {
+        return;
+      }
+      if (!provider) {
+        this.post({
+          type: 'enhancedPrompt',
+          text: trimmed,
+          error: 'No chat provider is connected. Connect a model, then try again.',
+        });
+        return;
+      }
       let enhanced = '';
-      for await (const event of provider.chat(
+      for await (const event of chatWithRetry(
+        provider,
         [
           {
             role: 'system',
@@ -4381,20 +5455,48 @@ export class SessionController {
           },
           { role: 'user', content: trimmed },
         ],
-        { model: getConfig().model, maxTokens: 512, temperature: 0.3 },
+        {
+          model: getConfig().model,
+          maxTokens: 512,
+          temperature: 0.3,
+          signal: controller.signal,
+          contextTokens: this.effectiveContextLimit(),
+        },
+        { attempts: 1, retryOnEmpty: false },
       )) {
         if (event.type === 'text') {
           enhanced += event.text;
         }
       }
+      if (requestId !== this.enhanceRequestId) {
+        return;
+      }
       const result = enhanced.trim();
       if (result) {
         this.post({ type: 'enhancedPrompt', text: result });
       } else {
-        this.post({ type: 'enhancedPrompt', text: trimmed, error: 'No rewrite produced.' });
+        this.post({
+          type: 'enhancedPrompt',
+          text: trimmed,
+          error: 'The model returned no rewritten prompt. Your original prompt is unchanged.',
+        });
       }
     } catch (error) {
-      this.post({ type: 'enhancedPrompt', text: trimmed, error: errorMessage(error) });
+      if (requestId !== this.enhanceRequestId) {
+        return;
+      }
+      this.post({
+        type: 'enhancedPrompt',
+        text: trimmed,
+        error: controller.signal.aborted
+          ? 'Prompt enhancement timed out. Your original prompt is unchanged.'
+          : `Prompt enhancement failed: ${errorMessage(error)}`,
+      });
+    } finally {
+      clearTimeout(timeout);
+      if (this.enhanceAbort === controller) {
+        this.enhanceAbort = undefined;
+      }
     }
   }
 
@@ -4554,6 +5656,7 @@ export class SessionController {
         blockers: [],
         lastHeartbeatAt: Date.now(),
       };
+      this.setContinuation('task', this.taskState.taskId, 'complete');
       this.eventLedger.setTask(this.taskState.taskId);
       this.eventLedger.append('state', {
         state: this.taskState.state,
@@ -4594,6 +5697,7 @@ export class SessionController {
     parsed.skippedSteps = this.plan.skippedSteps;
     parsed.title = this.plan.title;
     this.plan = parsed;
+    this.setContinuation('plan', `plan:${this.plan.version}`, 'paused');
     this.recordContextMetadata(planContextMetadata(parsed));
     await this.savePlanFile(this.plan, this.lastRequest);
     this.post({ type: 'plan', plan: this.plan });
@@ -4629,7 +5733,7 @@ export class SessionController {
   }
 
   private async explainSection(key: string): Promise<void> {
-    if (this.phase === 'planning' || this.phase === 'executing') {
+    if (isActivePhase(this.phase)) {
       this.addNotice('Wait for the current task to finish before asking for an explanation.');
       return;
     }
@@ -4659,7 +5763,7 @@ export class SessionController {
   }
 
   private addAssistantMessage(text: string): UiMessage {
-    const message: UiMessage = { id: randomId('msg'), role: 'assistant', text };
+    const message: UiMessage = { id: randomId('msg'), role: 'assistant', text: stripInternalContext(text) };
     this.uiMessages.push(message);
     this.post({ type: 'addMessage', message });
     this.persist();
@@ -4669,6 +5773,9 @@ export class SessionController {
   private appendConversation(message: ChatMessage): SessionContextEntry {
     if (!message.id) {
       message.id = randomId('msg');
+    }
+    if (message.role === 'assistant') {
+      message = { ...message, content: stripInternalContext(message.content) };
     }
     const index = this.conversation.length;
     this.conversation.push(message);
@@ -4767,7 +5874,7 @@ export class SessionController {
     retainTakeaways = false,
   ): void {
     const { text: withoutFailure, failureConcept } = extractFailureConcept(text);
-    const { text: body, takeaways } = extractTakeaways(withoutFailure);
+    const { text: body, takeaways } = extractTakeaways(stripInternalContext(withoutFailure));
     if (retainTakeaways && takeaways?.length && getConfig().memory) {
       void (async () => {
         let saved = 0;
@@ -4874,6 +5981,7 @@ export class SessionController {
       existing.detailKind = meta?.detailKind ?? existing.detailKind;
       existing.exitCode = meta?.exitCode ?? existing.exitCode;
       existing.filePath = meta?.filePath ?? existing.filePath;
+      existing.durationMs = meta?.durationMs ?? existing.durationMs;
     } else {
       activities.push({ id, label, status, icon, ...meta });
     }
@@ -4884,60 +5992,60 @@ export class SessionController {
     });
   }
 
-  private resolvedModelInfo(): { catalog: CatalogModel | undefined; registry: ModelInfo | undefined } {
+  private modelContextInfo(presetId: string, modelId: string, providerId: string): ModelContextInfo {
+    const config = getConfig();
+    const preset = findPreset(presetId) ?? PRESETS[0];
+    const metadata = this.selectedModelMetadata(preset.id, modelId, providerId);
+    const modelLimit = metadata.contextWindow || config.contextLimitTokens;
+    const localCap = safeLocalContextCap(config.localContextCapTokens);
+    const limit = preset.local && localCap > 0 ? Math.min(modelLimit, localCap) : modelLimit;
+    const catalog = modelInfo(preset.id, modelId);
+    const registry = this.registry.lookup(providerId, modelId);
+    const catalogMax = catalog?.maxOutput;
+    const registryMax = registry?.maxOutput;
+    const reserved = catalogMax && catalogMax > 0
+      ? catalogMax
+      : registryMax && registryMax > 0
+        ? registryMax
+        : 8192;
+    const supportsReasoning = Boolean(catalog?.reasoning) || (registry?.supportsReasoning ?? false);
+    const profile = contextProfileFor({
+      contextWindow: limit,
+      maxOutput: reserved,
+      supportsTools: registry?.supportsTools ?? true,
+      supportsReasoning,
+      override: config.contextProfile,
+    });
+    return { catalog, registry, limit, reserved, profile, supportsReasoning, local: Boolean(preset.local) };
+  }
+
+  private mainModelContext(): ModelContextInfo {
     const config = getConfig();
     const preset = findPreset(config.preset) ?? PRESETS[0];
-    return {
-      catalog: modelInfo(preset.id, config.model),
-      registry: this.registry.lookup(preset.provider, config.model),
-    };
+    return this.modelContextInfo(preset.id, config.model, preset.provider);
   }
 
   private effectiveContextLimit(): number {
-    const config = getConfig();
-    const preset = findPreset(config.preset) ?? PRESETS[0];
-    const metadata = this.selectedModelMetadata(preset.id, config.model, preset.provider);
-    const modelLimit = metadata.contextWindow || config.contextLimitTokens;
-    if (!preset.local || config.localContextCapTokens <= 0) {
-      return modelLimit;
-    }
-    return Math.min(modelLimit, config.localContextCapTokens);
+    return this.mainModelContext().limit;
   }
 
   private plannerStepLimit(_config: DevFirstConfig, _preset: ProviderPreset): number {
     // Planning normally ends when the model submits a ready plan or answers.
-    // Keep a hard safety cap so a model that keeps issuing varied read calls
-    // cannot plan forever; execution remains separately bounded by maxSteps.
-    return 20;
+    // 0 means unlimited: the planner keeps working until it has a ready plan,
+    // answers, or an explicit safety guard (repetition/readiness) stops it.
+    return 0;
   }
 
   private reservedOutputTokens(): number {
-    const { catalog, registry } = this.resolvedModelInfo();
-    const catalogMax = catalog?.maxOutput;
-    if (catalogMax && catalogMax > 0) {
-      return catalogMax;
-    }
-    const registryMax = registry?.maxOutput;
-    if (registryMax && registryMax > 0) {
-      return registryMax;
-    }
-    return 8192;
+    return this.mainModelContext().reserved;
   }
 
   private profileSupportsReasoning(): boolean {
-    const { catalog, registry } = this.resolvedModelInfo();
-    return Boolean(catalog?.reasoning) || (registry?.supportsReasoning ?? false);
+    return this.mainModelContext().supportsReasoning;
   }
 
   private buildContextProfile(): ContextProfile {
-    const { registry } = this.resolvedModelInfo();
-    return contextProfileFor({
-      contextWindow: this.effectiveContextLimit(),
-      maxOutput: this.reservedOutputTokens(),
-      supportsTools: registry?.supportsTools ?? true,
-      supportsReasoning: this.profileSupportsReasoning(),
-      override: getConfig().contextProfile,
-    });
+    return this.mainModelContext().profile;
   }
 
   private contextProfileInfo(): ContextProfileInfo {
@@ -5031,6 +6139,7 @@ export class SessionController {
   }
 
   private recordRoute(messageId: string, route: TaskRouteEvent['route'], stateBefore: TaskStateStatus): void {
+    this.sessionMemoryCard = this.buildSessionMemoryCard();
     this.routeLog = [
       ...this.routeLog,
       {
@@ -5085,6 +6194,11 @@ export class SessionController {
     run.status = status;
     run.updatedAt = Date.now();
     void this.saveRun(run);
+    if (status === 'completed') {
+      this.setContinuation('task', run.id, 'complete');
+    } else if (status === 'interrupted' || status === 'stopped' || status === 'failed') {
+      this.setContinuation('task', run.id, 'paused');
+    }
     if (status === 'interrupted') {
       this.recoveryRun = run;
     } else if (this.recoveryRun?.id === run.id) {
@@ -5920,6 +7034,15 @@ export class SessionController {
       return;
     }
     message.interrupted = true;
+    if (this.lastAnswer?.messageId === message.id) {
+      this.lastAnswer = {
+        ...this.lastAnswer,
+        text: message.text,
+        status: 'interrupted',
+        updatedAt: Date.now(),
+      };
+      this.setContinuation('answer', message.id, 'interrupted');
+    }
     void this.persistNow();
   }
 

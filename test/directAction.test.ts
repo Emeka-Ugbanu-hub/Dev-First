@@ -68,6 +68,11 @@ function planVersion(controller: SessionController): number {
   return (controller as unknown as { planVersion: number }).planVersion;
 }
 
+function textSse(text: string): string {
+  const chunk = JSON.stringify({ choices: [{ delta: { content: text } }] });
+  return `data: ${chunk}\n\ndata: [DONE]\n\n`;
+}
+
 function toolSse(name: string, args: Record<string, unknown>): string {
   const chunk = JSON.stringify({
     choices: [
@@ -123,6 +128,61 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+});
+
+describe('prompt enhancement', () => {
+  it('rewrites with the current chat provider', async () => {
+    stubFetch([textSse('Fix the login race condition with a bounded retry.')]);
+    const posted: HostMessage[] = [];
+    const controller = createController(posted);
+
+    await (controller as unknown as { enhancePrompt(text: string): Promise<void> })
+      .enhancePrompt('fix login race');
+
+    const enhanced = posts(posted, 'enhancedPrompt');
+    expect(enhanced).toHaveLength(1);
+    expect(enhanced[0].text).toContain('bounded retry');
+    expect(enhanced[0].error).toBeUndefined();
+    controller.dispose();
+  });
+
+  it('reports an error instead of leaving the prompt button spinning', async () => {
+    env.secret = undefined;
+    const posted: HostMessage[] = [];
+    const controller = createController(posted);
+
+    await (controller as unknown as { enhancePrompt(text: string): Promise<void> })
+      .enhancePrompt('fix login race');
+
+    const enhanced = posts(posted, 'enhancedPrompt');
+    expect(enhanced).toHaveLength(1);
+    expect(enhanced[0].text).toBe('fix login race');
+    expect(enhanced[0].error).toContain('No chat provider');
+    controller.dispose();
+  });
+});
+
+describe('durable ledger pinning', () => {
+  it('does not pin the ledger for a fresh planning request', () => {
+    const posted: HostMessage[] = [];
+    const controller = createController(posted);
+    (controller as unknown as { eventLedger: { append(kind: string, payload: Record<string, unknown>): void } })
+      .eventLedger.append('state', { state: 'planning', completedSteps: [], nextSteps: [], blockers: [] });
+
+    expect((controller as unknown as { buildPinnedContext(): { ledger?: string } }).buildPinnedContext().ledger)
+      .toBeUndefined();
+
+    (controller as unknown as { plan: Plan }).plan = {
+      version: 1,
+      status: 'draft',
+      intent: 'plan',
+      title: 'Active',
+      steps: ['Do it'],
+    };
+    expect((controller as unknown as { buildPinnedContext(): { ledger?: string } }).buildPinnedContext().ledger)
+      .toContain('Durable task ledger');
+    controller.dispose();
+  });
 });
 
 describe('direct trivial runs', () => {
@@ -205,7 +265,7 @@ describe('direct trivial runs', () => {
 });
 
 describe('restored plans', () => {
-  it('drops a restored approved plan but restores a draft', async () => {
+  it('restores approved and draft plans so interrupted work can resume', async () => {
     const approvedStorage = `/tmp/dev-first-restore-approved-${Math.random().toString(36).slice(2)}`;
     await new SessionStore(path.join(approvedStorage, 'sessions')).save({
       id: 's_approved',
@@ -222,7 +282,7 @@ describe('restored plans', () => {
     });
     const approvedController = createController([], { storage: approvedStorage });
     await vi.waitFor(() => expect(approvedController.getState().sessionTitle).toBe('Approved plan'));
-    expect(approvedController.getState().plan).toBeNull();
+    expect(approvedController.getState().plan?.status).toBe('approved');
     approvedController.dispose();
 
     const draftStorage = `/tmp/dev-first-restore-draft-${Math.random().toString(36).slice(2)}`;

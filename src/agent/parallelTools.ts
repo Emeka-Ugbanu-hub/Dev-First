@@ -1,5 +1,7 @@
 export const PARALLEL_SAFE = new Set([
   'read_file',
+  'skim_file',
+  'read_output',
   'list_files',
   'search_text',
   'find_symbol',

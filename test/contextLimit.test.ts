@@ -174,6 +174,47 @@ describe('effective context window', () => {
     controller.dispose();
   });
 
+  it('uses the discovered or fallback window when the local cap is zero', () => {
+    env.config = {
+      preset: 'ollama',
+      model: 'unknown-local-model-xyz',
+      contextLimitTokens: 262_144,
+      localContextCapTokens: 0,
+    };
+    const controller = createController([]);
+
+    expect(controller.getState().contextUsage.limit).toBe(262_144);
+    expect(controller.getState().contextUsage.profile?.tier).toBe('large');
+    controller.dispose();
+  });
+
+  it('uses a small discovered local window when the local cap is zero', () => {
+    env.config = {
+      preset: 'ollama',
+      model: 'unknown-local-model-xyz',
+      contextLimitTokens: 4_096,
+      localContextCapTokens: 0,
+    };
+    const controller = createController([]);
+
+    expect(controller.getState().contextUsage.limit).toBe(4_096);
+    expect(controller.getState().contextUsage.profile?.tier).toBe('compact');
+    controller.dispose();
+  });
+
+  it('honors an explicit local cap below the model window', () => {
+    env.config = {
+      preset: 'ollama',
+      model: 'unknown-local-model-xyz',
+      contextLimitTokens: 262_144,
+      localContextCapTokens: 48_000,
+    };
+    const controller = createController([]);
+
+    expect(controller.getState().contextUsage.limit).toBe(48_000);
+    controller.dispose();
+  });
+
   it('prefers registry metadata over the setting for reserved output and limit', () => {
     env.config = { preset: 'anthropic', model: 'claude-opus-4-1', contextLimitTokens: 64_000 };
     const controller = createController([]);

@@ -1,4 +1,4 @@
-import { ChatMessage, ChatOptions, LLMProvider, StreamEvent, ToolCall, reasoningBudget } from '../types';
+import { ChatMessage, ChatOptions, LLMProvider, StreamEvent, StreamStopReason, ToolCall, reasoningBudget } from '../types';
 import { adaptiveEffort } from '../adaptive';
 import { formatHttpError, joinUrl, sseLines } from '../sse';
 import { parseJsonLoose } from '../../util/json';
@@ -107,6 +107,8 @@ export class AnthropicProvider implements LLMProvider {
       }
 
       const toolBlocks = new Map<number, ToolCall>();
+      let stopReason: string | undefined;
+      let sawToolUse = false;
 
       for await (const line of sseLines(response)) {
         if (!line.startsWith('data:')) {
@@ -138,6 +140,9 @@ export class AnthropicProvider implements LLMProvider {
             break;
           }
           case 'message_delta': {
+            if (typeof json.delta?.stop_reason === 'string' && json.delta.stop_reason) {
+              stopReason = json.delta.stop_reason;
+            }
             const output = numberOrUndefined(json.usage?.output_tokens);
             if (output !== undefined) {
               yield { type: 'usage', outputTokens: output };
@@ -147,6 +152,7 @@ export class AnthropicProvider implements LLMProvider {
           case 'content_block_start': {
             const block = json.content_block;
             if (block?.type === 'tool_use') {
+              sawToolUse = true;
               toolBlocks.set(json.index ?? 0, {
                 id: block.id ?? randomId('call'),
                 name: block.name ?? '',
@@ -187,7 +193,7 @@ export class AnthropicProvider implements LLMProvider {
             break;
         }
       }
-      yield { type: 'done' };
+      yield { type: 'done', reason: anthropicStopReason(stopReason, sawToolUse) };
       return;
     }
   }
@@ -328,6 +334,28 @@ function applyMessageCacheBreakpoints(messages: any[]): void {
         last.cache_control = { type: 'ephemeral' };
       }
     }
+  }
+}
+
+function anthropicStopReason(reason: string | undefined, sawToolUse: boolean): StreamStopReason {
+  if (sawToolUse || reason === 'tool_use') {
+    return 'tool-calls';
+  }
+  switch (reason) {
+    case 'max_tokens':
+      return 'length';
+    case 'pause_turn':
+      // The turn was paused before completion (for example during a
+      // long-running server-side tool). Treat it as incomplete output so the
+      // caller continues instead of presenting a partial answer.
+      return 'length';
+    case 'refusal':
+      return 'content-filter';
+    case 'end_turn':
+    case 'stop_sequence':
+      return 'stop';
+    default:
+      return 'unknown';
   }
 }
 
